@@ -1,0 +1,2880 @@
+diff --git a/include/ggml.h b/include/ggml.h
+index 35f0c44ec42117a3a96b20ebe05cca3012a083e9..d8247368c58fe2bfc9f88434901c673982f47039 100644
+--- a/include/ggml.h
++++ b/include/ggml.h
+@@ -2187,6 +2187,18 @@ extern "C" {
+             int                   d0,  // dilation dimension 0
+             int                   d1); // dilation dimension 1
+ 
++    GGML_API struct ggml_tensor * ggml_conv_2d_direct_bias_silu(
++            struct ggml_context * ctx,
++            struct ggml_tensor  * a,
++            struct ggml_tensor  * b,
++            struct ggml_tensor  * bias,
++            int                   s0,
++            int                   s1,
++            int                   p0,
++            int                   p1,
++            int                   d0,
++            int                   d1);
++
+     GGML_API struct ggml_tensor * ggml_conv_3d_direct(
+             struct ggml_context * ctx,
+             struct ggml_tensor  * a,   // kernel [KW, KH, KD, IC * OC]
+diff --git a/src/ggml-cpu/ggml-cpu.c b/src/ggml-cpu/ggml-cpu.c
+index 491316f7491252248d6f74a60440d3efa7aa6177..22afa38d4badeb9823c5e862a994de25b2ae430e 100644
+--- a/src/ggml-cpu/ggml-cpu.c
++++ b/src/ggml-cpu/ggml-cpu.c
+@@ -1299,17 +1299,87 @@ void ggml_compute_forward_mul_mat(
+ 
+     const bool src1_cont = ggml_is_contiguous(src1);
+ 
++    /* rfdetr.cpp patch: merge per-broadcast llamafile_sgemm calls when src0
++     * is unbroadcasted along a dim and src1/dst pack that dim contiguously.
++     *
++     * Why: ggml's mul_mat broadcasts over ne12/ne13 by issuing one sgemm per
++     * (i12,i13) pair. For e.g. windowed attention (ne12=16 windows, ne11=101
++     * tokens) that's 16 sgemm calls of N=101 instead of one call of N=1616.
++     * Per-call overhead (ggml_barrier, chunk setup, kernel prelude) and poor
++     * thread utilization on small N strictly dominate the actual FMA work.
++     * Folding the 16 windows into a single N=1616 call gives 4-5x speedup on
++     * those shapes (see git log for measurements). */
+     if (src1_cont) {
++        const size_t ts_src0 = ggml_type_size(src0->type);
++        const size_t ts_src1 = ggml_type_size(src1->type);
++        const size_t ts_dst  = ggml_type_size(dst->type);
++
++        /* dst must be row-contiguous along the dims we want to fold. */
++        const bool dst_pack_2 = (nb1 == ts_dst * ne0)  && (nb2 == nb1 * ne1);
++        const bool dst_pack_3 = dst_pack_2             && (nb3 == nb2 * ne2);
++
++        /* src1 must pack the dim we're folding. For src1_cont, nb12 =
++         * nb11*ne11 and nb13 = nb12*ne12, so:
++         *   - dim 2 always packs (stride = ne11 rows)
++         *   - dim 3 packs across BOTH 12 and 13 only if ne12==1 OR we fold
++         *     both 12 and 13 together. */
++        const bool src1_pack_2 = (nb12 == nb11 * ne11);
++
++        /* src0 must NOT change as we step through the dim, i.e. ne0X == 1
++         * (purely broadcasted), so all (i12, i13) read the same weight page. */
++        const bool src0_share_2 = (ne02 == 1);
++        const bool src0_share_3 = (ne03 == 1);
++
++        /* fold_2_3: collapse both ne12 and ne13 into a flat N. Requires src0
++         * to be broadcast on BOTH dims; src1 to be fully packed (it is, when
++         * src1_cont). */
++        const bool fold_2_3 = src0_share_2 && src0_share_3 && src1_pack_2 &&
++                              dst_pack_3 && (ne12 * ne13 > 1);
++
++        /* fold_2: per-i13 sgemm collapsing ne12 into N. Used when ne03 > 1
++         * but ne02 == 1. */
++        const bool fold_2_only = !fold_2_3 && src0_share_2 && src1_pack_2 &&
++                                 dst_pack_2 && ne12 > 1;
++
++        if (fold_2_3) {
++            /* Single sgemm: collapse both broadcast dims into a flat N. */
++            if (!llamafile_sgemm(params,
++                                 ne01, ne11 * ne12 * ne13, ne00/ggml_blck_size(src0->type),
++                                 (const char *)src0->data,
++                                 nb01/ts_src0,
++                                 (const char *)src1->data,
++                                 nb11/ts_src1,
++                                 (char *)dst->data,
++                                 nb1/ts_dst,
++                                 src0->type, src1->type, dst->type))
++                goto UseGgmlGemm1;
++            return;
++        }
++        if (fold_2_only) {
++            for (int64_t i13 = 0; i13 < ne13; i13++)
++                if (!llamafile_sgemm(params,
++                                     ne01, ne11 * ne12, ne00/ggml_blck_size(src0->type),
++                                     (const char *)src0->data + i13/r3*nb03,
++                                     nb01/ts_src0,
++                                     (const char *)src1->data + i13*nb13,
++                                     nb11/ts_src1,
++                                     (char *)dst->data + i13*nb3,
++                                     nb1/ts_dst,
++                                     src0->type, src1->type, dst->type))
++                    goto UseGgmlGemm1;
++            return;
++        }
++
+         for (int64_t i13 = 0; i13 < ne13; i13++)
+             for (int64_t i12 = 0; i12 < ne12; i12++)
+                 if (!llamafile_sgemm(params,
+                                      ne01, ne11, ne00/ggml_blck_size(src0->type),
+                                      (const char *)src0->data + i12/r2*nb02 + i13/r3*nb03,
+-                                     nb01/ggml_type_size(src0->type),
++                                     nb01/ts_src0,
+                                      (const char *)src1->data + i12*nb12 + i13*nb13,
+-                                     nb11/ggml_type_size(src1->type),
++                                     nb11/ts_src1,
+                                      (char *)dst->data + i12*nb2 + i13*nb3,
+-                                     nb1/ggml_type_size(dst->type),
++                                     nb1/ts_dst,
+                                      src0->type,
+                                      src1->type,
+                                      dst->type))
+@@ -1367,17 +1437,65 @@ UseGgmlGemm1:;
+     if (src1->type != vec_dot_type) {
+         const void* wdata = (src1->type == vec_dot_type) ? src1->data : params->wdata;
+         const size_t row_size = ggml_row_size(vec_dot_type, ne10);
++        const size_t ts_src0 = ggml_type_size(src0->type);
++        const size_t ts_vdt  = ggml_type_size(vec_dot_type);
++        const size_t ts_dst  = ggml_type_size(dst->type);
++
++        /* Same broadcast-fold as the F32 path above. wdata layout from
++         * the from_float loop iterates (i13, i12, i11) outer→inner, so the
++         * memory order is i13-outermost: offset(i12, i13) =
++         *   (i12*ne11 + i13*ne12*ne11)*row_size
++         * Stride between consecutive i12 (i13 fixed): ne11*row_size  -> packs dim 2
++         * Stride between consecutive i13 (i12 fixed): ne12*ne11*row_size -> NOT packed
++         *   (those rows are interleaved with other heads). fold_3 is therefore
++         *   only safe in the no-wdata path above. */
++        const bool dst_pack_2  = (nb1 == ts_dst * ne0)  && (nb2 == nb1 * ne1);
++        const bool dst_pack_3  = dst_pack_2             && (nb3 == nb2 * ne2);
++        const bool src0_share_2 = (ne02 == 1);
++        const bool src0_share_3 = (ne03 == 1);
++
++        const bool fold_2_3 = src0_share_2 && src0_share_3 && dst_pack_3 &&
++                              (ne12 * ne13 > 1);
++        const bool fold_2   = src0_share_2 && dst_pack_2 && ne12 > 1;
++
++        if (fold_2_3) {
++            if (!llamafile_sgemm(params,
++                                 ne01, ne11 * ne12 * ne13, ne00/ggml_blck_size(src0->type),
++                                 (const char *)src0->data,
++                                 nb01/ts_src0,
++                                 (const char *)wdata,
++                                 row_size/ts_vdt,
++                                 (char *)dst->data,
++                                 nb1/ts_dst,
++                                 src0->type, vec_dot_type, dst->type))
++                goto UseGgmlGemm2;
++            return;
++        }
++        if (fold_2) {
++            for (int64_t i13 = 0; i13 < ne13; i13++)
++                if (!llamafile_sgemm(params,
++                                     ne01, ne11 * ne12, ne00/ggml_blck_size(src0->type),
++                                     (const char *)src0->data + i13/r3*nb03,
++                                     nb01/ts_src0,
++                                     (const char *)wdata + i13*ne12*ne11*row_size,
++                                     row_size/ts_vdt,
++                                     (char *)dst->data + i13*nb3,
++                                     nb1/ts_dst,
++                                     src0->type, vec_dot_type, dst->type))
++                    goto UseGgmlGemm2;
++            return;
++        }
+ 
+         for (int64_t i13 = 0; i13 < ne13; i13++)
+             for (int64_t i12 = 0; i12 < ne12; i12++)
+                 if (!llamafile_sgemm(params,
+                                      ne01, ne11, ne00/ggml_blck_size(src0->type),
+                                      (const char *)src0->data + i12/r2*nb02 + i13/r3*nb03,
+-                                     nb01/ggml_type_size(src0->type),
++                                     nb01/ts_src0,
+                                      (const char *)wdata + (i12*ne11 + i13*ne12*ne11)*row_size,
+-                                     row_size/ggml_type_size(vec_dot_type),
++                                     row_size/ts_vdt,
+                                      (char *)dst->data + i12*nb2 + i13*nb3,
+-                                     nb1/ggml_type_size(dst->type),
++                                     nb1/ts_dst,
+                                      src0->type,
+                                      vec_dot_type,
+                                      dst->type))
+@@ -3057,6 +3175,187 @@ static int ggml_cpu_try_fuse_ops(
+     return 0;
+ }
+ 
++// ---------------------------------------------------------------------------
++// Per-op-type profiling (enabled at runtime via env GGML_PROFILE_OPS=1).
++// Profile is accumulated on thread 0 only, using wall-clock time around each
++// node's compute+barrier. Summary is printed on every graph compute call.
++//
++// MUL_MAT is bucketed by K (the reduction dimension on src0->ne[0]):
++//   - "MUL_MAT[K<=64]"     (e.g. attention QK^T / PV for small head_dim)
++//   - "MUL_MAT[K<=384]"    (medium)
++//   - "MUL_MAT[K>384]"     (bulk projections / FFN)
++// ---------------------------------------------------------------------------
++
++static int ggml_profile_ops_enabled(void) {
++    static int cached = -1;
++    if (cached < 0) {
++        const char * s = getenv("GGML_PROFILE_OPS");
++        cached = (s && s[0] && s[0] != '0') ? 1 : 0;
++    }
++    return cached;
++}
++
++#define GGML_PROF_NUM_BUCKETS (GGML_OP_COUNT + 3)  // +3 mul_mat sub-buckets
++#define GGML_PROF_BUCKET_MM_SMALL  (GGML_OP_COUNT + 0)
++#define GGML_PROF_BUCKET_MM_MED    (GGML_OP_COUNT + 1)
++#define GGML_PROF_BUCKET_MM_LARGE  (GGML_OP_COUNT + 2)
++
++#define GGML_PROF_MM_DETAIL 32  // top-N distinct mul_mat shapes to track
++struct ggml_prof_mm_shape {
++    int64_t M, N, K, B;
++    int64_t total_us;
++    int64_t calls;
++    int64_t flops_per_call;
++};
++
++struct ggml_profile_state {
++    int64_t total_us[GGML_PROF_NUM_BUCKETS];
++    int64_t calls   [GGML_PROF_NUM_BUCKETS];
++    int64_t total_flops[GGML_PROF_NUM_BUCKETS]; // for MUL_MAT buckets
++    int64_t grand_total_us;
++    int     graph_idx;
++    struct ggml_prof_mm_shape mm_shapes[GGML_PROF_MM_DETAIL];
++    int     n_mm_shapes;
++};
++
++static struct ggml_profile_state g_ggml_profile = {0};
++
++static const char * ggml_prof_bucket_name(int b) {
++    if (b < GGML_OP_COUNT) return ggml_op_name((enum ggml_op)b);
++    switch (b) {
++        case GGML_PROF_BUCKET_MM_SMALL: return "MUL_MAT[K<=64]";
++        case GGML_PROF_BUCKET_MM_MED:   return "MUL_MAT[K<=384]";
++        case GGML_PROF_BUCKET_MM_LARGE: return "MUL_MAT[K>384]";
++    }
++    return "?";
++}
++
++static int ggml_prof_bucket_for(const struct ggml_tensor * node) {
++    if (node->op == GGML_OP_MUL_MAT) {
++        const int64_t K = node->src[0]->ne[0];
++        if (K <= 64)  return GGML_PROF_BUCKET_MM_SMALL;
++        if (K <= 384) return GGML_PROF_BUCKET_MM_MED;
++        return GGML_PROF_BUCKET_MM_LARGE;
++    }
++    return (int) node->op;
++}
++
++static int64_t ggml_prof_flops_for(const struct ggml_tensor * node) {
++    if (node->op != GGML_OP_MUL_MAT) return 0;
++    // src0: [K, M, ...]  src1: [K, N, ...]  dst: [M, N, ...]
++    const int64_t K = node->src[0]->ne[0];
++    const int64_t M = node->src[0]->ne[1];
++    const int64_t N = node->src[1]->ne[1];
++    // batch dims
++    int64_t B = 1;
++    for (int d = 2; d < GGML_MAX_DIMS; ++d) {
++        B *= node->ne[d];
++    }
++    return 2 * M * N * K * B;
++}
++
++static void ggml_prof_record_mm(const struct ggml_tensor * node, int64_t dt_us) {
++    const int64_t K = node->src[0]->ne[0];
++    const int64_t M = node->src[0]->ne[1];
++    const int64_t N = node->src[1]->ne[1];
++    int64_t B = 1;
++    for (int d = 2; d < GGML_MAX_DIMS; ++d) {
++        B *= node->ne[d];
++    }
++    for (int i = 0; i < g_ggml_profile.n_mm_shapes; ++i) {
++        struct ggml_prof_mm_shape * s = &g_ggml_profile.mm_shapes[i];
++        if (s->M == M && s->N == N && s->K == K && s->B == B) {
++            s->total_us += dt_us;
++            s->calls    += 1;
++            return;
++        }
++    }
++    if (g_ggml_profile.n_mm_shapes < GGML_PROF_MM_DETAIL) {
++        struct ggml_prof_mm_shape * s = &g_ggml_profile.mm_shapes[g_ggml_profile.n_mm_shapes++];
++        s->M = M; s->N = N; s->K = K; s->B = B;
++        s->total_us = dt_us;
++        s->calls = 1;
++        s->flops_per_call = 2 * M * N * K * B;
++    }
++}
++
++static int ggml_prof_mm_cmp(const void * a, const void * b) {
++    const struct ggml_prof_mm_shape * sa = (const struct ggml_prof_mm_shape *)a;
++    const struct ggml_prof_mm_shape * sb = (const struct ggml_prof_mm_shape *)b;
++    if (sa->total_us < sb->total_us) return  1;
++    if (sa->total_us > sb->total_us) return -1;
++    return 0;
++}
++
++static int ggml_prof_cmp(const void * a, const void * b) {
++    int ia = *(const int *)a;
++    int ib = *(const int *)b;
++    int64_t ta = g_ggml_profile.total_us[ia];
++    int64_t tb = g_ggml_profile.total_us[ib];
++    if (ta < tb) return  1;
++    if (ta > tb) return -1;
++    return 0;
++}
++
++static void ggml_prof_dump_and_reset(void) {
++    int idx[GGML_PROF_NUM_BUCKETS];
++    int n_used = 0;
++    for (int i = 0; i < GGML_PROF_NUM_BUCKETS; ++i) {
++        if (g_ggml_profile.calls[i] > 0) {
++            idx[n_used++] = i;
++        }
++    }
++    qsort(idx, n_used, sizeof(int), ggml_prof_cmp);
++
++    int64_t total = g_ggml_profile.grand_total_us;
++    fprintf(stderr,
++        "\n=== GGML per-op profile (graph #%d, total=%.2f ms) ===\n",
++        g_ggml_profile.graph_idx, total / 1000.0);
++    fprintf(stderr,
++        "%-26s %10s %8s %10s %12s\n",
++        "op", "time_ms", "calls", "pct", "GFLOPS");
++    for (int i = 0; i < n_used; ++i) {
++        int b = idx[i];
++        int64_t us = g_ggml_profile.total_us[b];
++        double  ms = us / 1000.0;
++        double pct = total > 0 ? 100.0 * (double)us / (double)total : 0.0;
++        if (b >= GGML_OP_COUNT) {
++            double gflops = (us > 0)
++                ? ((double)g_ggml_profile.total_flops[b] / 1e9) / (us / 1e6)
++                : 0.0;
++            fprintf(stderr, "%-26s %10.2f %8" PRId64 " %9.1f%% %12.2f\n",
++                    ggml_prof_bucket_name(b), ms, g_ggml_profile.calls[b], pct, gflops);
++        } else {
++            fprintf(stderr, "%-26s %10.2f %8" PRId64 " %9.1f%%\n",
++                    ggml_prof_bucket_name(b), ms, g_ggml_profile.calls[b], pct);
++        }
++    }
++    fprintf(stderr, "===\n");
++
++    if (g_ggml_profile.n_mm_shapes > 0) {
++        qsort(g_ggml_profile.mm_shapes,
++              g_ggml_profile.n_mm_shapes,
++              sizeof(struct ggml_prof_mm_shape),
++              ggml_prof_mm_cmp);
++        fprintf(stderr, "--- MUL_MAT shape breakdown (top, sorted by total_us) ---\n");
++        fprintf(stderr, "%6s %6s %6s %4s %8s %6s %10s %10s\n",
++                "M", "N", "K", "B", "time_ms", "calls", "GFLOPS/call", "GFLOPS_eff");
++        for (int i = 0; i < g_ggml_profile.n_mm_shapes; ++i) {
++            struct ggml_prof_mm_shape * s = &g_ggml_profile.mm_shapes[i];
++            double ms = s->total_us / 1000.0;
++            double gflops_eff = s->total_us > 0
++                ? ((double)(s->flops_per_call * s->calls) / 1e9) / (s->total_us / 1e6) : 0.0;
++            fprintf(stderr, "%6" PRId64 " %6" PRId64 " %6" PRId64 " %4" PRId64
++                    " %8.2f %6" PRId64 " %10.3f %10.2f\n",
++                    s->M, s->N, s->K, s->B, ms, s->calls,
++                    (double)s->flops_per_call / 1e9, gflops_eff);
++        }
++        fprintf(stderr, "---\n");
++    }
++
++    memset(&g_ggml_profile, 0, sizeof(g_ggml_profile));
++}
++
+ static thread_ret_t ggml_graph_compute_thread(void * data) {
+     struct ggml_compute_state * state = (struct ggml_compute_state *) data;
+     struct ggml_threadpool    * tp    = state->threadpool;
+@@ -3085,6 +3384,9 @@ static thread_ret_t ggml_graph_compute_thread(void * data) {
+     GGML_PRINT_DEBUG("thread #%d compute-start cplan %p last-graph %d\n", state->ith, (const void *)cplan, state->last_graph);
+ #endif
+ 
++    const int prof_enabled = (state->ith == 0) && ggml_profile_ops_enabled();
++    int64_t prof_node_start_us = 0;
++
+     for (int node_n = 0; node_n < cgraph->n_nodes && atomic_load_explicit(&tp->abort, memory_order_relaxed) != node_n; node_n++) {
+         struct ggml_tensor * node = cgraph->nodes[node_n];
+ 
+@@ -3097,6 +3399,10 @@ static thread_ret_t ggml_graph_compute_thread(void * data) {
+             continue;
+         }
+ 
++        if (prof_enabled) {
++            prof_node_start_us = ggml_time_us();
++        }
++
+         // TODO: move fused-op detection into ggml_graph_plan so fusion decisions are made once at planning time
+         // Try fused ops, fall back to normal compute
+         const int n_fused = ggml_cpu_try_fuse_ops(cgraph, node_n, &params, cplan);
+@@ -3115,6 +3421,23 @@ static thread_ret_t ggml_graph_compute_thread(void * data) {
+         if (node_n + 1 < cgraph->n_nodes) {
+             ggml_barrier(state->threadpool);
+         }
++
++        if (prof_enabled) {
++            const int64_t dt = ggml_time_us() - prof_node_start_us;
++            const int b = ggml_prof_bucket_for(node);
++            g_ggml_profile.total_us[b]    += dt;
++            g_ggml_profile.calls   [b]    += 1;
++            g_ggml_profile.total_flops[b] += ggml_prof_flops_for(node);
++            g_ggml_profile.grand_total_us += dt;
++            if (node->op == GGML_OP_MUL_MAT) {
++                ggml_prof_record_mm(node, dt);
++            }
++        }
++    }
++
++    if (prof_enabled) {
++        g_ggml_profile.graph_idx++;
++        ggml_prof_dump_and_reset();
+     }
+ 
+ #ifdef GGML_USE_OPENMP
+diff --git a/src/ggml-cpu/ops.cpp b/src/ggml-cpu/ops.cpp
+index 42ec809ce521620f62c02619bdf47f5350cd2a13..7545d27203b31cac7fe41a335ff8ad41ce944533 100644
+--- a/src/ggml-cpu/ops.cpp
++++ b/src/ggml-cpu/ops.cpp
+@@ -6390,25 +6390,28 @@ static void ggml_compute_forward_im2col_f32(
+     {
+         float * const wdata = (float *) dst->data;
+ 
+-        for (int64_t in = 0; in < N; in++) {
+-            for (int64_t ioh = 0; ioh < OH; ioh++) { // 1
+-                for (int64_t iow = 0; iow < OW; iow++) {
+-                    for (int64_t iic = ith; iic < IC; iic += nth) {
+-
+-                        // micro kernel
+-                        float * dst_data = wdata + (in*OH*OW + ioh*OW + iow)*(IC*KH*KW); // [IC, KH, KW]
+-                        const float * const src_data = (float *)((char *) src1->data + in*ofs0 + iic*ofs1); // [IH, IW]
+-
+-                        for (int64_t ikh = 0; ikh < KH; ikh++) {  // 1
+-                            for (int64_t ikw = 0; ikw < KW; ikw++) {
+-                                const int64_t iiw = iow*s0 + ikw*d0 - p0;
+-                                const int64_t iih = ioh*s1 + ikh*d1 - p1;
+-
+-                                if (iih < 0 || iih >= IH || iiw < 0 || iiw >= IW) {
+-                                    dst_data[iic*(KH*KW) + ikh*KW + ikw] = 0;
+-                                } else {
+-                                    dst_data[iic*(KH*KW) + ikh*KW + ikw] = (src_data[iih*IW + iiw]);
+-                                }
++        // Parallelise over output rows (N*OH): the spatial dimension is far
++        // larger than IC, and slicing on IC both starves threads (IC can be 3)
++        // and makes every thread write the same (oh,ow) slot of dst.
++        for (int64_t row = ith; row < N*OH; row += nth) {
++            const int64_t in  = row / OH;
++            const int64_t ioh = row % OH;
++            for (int64_t iow = 0; iow < OW; iow++) {
++                for (int64_t iic = 0; iic < IC; iic++) {
++
++                    // micro kernel
++                    float * dst_data = wdata + (in*OH*OW + ioh*OW + iow)*(IC*KH*KW); // [IC, KH, KW]
++                    const float * const src_data = (float *)((char *) src1->data + in*ofs0 + iic*ofs1); // [IH, IW]
++
++                    for (int64_t ikh = 0; ikh < KH; ikh++) {  // 1
++                        for (int64_t ikw = 0; ikw < KW; ikw++) {
++                            const int64_t iiw = iow*s0 + ikw*d0 - p0;
++                            const int64_t iih = ioh*s1 + ikh*d1 - p1;
++
++                            if (iih < 0 || iih >= IH || iiw < 0 || iiw >= IW) {
++                                dst_data[iic*(KH*KW) + ikh*KW + ikw] = 0;
++                            } else {
++                                dst_data[iic*(KH*KW) + ikh*KW + ikw] = (src_data[iih*IW + iiw]);
+                             }
+                         }
+                     }
+@@ -6418,11 +6421,6 @@ static void ggml_compute_forward_im2col_f32(
+     }
+ }
+ 
+-
+-// ggml_compute_forward_im2col_f16
+-// src0: kernel [OC, IC, KH, KW]
+-// src1: image [N, IC, IH, IW]
+-// dst:  result [N, OH, OW, IC*KH*KW]
+ static void ggml_compute_forward_im2col_f16(
+         const ggml_compute_params * params,
+               ggml_tensor * dst) {
+@@ -6466,33 +6464,34 @@ static void ggml_compute_forward_im2col_f16(
+     {
+         ggml_fp16_t * const wdata = (ggml_fp16_t *) dst->data;
+ 
+-        for (int64_t in = 0; in < N; in++) {
+-            for (int64_t ioh = 0; ioh < OH; ioh++) { // 1
+-                for (int64_t iow = 0; iow < OW; iow++) {
+-                    for (int64_t iic = ith; iic < IC; iic += nth) {
+-
+-                        // micro kernel
+-                        ggml_fp16_t * dst_data = wdata + (in*OH*OW + ioh*OW + iow)*(IC*KH*KW); // [IC, KH, KW]
+-                        const float * const src_data_f32 = src1->type == GGML_TYPE_F32
+-                            ? (const float *)((const char *) src1->data + in*ofs0 + iic*ofs1)
+-                            : nullptr; // [IH, IW]
+-                        const ggml_fp16_t * const src_data_f16 = src1->type == GGML_TYPE_F16
+-                            ? (const ggml_fp16_t *)((const char *) src1->data + in*ofs0 + iic*ofs1)
+-                            : nullptr; // [IH, IW]
+-
+-                        for (int64_t ikh = 0; ikh < KH; ikh++) {  // 1
+-                            for (int64_t ikw = 0; ikw < KW; ikw++) {
+-                                const int64_t iiw = iow*s0 + ikw*d0 - p0;
+-                                const int64_t iih = ioh*s1 + ikh*d1 - p1;
+-
+-                                if (iih < 0 || iih >= IH || iiw < 0 || iiw >= IW) {
+-                                    dst_data[iic*(KH*KW) + ikh*KW + ikw] = 0;
++        // Parallelise over output rows (N*OH): see im2col_f32 above.
++        for (int64_t row = ith; row < N*OH; row += nth) {
++            const int64_t in  = row / OH;
++            const int64_t ioh = row % OH;
++            for (int64_t iow = 0; iow < OW; iow++) {
++                for (int64_t iic = 0; iic < IC; iic++) {
++
++                    // micro kernel
++                    ggml_fp16_t * const dst_data = wdata + (in*OH*OW + ioh*OW + iow)*(IC*KH*KW); // [IC, KH, KW]
++                    const float * const src_data_f32 = src1->type == GGML_TYPE_F32
++                        ? (const float *)((const char *) src1->data + in*ofs0 + iic*ofs1)
++                        : nullptr; // [IH, IW]
++                    const ggml_fp16_t * const src_data_f16 = src1->type == GGML_TYPE_F16
++                        ? (const ggml_fp16_t *)((const char *) src1->data + in*ofs0 + iic*ofs1)
++                        : nullptr; // [IH, IW]
++
++                    for (int64_t ikh = 0; ikh < KH; ikh++) {  // 1
++                        for (int64_t ikw = 0; ikw < KW; ikw++) {
++                            const int64_t iiw = iow*s0 + ikw*d0 - p0;
++                            const int64_t iih = ioh*s1 + ikh*d1 - p1;
++
++                            if (iih < 0 || iih >= IH || iiw < 0 || iiw >= IW) {
++                                dst_data[iic*(KH*KW) + ikh*KW + ikw] = 0;
++                            } else {
++                                if (src_data_f32 != nullptr) {
++                                    dst_data[iic*(KH*KW) + ikh*KW + ikw] = GGML_CPU_FP32_TO_FP16(src_data_f32[iih*IW + iiw]);
+                                 } else {
+-                                    if (src_data_f32 != nullptr) {
+-                                        dst_data[iic*(KH*KW) + ikh*KW + ikw] = GGML_CPU_FP32_TO_FP16(src_data_f32[iih*IW + iiw]);
+-                                    } else {
+-                                        dst_data[iic*(KH*KW) + ikh*KW + ikw] = src_data_f16[iih*IW + iiw];
+-                                    }
++                                    dst_data[iic*(KH*KW) + ikh*KW + ikw] = src_data_f16[iih*IW + iiw];
+                                 }
+                             }
+                         }
+diff --git a/src/ggml-cuda/CMakeLists.txt b/src/ggml-cuda/CMakeLists.txt
+index d3953eee962e7cdc8cd39e6e8c062bced167e200..d2e6db1a1a5db26e2de7cb730517edf8da3471c7 100644
+--- a/src/ggml-cuda/CMakeLists.txt
++++ b/src/ggml-cuda/CMakeLists.txt
+@@ -129,6 +129,33 @@ if (CUDAToolkit_FOUND)
+                              ${GGML_SOURCES_CUDA}
+                             )
+ 
++    if (GGML_CUDA_CUDNN)
++        find_path(CUDNN_INCLUDE_DIR cudnn.h
++            HINTS $ENV{CUDNN_ROOT} /usr/local/cudnn
++            PATH_SUFFIXES include)
++        find_library(CUDNN_LIBRARY cudnn
++            HINTS $ENV{CUDNN_ROOT} /usr/local/cudnn
++            PATH_SUFFIXES lib lib64)
++        if (NOT CUDNN_INCLUDE_DIR OR NOT CUDNN_LIBRARY)
++            message(FATAL_ERROR "GGML_CUDA_CUDNN requires cuDNN headers and library; set CUDNN_ROOT or disable YOLO_GGML_CUDNN")
++        endif()
++        target_include_directories(ggml-cuda PRIVATE ${CUDNN_INCLUDE_DIR})
++        target_include_directories(ggml-cuda PRIVATE "${CMAKE_CURRENT_LIST_DIR}/../../../cudnn-frontend/include")
++        target_link_libraries(ggml-cuda PRIVATE ${CUDNN_LIBRARY})
++        target_compile_definitions(ggml-cuda PRIVATE GGML_CUDA_USE_CUDNN)
++        message(STATUS "Using cuDNN direct convolutions: ${CUDNN_LIBRARY}")
++    endif()
++
++    if (GGML_CUDA_CUTLASS)
++        set(CUTLASS_INCLUDE_DIR "${CMAKE_CURRENT_LIST_DIR}/../../../cutlass/include")
++        if (NOT EXISTS "${CUTLASS_INCLUDE_DIR}/cutlass/cutlass.h")
++            message(FATAL_ERROR "GGML_CUDA_CUTLASS requires the third_party/cutlass submodule")
++        endif()
++        target_include_directories(ggml-cuda PRIVATE ${CUTLASS_INCLUDE_DIR})
++        target_compile_definitions(ggml-cuda PRIVATE GGML_CUDA_USE_CUTLASS)
++        message(STATUS "Using CUTLASS implicit-GEMM convolutions: ${CUTLASS_INCLUDE_DIR}")
++    endif()
++
+     add_compile_definitions(GGML_CUDA_PEER_MAX_BATCH_SIZE=${GGML_CUDA_PEER_MAX_BATCH_SIZE})
+ 
+     if (GGML_CUDA_GRAPHS)
+diff --git a/src/ggml-cuda/binbcast.cu b/src/ggml-cuda/binbcast.cu
+index 2e38077bf67fbd7c35bb9fc5e7ddff63812e6989..cf6ad57822be2be42102394ee82f086598b72935 100644
+--- a/src/ggml-cuda/binbcast.cu
++++ b/src/ggml-cuda/binbcast.cu
+@@ -415,7 +415,9 @@ static void ggml_cuda_op_bin_bcast(
+ 
+     GGML_ASSERT(src1->type == GGML_TYPE_F32 || src1->type == GGML_TYPE_F16);
+ 
+-    if (src0->type == GGML_TYPE_F32 && dst->type == GGML_TYPE_F32) {
++    if (src0->type == GGML_TYPE_F32 && src1->type == GGML_TYPE_F16 && dst->type == GGML_TYPE_F32) {
++        op()(src0, src1, dst, (const float *)src0_dd, (const half *)src1_dd, (float *)dst_dd, stream);
++    } else if (src0->type == GGML_TYPE_F32 && dst->type == GGML_TYPE_F32) {
+         op()(src0, src1, dst, (const float *)src0_dd, (const float *)src1_dd, (float *)dst_dd, stream);
+     } else if (src0->type == GGML_TYPE_F16 && src1->type == GGML_TYPE_F16 && dst->type == GGML_TYPE_F16) {
+         op()(src0, src1, dst, (const half *) src0_dd, (const half *)src1_dd, (half *) dst_dd, stream);
+@@ -457,7 +459,11 @@ static void ggml_cuda_op_fused_binbcast_impl(ggml_backend_cuda_context & ctx, gg
+     const ggml_tensor * src0 = dst->src[0];
+     const ggml_tensor * src1 = dst->src[1];
+ 
+-    if (src0->type == GGML_TYPE_F32 && dst->type == GGML_TYPE_F32) {
++    if (src0->type == GGML_TYPE_F32 && src1->type == GGML_TYPE_F16 && dst->type == GGML_TYPE_F32) {
++        launch_bin_bcast_pack<op, float, half, float>(src0, src1, dst,
++            (const float *) src0->data, (const half *) src1->data, (float *) dst->data,
++            stream, std::make_index_sequence<n_fuse>{});
++    } else if (src0->type == GGML_TYPE_F32 && dst->type == GGML_TYPE_F32) {
+         launch_bin_bcast_pack<op, float, float, float>(src0, src1, dst,
+             (const float *) src0->data, (const float *) src1->data, (float *) dst->data,
+             stream, std::make_index_sequence<n_fuse>{});
+diff --git a/src/ggml-cuda/common.cuh b/src/ggml-cuda/common.cuh
+index d27d8acb1d37776dfe955440cb787117bf96270f..ea0d54d8bbbf471a2bb05ccf38d5f3f0c21456b6 100644
+--- a/src/ggml-cuda/common.cuh
++++ b/src/ggml-cuda/common.cuh
+@@ -1419,6 +1419,7 @@ struct ggml_backend_cuda_context {
+ 
+     cudaStream_t streams[GGML_CUDA_MAX_DEVICES][GGML_CUDA_MAX_STREAMS] = { { nullptr } };
+     cublasHandle_t cublas_handles[GGML_CUDA_MAX_DEVICES] = {nullptr};
++    void * cudnn_context = nullptr;
+ 
+     int curr_stream_no = 0;
+ 
+@@ -1666,4 +1667,3 @@ static __inline__ void ggml_cuda_kernel_launch(Kernel kernel, const ggml_cuda_ke
+     kernel<<<launch_params.block_nums, launch_params.block_dims, launch_params.shmem, launch_params.stream>>>(std::forward<Args>(args)... );
+     CUDA_CHECK(cudaGetLastError());
+ }
+-
+diff --git a/src/ggml-cuda/conv2d-dw.cu b/src/ggml-cuda/conv2d-dw.cu
+index 7583233b1b7cd4bee67cf7b84434ac7b41f17165..53c6c6645cd5855305fa0858552fb0e1fefa7ae6 100644
+--- a/src/ggml-cuda/conv2d-dw.cu
++++ b/src/ggml-cuda/conv2d-dw.cu
+@@ -1,4 +1,6 @@
+ #include "conv2d-dw.cuh"
++#include "conv2d.cuh"
++#include "convert.cuh"
+ 
+ struct conv_params {
+     int in_w, in_h;
+@@ -97,7 +99,7 @@ __global__ void conv2d_dw_kernel(const T * __restrict__ input, const T * __restr
+     int batch_idx, channel_idx, out_y_idx, out_x_idx;
+     Layout::unpack_indices(global_idx, params, batch_idx, channel_idx, out_y_idx, out_x_idx);
+ 
+-    T accumulator = 0;
++    float accumulator = 0.0f;
+     kernel_bounds bounds = calculate_kernel_bounds(out_x_idx, out_y_idx, params);
+ 
+     for (int kern_y = bounds.y_min; kern_y < bounds.y_max; ++kern_y) {
+@@ -109,21 +111,24 @@ __global__ void conv2d_dw_kernel(const T * __restrict__ input, const T * __restr
+             const T input_val  = input[Layout::input_index(batch_idx, channel_idx, in_y_idx, in_x_idx, params)];
+             const T kernel_val = kernel[Layout::kernel_index(channel_idx, kern_y, kern_x, params)];
+ 
+-            accumulator += input_val * kernel_val;
++            accumulator += ggml_cuda_cast<float>(input_val) * ggml_cuda_cast<float>(kernel_val);
+         }
+     }
+ 
+-    output[Layout::output_index(batch_idx, channel_idx, out_y_idx, out_x_idx, params)] = accumulator;
++    output[Layout::output_index(batch_idx, channel_idx, out_y_idx, out_x_idx, params)] =
++        ggml_cuda_cast<T>(accumulator);
+ }
+ 
+ void ggml_cuda_op_conv2d_dw(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
+     const ggml_tensor * kernel = dst->src[0];
+     const ggml_tensor * input  = dst->src[1];
+ 
+-    GGML_ASSERT(kernel->type == GGML_TYPE_F32 && input->type == GGML_TYPE_F32 && dst->type == GGML_TYPE_F32);
+-    const float * w_d = (const float *) kernel->data;
+-    const float * x_d = (const float *) input->data;
+-    float *       y_d = (float *) dst->data;
++    const bool f32 = kernel->type == GGML_TYPE_F32 && input->type == GGML_TYPE_F32 && dst->type == GGML_TYPE_F32;
++    const bool f16 = kernel->type == GGML_TYPE_F16 && input->type == GGML_TYPE_F16 && dst->type == GGML_TYPE_F16;
++    GGML_ASSERT(f32 || f16);
++#ifdef GGML_CUDA_USE_CUDNN
++    if (ggml_cuda_conv2d_cudnn(ctx, dst, true)) return;
++#endif
+ 
+     const int32_t * p          = (const int32_t *) dst->op_params;
+     const int       stride_x   = p[0];
+@@ -147,14 +152,22 @@ void ggml_cuda_op_conv2d_dw(ggml_backend_cuda_context & ctx, ggml_tensor * dst)
+     const int total  = batches * channels * out_h * out_w;
+     const int blocks = (total + CUDA_CONV2D_DW_BLOCK_SIZE - 1) / CUDA_CONV2D_DW_BLOCK_SIZE;
+ 
+-    if (ggml_is_contiguous(input)) {
++    if (f16 && ggml_is_contiguous(input)) {
++        conv2d_dw_kernel<half, whcn_layout><<<blocks, CUDA_CONV2D_DW_BLOCK_SIZE, 0, st>>>(
++            (const half *) input->data, (const half *) kernel->data, (half *) dst->data, in_w, in_h, out_w, out_h,
++            kernel_w, kernel_h, stride_x, stride_y, padding_x, padding_y, dilation_x, dilation_y, channels, batches);
++    } else if (f16 && ggml_is_contiguous_channels(input)) {
++        conv2d_dw_kernel<half, cwhn_layout><<<blocks, CUDA_CONV2D_DW_BLOCK_SIZE, 0, st>>>(
++            (const half *) input->data, (const half *) kernel->data, (half *) dst->data, in_w, in_h, out_w, out_h,
++            kernel_w, kernel_h, stride_x, stride_y, padding_x, padding_y, dilation_x, dilation_y, channels, batches);
++    } else if (ggml_is_contiguous(input)) {
+         conv2d_dw_kernel<float, whcn_layout><<<blocks, CUDA_CONV2D_DW_BLOCK_SIZE, 0, st>>>(
+-            x_d, w_d, y_d, in_w, in_h, out_w, out_h, kernel_w, kernel_h, stride_x, stride_y, padding_x, padding_y,
+-            dilation_x, dilation_y, channels, batches);
++            (const float *) input->data, (const float *) kernel->data, (float *) dst->data, in_w, in_h, out_w, out_h,
++            kernel_w, kernel_h, stride_x, stride_y, padding_x, padding_y, dilation_x, dilation_y, channels, batches);
+     } else if (ggml_is_contiguous_channels(input)) {
+         conv2d_dw_kernel<float, cwhn_layout><<<blocks, CUDA_CONV2D_DW_BLOCK_SIZE, 0, st>>>(
+-            x_d, w_d, y_d, in_w, in_h, out_w, out_h, kernel_w, kernel_h, stride_x, stride_y, padding_x, padding_y,
+-            dilation_x, dilation_y, channels, batches);
++            (const float *) input->data, (const float *) kernel->data, (float *) dst->data, in_w, in_h, out_w, out_h,
++            kernel_w, kernel_h, stride_x, stride_y, padding_x, padding_y, dilation_x, dilation_y, channels, batches);
+     } else {
+         GGML_ABORT("Unsupported memory layout for conv_2d_dw");
+     }
+diff --git a/src/ggml-cuda/conv2d-transpose.cu b/src/ggml-cuda/conv2d-transpose.cu
+index 6cbd6f879e6f5e4a37160580a1a2d94fc4b9c060..139dee1e380ba0f03826b343fef06c2e5e4e76e7 100644
+--- a/src/ggml-cuda/conv2d-transpose.cu
++++ b/src/ggml-cuda/conv2d-transpose.cu
+@@ -1,10 +1,16 @@
+ #include "conv2d-transpose.cuh"
+ #include "convert.cuh"
+ 
+-template <typename kernel_t>
+-static __global__ void conv2d_transpose_kernel(const float * __restrict__ input,
++#ifdef GGML_CUDA_USE_CUDNN
++#include <cudnn.h>
++#include <new>
++#include <string>
++#endif
++
++template <typename input_t, typename kernel_t, typename output_t>
++static __global__ void conv2d_transpose_kernel(const input_t * __restrict__ input,
+                                                const kernel_t * __restrict__ kernel,
+-                                               float * __restrict__ output,
++                                               output_t * __restrict__ output,
+                                                const int in_w,
+                                                const int in_h,
+                                                const int out_w,
+@@ -56,27 +62,144 @@ static __global__ void conv2d_transpose_kernel(const float * __restrict__ input,
+                 const int kernel_idx =
+                     (kernel_h * kernel_w * c_out) * c_in_idx + (kernel_h * kernel_w) * c_idx + (kernel_w) *kh + kw;
+ 
+-                float    input_val = input[input_idx];
++                input_t  input_val  = input[input_idx];
+                 kernel_t kern_val  = kernel[kernel_idx];
+ 
+-                accumulator += input_val * ggml_cuda_cast<float>(kern_val);
++                accumulator += ggml_cuda_cast<float>(input_val) * ggml_cuda_cast<float>(kern_val);
+             }
+         }
+     }
+ 
+-    output[(out_w * out_h * c_out) * n_idx + (out_w * out_h) * c_idx + (out_w) *out_y_idx + out_x_idx] = accumulator;
++    output[(out_w * out_h * c_out) * n_idx + (out_w * out_h) * c_idx + (out_w) *out_y_idx + out_x_idx] =
++        ggml_cuda_cast<output_t>(accumulator);
+ }
+ 
++#ifdef GGML_CUDA_USE_CUDNN
++namespace {
++
++struct transpose_cudnn_plan {
++    cudnnHandle_t handle = nullptr;
++    cudnnTensorDescriptor_t dx_desc = nullptr;
++    cudnnTensorDescriptor_t dy_desc = nullptr;
++    cudnnFilterDescriptor_t w_desc = nullptr;
++    cudnnConvolutionDescriptor_t conv_desc = nullptr;
++    cudnnConvolutionBwdDataAlgo_t algo = CUDNN_CONVOLUTION_BWD_DATA_ALGO_0;
++    size_t workspace_bytes = 0;
++    void * workspace = nullptr;
++    std::string source_key;
++    bool disabled = false;
++    ~transpose_cudnn_plan() {
++        if (workspace) cudaFree(workspace);
++        if (conv_desc) cudnnDestroyConvolutionDescriptor(conv_desc);
++        if (w_desc) cudnnDestroyFilterDescriptor(w_desc);
++        if (dy_desc) cudnnDestroyTensorDescriptor(dy_desc);
++        if (dx_desc) cudnnDestroyTensorDescriptor(dx_desc);
++        if (handle) cudnnDestroy(handle);
++    }
++};
++
++static transpose_cudnn_plan & transpose_plan() {
++    // A plan owns a cuDNN handle and descriptors. Keep one cache per worker
++    // thread so independent sessions cannot race while rebuilding it.
++    thread_local transpose_cudnn_plan plan;
++    return plan;
++}
++
++static std::string transpose_plan_key(const ggml_tensor * kernel, const ggml_tensor * input,
++                                      const ggml_tensor * dst) {
++    const int32_t stride = dst->op_params[0];
++    return std::to_string(reinterpret_cast<uintptr_t>(kernel->data)) + ":" +
++           std::to_string(input->ne[0]) + ":" + std::to_string(input->ne[1]) + ":" +
++           std::to_string(input->ne[2]) + ":" + std::to_string(input->ne[3]) + ":" +
++           std::to_string(dst->ne[0]) + ":" + std::to_string(dst->ne[1]) + ":" +
++           std::to_string(dst->ne[2]) + ":" + std::to_string(dst->ne[3]) + ":" +
++           std::to_string(kernel->ne[0]) + ":" + std::to_string(kernel->ne[1]) + ":" +
++           std::to_string(kernel->ne[2]) + ":" + std::to_string(kernel->ne[3]) + ":" +
++           std::to_string((int) input->type) + ":" + std::to_string((int) kernel->type) + ":" +
++           std::to_string(stride);
++}
++
++static bool transpose_cudnn(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
++    const ggml_tensor * kernel = dst->src[0];
++    const ggml_tensor * input = dst->src[1];
++    if (input->type != dst->type || kernel->type != input->type ||
++        (input->type != GGML_TYPE_F16 && input->type != GGML_TYPE_F32) || !ggml_is_contiguous(input) ||
++        !ggml_is_contiguous(kernel) || !ggml_is_contiguous(dst)) {
++        return false;
++    }
++
++    auto & plan = transpose_plan();
++    const std::string key = transpose_plan_key(kernel, input, dst);
++    if (plan.source_key != key || plan.handle == nullptr) {
++        if (plan.handle) {
++            plan.~transpose_cudnn_plan();
++            new (&plan) transpose_cudnn_plan();
++        }
++        if (cudnnCreate(&plan.handle) != CUDNN_STATUS_SUCCESS ||
++            cudnnCreateTensorDescriptor(&plan.dx_desc) != CUDNN_STATUS_SUCCESS ||
++            cudnnCreateTensorDescriptor(&plan.dy_desc) != CUDNN_STATUS_SUCCESS ||
++            cudnnCreateFilterDescriptor(&plan.w_desc) != CUDNN_STATUS_SUCCESS ||
++            cudnnCreateConvolutionDescriptor(&plan.conv_desc) != CUDNN_STATUS_SUCCESS) {
++            return false;
++        }
++
++        const int cin = input->ne[2], cout = dst->ne[2], kh = kernel->ne[1], kw = kernel->ne[0];
++        const cudnnDataType_t type = input->type == GGML_TYPE_F16 ? CUDNN_DATA_HALF : CUDNN_DATA_FLOAT;
++        if (cudnnSetTensor4dDescriptor(plan.dx_desc, CUDNN_TENSOR_NCHW, type,
++                                       dst->ne[3], dst->ne[2], dst->ne[1], dst->ne[0]) != CUDNN_STATUS_SUCCESS ||
++            cudnnSetTensor4dDescriptor(plan.dy_desc, CUDNN_TENSOR_NCHW, type,
++                                       input->ne[3], input->ne[2], input->ne[1], input->ne[0]) != CUDNN_STATUS_SUCCESS ||
++            // ConvTranspose weights are [Cin, Cout, Kh, Kw], exactly the filter
++            // layout expected by backward-data where dy has Cin channels.
++            cudnnSetFilter4dDescriptor(plan.w_desc, type, CUDNN_TENSOR_NCHW, cin, cout, kh, kw) != CUDNN_STATUS_SUCCESS ||
++            cudnnSetConvolution2dDescriptor(plan.conv_desc, 0, 0, dst->op_params[0], dst->op_params[0], 1, 1,
++                                            CUDNN_CROSS_CORRELATION, CUDNN_DATA_FLOAT) != CUDNN_STATUS_SUCCESS ||
++            cudnnSetConvolutionMathType(plan.conv_desc, CUDNN_TENSOR_OP_MATH_ALLOW_CONVERSION) != CUDNN_STATUS_SUCCESS) {
++            return false;
++        }
++        cudnnConvolutionBwdDataAlgoPerf_t perf[CUDNN_CONVOLUTION_BWD_DATA_ALGO_COUNT];
++        int count = 0;
++        if (cudaMalloc(&plan.workspace, 64ull << 20) != cudaSuccess ||
++            cudnnFindConvolutionBackwardDataAlgorithmEx(plan.handle, plan.w_desc, kernel->data, plan.dy_desc,
++                                                         input->data, plan.conv_desc, plan.dx_desc, dst->data,
++                                                         CUDNN_CONVOLUTION_BWD_DATA_ALGO_COUNT, &count, perf,
++                                                         plan.workspace, 64ull << 20) != CUDNN_STATUS_SUCCESS) {
++            return false;
++        }
++        bool found_algorithm = false;
++        for (int i = 0; i < count; ++i) {
++            if (perf[i].status == CUDNN_STATUS_SUCCESS && perf[i].memory <= (64ull << 20)) {
++                plan.algo = perf[i].algo;
++                plan.workspace_bytes = perf[i].memory;
++                found_algorithm = true;
++                break;
++            }
++        }
++        plan.source_key = key;
++        plan.disabled = !found_algorithm;
++    }
++    if (plan.disabled) return false;
++
++    if (cudnnSetStream(plan.handle, ctx.stream()) != CUDNN_STATUS_SUCCESS) return false;
++    const float alpha = 1.0f, beta = 0.0f;
++    const cudnnStatus_t status = cudnnConvolutionBackwardData(
++        plan.handle, &alpha, plan.w_desc, kernel->data, plan.dy_desc, input->data, plan.conv_desc, plan.algo,
++        plan.workspace, plan.workspace_bytes, &beta, plan.dx_desc, dst->data);
++    plan.disabled = status != CUDNN_STATUS_SUCCESS;
++    return !plan.disabled;
++}
++
++} // namespace
++#endif
++
+ //input is (W, H, C_in, N), Kernel is (W, H, C_out, C_in)
+ void ggml_cuda_conv_2d_transpose_p0(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
+     const ggml_tensor * kernel = dst->src[0];
+     const ggml_tensor * input  = dst->src[1];
+ 
+     GGML_ASSERT(kernel->type == GGML_TYPE_F16 || kernel->type == GGML_TYPE_F32);
+-    GGML_ASSERT(input->type == GGML_TYPE_F32 && dst->type == GGML_TYPE_F32);
+-
+-    const float * input_data  = (const float *) input->data;
+-    float *       output_data = (float *) dst->data;
++    GGML_ASSERT(input->type == dst->type);
++    GGML_ASSERT(input->type == GGML_TYPE_F16 || input->type == GGML_TYPE_F32);
+     const void *  kernel_data = kernel->data;
+ 
+     const int input_w      = input->ne[0];
+@@ -99,17 +222,28 @@ void ggml_cuda_conv_2d_transpose_p0(ggml_backend_cuda_context & ctx, ggml_tensor
+     GGML_ASSERT(ggml_is_contiguous(kernel));
+     GGML_ASSERT(ggml_is_contiguous(dst));
+ 
++#ifdef GGML_CUDA_USE_CUDNN
++    if (transpose_cudnn(ctx, dst)) return;
++#endif
++
+     const int total  = output_w * output_h * channels_out * batches;
+     const int blocks = (total + CUDA_CONV2D_TRANSPOSE_BLOCK_SIZE - 1) / CUDA_CONV2D_TRANSPOSE_BLOCK_SIZE;
+ 
+-    if (kernel->type == GGML_TYPE_F16) {
+-        conv2d_transpose_kernel<half><<<blocks, CUDA_CONV2D_TRANSPOSE_BLOCK_SIZE, 0, st>>>(
+-            input_data, (const half *) kernel_data, output_data, input_w, input_h, output_w, output_h, kernel_w,
+-            kernel_h, stride, channels_in, channels_out, batches);
+-
++    if (input->type == GGML_TYPE_F16 && kernel->type == GGML_TYPE_F16) {
++        conv2d_transpose_kernel<half, half, half><<<blocks, CUDA_CONV2D_TRANSPOSE_BLOCK_SIZE, 0, st>>>(
++            (const half *) input->data, (const half *) kernel_data, (half *) dst->data,
++            input_w, input_h, output_w, output_h, kernel_w, kernel_h, stride, channels_in, channels_out, batches);
++    } else if (input->type == GGML_TYPE_F16 && kernel->type == GGML_TYPE_F32) {
++        conv2d_transpose_kernel<half, float, half><<<blocks, CUDA_CONV2D_TRANSPOSE_BLOCK_SIZE, 0, st>>>(
++            (const half *) input->data, (const float *) kernel_data, (half *) dst->data,
++            input_w, input_h, output_w, output_h, kernel_w, kernel_h, stride, channels_in, channels_out, batches);
++    } else if (kernel->type == GGML_TYPE_F16) {
++        conv2d_transpose_kernel<float, half, float><<<blocks, CUDA_CONV2D_TRANSPOSE_BLOCK_SIZE, 0, st>>>(
++            (const float *) input->data, (const half *) kernel_data, (float *) dst->data,
++            input_w, input_h, output_w, output_h, kernel_w, kernel_h, stride, channels_in, channels_out, batches);
+     } else {
+-        conv2d_transpose_kernel<float><<<blocks, CUDA_CONV2D_TRANSPOSE_BLOCK_SIZE, 0, st>>>(
+-            input_data, (const float *) kernel_data, output_data, input_w, input_h, output_w, output_h, kernel_w,
+-            kernel_h, stride, channels_in, channels_out, batches);
++        conv2d_transpose_kernel<float, float, float><<<blocks, CUDA_CONV2D_TRANSPOSE_BLOCK_SIZE, 0, st>>>(
++            (const float *) input->data, (const float *) kernel_data, (float *) dst->data,
++            input_w, input_h, output_w, output_h, kernel_w, kernel_h, stride, channels_in, channels_out, batches);
+     }
+ }
+diff --git a/src/ggml-cuda/conv2d.cu b/src/ggml-cuda/conv2d.cu
+index 14774d4a5e736d2c7ff1013bad30cb535cfa72e1..d1fc097c4bf221253a4e57df090f94ecd4cfe2a7 100644
+--- a/src/ggml-cuda/conv2d.cu
++++ b/src/ggml-cuda/conv2d.cu
+@@ -1,5 +1,21 @@
+ #include "conv2d.cuh"
+ #include "convert.cuh"
++#include "cutlass-conv2d.cuh"
++
++#ifdef GGML_CUDA_USE_CUDNN
++#include <cudnn.h>
++#include <cudnn_frontend.h>
++#include <cudnn_frontend_find_plan.h>
++
++#include <array>
++#include <algorithm>
++#include <cinttypes>
++#include <cstdlib>
++#include <cstring>
++#include <limits>
++#include <memory>
++#include <unordered_map>
++#endif
+ 
+ struct conv_params {
+     const int64_t IW, IH;
+@@ -69,10 +85,10 @@ struct whcn_layout {
+     }
+ };
+ 
+-template <typename T, typename Layout>
+-static __global__ void conv2d_kernel(const float * __restrict__ input,
+-                                     const T * __restrict__ kernel,
+-                                     float * __restrict__ output,
++template <typename X, typename K, typename Y, typename Layout>
++static __global__ void conv2d_kernel(const X * __restrict__ input,
++                                     const K * __restrict__ kernel,
++                                     Y * __restrict__ output,
+                                      const conv_params P) {
+     const int64_t global_idx = blockIdx.x * blockDim.x + threadIdx.x;
+ 
+@@ -94,37 +110,807 @@ static __global__ void conv2d_kernel(const float * __restrict__ input,
+             for (int64_t kx = bounds.x_min; kx < bounds.x_max; ++kx) {
+                 const int64_t in_x = calculate_input_coord(out_x, kx, P.ST_X, P.DL_X, P.PD_X);
+ 
+-                const float input_val = input[Layout::input_index(n, c_in, in_y, in_x, P)];
+-                const T kernel_val = kernel[Layout::kernel_index(c_out, c_in, ky, kx, P)];
+-                acc += (input_val * ggml_cuda_cast<float>(kernel_val));
++                const X input_val = input[Layout::input_index(n, c_in, in_y, in_x, P)];
++                const K kernel_val = kernel[Layout::kernel_index(c_out, c_in, ky, kx, P)];
++                acc += ggml_cuda_cast<float>(input_val) * ggml_cuda_cast<float>(kernel_val);
+             }
+         }
+     }
+ 
+     // [N, OC, OH, OW]
+-    output[Layout::output_index(n, c_out, out_y, out_x, P)] = acc;
++    output[Layout::output_index(n, c_out, out_y, out_x, P)] = ggml_cuda_cast<Y>(acc);
+ }
+ 
+-template <typename T>
+-static void conv2d_cuda(const float * X_D, const T * K_D, float * Y_D, const conv_params P, cudaStream_t st) {
++template <typename X, typename K, typename Y>
++static void conv2d_cuda(const X * X_D, const K * K_D, Y * Y_D, const conv_params P, cudaStream_t st) {
+     const int blocks = (P.TOTAL + CUDA_CONV2D_BLOCK_SIZE - 1) / CUDA_CONV2D_BLOCK_SIZE;
+-    conv2d_kernel<T, whcn_layout><<<blocks, CUDA_CONV2D_BLOCK_SIZE, 0, st>>>(X_D, K_D, Y_D, P);
++    conv2d_kernel<X, K, Y, whcn_layout><<<blocks, CUDA_CONV2D_BLOCK_SIZE, 0, st>>>(X_D, K_D, Y_D, P);
++}
++
++template <typename T>
++static __global__ void bias_silu_kernel(
++        T * output, const float * bias, int64_t spatial, int64_t channels, int64_t total) {
++    const int64_t index = blockIdx.x * blockDim.x + threadIdx.x;
++    if (index >= total) return;
++    const float value = ggml_cuda_cast<float>(output[index]) + bias[(index / spatial) % channels];
++    output[index] = ggml_cuda_cast<T>(value / (1.0f + expf(-value)));
++}
++
++static void bias_silu_cuda(ggml_tensor * dst, cudaStream_t stream) {
++    if (!dst->src[2] || ggml_get_op_params_i32(dst, 7) != 1) return;
++    const int64_t spatial = dst->ne[0] * dst->ne[1];
++    const int64_t total = ggml_nelements(dst);
++    const int blocks = (total + CUDA_CONV2D_BLOCK_SIZE - 1) / CUDA_CONV2D_BLOCK_SIZE;
++    if (dst->type == GGML_TYPE_F16) {
++        bias_silu_kernel<<<blocks, CUDA_CONV2D_BLOCK_SIZE, 0, stream>>>(
++            (half *) dst->data, (const float *) dst->src[2]->data, spatial, dst->ne[2], total);
++    } else {
++        bias_silu_kernel<<<blocks, CUDA_CONV2D_BLOCK_SIZE, 0, stream>>>(
++            (float *) dst->data, (const float *) dst->src[2]->data, spatial, dst->ne[2], total);
++    }
+ }
+ 
+-static void conv2d_cuda_f16(const float * X_D, const half * K_D, float * Y_D, const conv_params P, cudaStream_t st) {
+-    conv2d_cuda<half>(X_D, K_D, Y_D, P, st);
++#ifdef GGML_CUDA_USE_CUDNN
++
++static __global__ void fp32_to_fp16_kernel(const float * src, half * dst, int64_t count) {
++    const int64_t index = blockIdx.x * blockDim.x + threadIdx.x;
++    if (index < count) dst[index] = __float2half(src[index]);
++}
++
++template <typename T>
++static __global__ void transpose_batched_kernel(
++        const T * src, T * dst, int64_t rows, int64_t columns) {
++    __shared__ T tile[32][33];
++    const int64_t batch = blockIdx.z;
++    const int64_t src_x = blockIdx.x * 32 + threadIdx.x;
++    const int64_t src_y = blockIdx.y * 32 + threadIdx.y;
++    const T * src_batch = src + batch * rows * columns;
++    T * dst_batch = dst + batch * rows * columns;
++    for (int offset = 0; offset < 32; offset += 8) {
++        if (src_x < columns && src_y + offset < rows) {
++            tile[threadIdx.y + offset][threadIdx.x] = src_batch[(src_y + offset) * columns + src_x];
++        }
++    }
++    __syncthreads();
++    const int64_t dst_x = blockIdx.y * 32 + threadIdx.x;
++    const int64_t dst_y = blockIdx.x * 32 + threadIdx.y;
++    for (int offset = 0; offset < 32; offset += 8) {
++        if (dst_x < rows && dst_y + offset < columns) {
++            dst_batch[(dst_y + offset) * rows + dst_x] = tile[threadIdx.x][threadIdx.y + offset];
++        }
++    }
+ }
+ 
+-static void conv2d_cuda_f32(const float * X_D, const float * K_D, float * Y_D, const conv_params P, cudaStream_t st) {
+-    conv2d_cuda<float>(X_D, K_D, Y_D, P, st);
++static void nchw_to_nhwc(const void * src, void * dst, cudnnDataType_t type,
++                         int64_t batches, int64_t channels, int64_t height, int64_t width, cudaStream_t stream) {
++    const int64_t total = batches * channels * height * width;
++    GGML_UNUSED(total);
++    const int64_t spatial = height * width;
++    const dim3 blocks((spatial + 31) / 32, (channels + 31) / 32, batches);
++    const dim3 threads(32, 8);
++    if (type == CUDNN_DATA_HALF) {
++        transpose_batched_kernel<<<blocks, threads, 0, stream>>>(
++            (const half *) src, (half *) dst, channels, spatial);
++    } else {
++        transpose_batched_kernel<<<blocks, threads, 0, stream>>>(
++            (const float *) src, (float *) dst, channels, spatial);
++    }
+ }
+ 
++static void nhwc_to_nchw(const void * src, void * dst, cudnnDataType_t type,
++                         int64_t batches, int64_t channels, int64_t height, int64_t width, cudaStream_t stream) {
++    const int64_t spatial = height * width;
++    const dim3 blocks((channels + 31) / 32, (spatial + 31) / 32, batches);
++    const dim3 threads(32, 8);
++    if (type == CUDNN_DATA_HALF) {
++        transpose_batched_kernel<<<blocks, threads, 0, stream>>>(
++            (const half *) src, (half *) dst, spatial, channels);
++    } else {
++        transpose_batched_kernel<<<blocks, threads, 0, stream>>>(
++            (const float *) src, (float *) dst, spatial, channels);
++    }
++}
++
++namespace {
++
++constexpr size_t CUDNN_WORKSPACE_BYTES = 64ull << 20;
++
++static bool env_enabled(const char * name) {
++    const char * value = getenv(name);
++    return value && value[0] != '\0' && strcmp(value, "0") != 0;
++}
++
++struct cudnn_conv_plan {
++    cudnnTensorDescriptor_t x_desc = nullptr;
++    cudnnTensorDescriptor_t y_desc = nullptr;
++    cudnnFilterDescriptor_t w_desc = nullptr;
++    cudnnConvolutionDescriptor_t conv_desc = nullptr;
++    std::array<cudnnConvolutionFwdAlgoPerf_t, CUDNN_CONVOLUTION_FWD_ALGO_COUNT> algorithms{};
++    int algorithm_count = 0;
++    int algorithm_index = 0;
++    bool disabled = false;
++    bool frontend_fused = false;
++    float frontend_time_ms = std::numeric_limits<float>::max();
++    float cutlass_time_ms = std::numeric_limits<float>::max();
++    void * frontend_input = nullptr;
++    void * frontend_output = nullptr;
++    void * frontend_weight = nullptr;
++    void * frontend_bias = nullptr;
++    cudnn_frontend::ManagedOpaqueDescriptor frontend_plan;
++#ifdef GGML_CUDA_USE_CUTLASS
++    ggml_cuda_cutlass_conv * cutlass_plan = nullptr;
++#endif
++
++    ~cudnn_conv_plan() {
++#ifdef GGML_CUDA_USE_CUTLASS
++        ggml_cuda_cutlass_conv_destroy(cutlass_plan);
++#endif
++        if (frontend_weight) cudaFree(frontend_weight);
++        if (frontend_output) cudaFree(frontend_output);
++        if (frontend_input) cudaFree(frontend_input);
++        if (frontend_bias) cudaFree(frontend_bias);
++        if (conv_desc) cudnnDestroyConvolutionDescriptor(conv_desc);
++        if (w_desc) cudnnDestroyFilterDescriptor(w_desc);
++        if (y_desc) cudnnDestroyTensorDescriptor(y_desc);
++        if (x_desc) cudnnDestroyTensorDescriptor(x_desc);
++    }
++};
++
++using cudnn_conv_shape = std::array<int64_t, 26>;
++
++struct cudnn_conv_shape_hash {
++    size_t operator()(const cudnn_conv_shape & shape) const {
++        size_t hash = 0;
++        for (const int64_t value : shape) {
++            hash ^= std::hash<int64_t>{}(value) + 0x9e3779b9 + (hash << 6) + (hash >> 2);
++        }
++        return hash;
++    }
++};
++
++enum class cudnn_conv_backend {
++    frontend,
++    cutlass,
++    legacy,
++};
++
++struct cudnn_conv_choice {
++    cudnn_conv_backend backend = cudnn_conv_backend::legacy;
++    cudnn_frontend::ManagedOpaqueDescriptor frontend_plan;
++    bool frontend_fused = false;
++    float frontend_time_ms = std::numeric_limits<float>::max();
++    float cutlass_time_ms = std::numeric_limits<float>::max();
++    float legacy_time_ms = std::numeric_limits<float>::max();
++    std::array<cudnnConvolutionFwdAlgoPerf_t, CUDNN_CONVOLUTION_FWD_ALGO_COUNT> algorithms{};
++    int algorithm_count = 0;
++    int algorithm_index = 0;
++};
++
++static cudnn_conv_shape get_conv_shape(const ggml_tensor * dst, bool depthwise) {
++    const ggml_tensor * kernel = dst->src[0];
++    const ggml_tensor * input = dst->src[1];
++    const ggml_tensor * bias = dst->src[2];
++    const int32_t * p = (const int32_t *) dst->op_params;
++    return {
++        input->ne[0], input->ne[1], input->ne[2], input->ne[3],
++        kernel->ne[0], kernel->ne[1], kernel->ne[2], kernel->ne[3],
++        dst->ne[0], dst->ne[1], dst->ne[2], dst->ne[3],
++        p[0], p[1], p[2], p[3], p[4], p[5], p[6], p[7],
++        input->type, kernel->type, dst->type, depthwise, bias != nullptr, bias ? bias->type : -1,
++    };
++}
++
++#ifdef GGML_CUDA_USE_CUTLASS
++static __global__ void bias_silu_nhwc_kernel(
++        half * output, const float * bias, int64_t channels, int64_t total) {
++    const int64_t index = blockIdx.x * blockDim.x + threadIdx.x;
++    if (index >= total) return;
++    const float value = __half2float(output[index]) + bias[index % channels];
++    output[index] = __float2half(value / (1.0f + expf(-value)));
++}
++
++static bool run_cutlass_plan(ggml_tensor * dst, cudnn_conv_plan & plan, cudaStream_t stream) {
++    const ggml_tensor * input = dst->src[1];
++    nchw_to_nhwc(input->data, plan.frontend_input, CUDNN_DATA_HALF,
++                 input->ne[3], input->ne[2], input->ne[1], input->ne[0], stream);
++    if (!ggml_cuda_cutlass_conv_run(plan.cutlass_plan, stream)) return false;
++    if (dst->src[2] && ggml_get_op_params_i32(dst, 7) == 1) {
++        const int64_t total = ggml_nelements(dst);
++        const int blocks = (total + CUDA_CONV2D_BLOCK_SIZE - 1) / CUDA_CONV2D_BLOCK_SIZE;
++        bias_silu_nhwc_kernel<<<blocks, CUDA_CONV2D_BLOCK_SIZE, 0, stream>>>(
++            (half *) plan.frontend_output, (const float *) dst->src[2]->data, dst->ne[2], total);
++    }
++    nhwc_to_nchw(plan.frontend_output, dst->data, CUDNN_DATA_HALF,
++                 dst->ne[3], dst->ne[2], dst->ne[1], dst->ne[0], stream);
++    return cudaPeekAtLastError() == cudaSuccess;
++}
++
++static float time_cutlass_plan(ggml_tensor * dst, cudnn_conv_plan & plan, cudaStream_t stream) {
++    if (!run_cutlass_plan(dst, plan, stream) || cudaStreamSynchronize(stream) != cudaSuccess) {
++        cudaGetLastError();
++        return std::numeric_limits<float>::max();
++    }
++    cudaEvent_t start = nullptr;
++    cudaEvent_t stop = nullptr;
++    cudaEventCreate(&start);
++    cudaEventCreate(&stop);
++    std::array<float, 3> times{};
++    for (float & time : times) {
++        cudaEventRecord(start, stream);
++        if (!run_cutlass_plan(dst, plan, stream)) {
++            time = std::numeric_limits<float>::max();
++            break;
++        }
++        cudaEventRecord(stop, stream);
++        cudaEventSynchronize(stop);
++        cudaEventElapsedTime(&time, start, stop);
++    }
++    cudaEventDestroy(stop);
++    cudaEventDestroy(start);
++    std::sort(times.begin(), times.end());
++    return times[1];
++}
++#endif
++
++struct cudnn_conv_context {
++    cudnnHandle_t handle = nullptr;
++    void * workspace = nullptr;
++    size_t workspace_bytes = 0;
++    std::unordered_map<const ggml_tensor *, std::unique_ptr<cudnn_conv_plan>> plans;
++    std::unordered_map<cudnn_conv_shape, cudnn_conv_choice, cudnn_conv_shape_hash> choices;
++
++    explicit cudnn_conv_context(int device) {
++        ggml_cuda_set_device(device);
++        if (cudnnCreate(&handle) != CUDNN_STATUS_SUCCESS) {
++            handle = nullptr;
++            return;
++        }
++        if (cudaMalloc(&workspace, CUDNN_WORKSPACE_BYTES) == cudaSuccess) {
++            workspace_bytes = CUDNN_WORKSPACE_BYTES;
++        } else {
++            workspace = nullptr;
++            cudaGetLastError();
++        }
++    }
++
++    ~cudnn_conv_context() {
++        plans.clear();
++        choices.clear();
++        if (workspace) cudaFree(workspace);
++        if (handle) cudnnDestroy(handle);
++    }
++};
++
++static bool prepare_nhwc_buffers(cudnn_conv_context & cctx, const ggml_tensor * dst,
++                                 cudnn_conv_plan & plan, bool convert_bias) {
++    const ggml_tensor * kernel = dst->src[0];
++    const ggml_tensor * input = dst->src[1];
++    const cudnnDataType_t data_type = input->type == GGML_TYPE_F16 ? CUDNN_DATA_HALF : CUDNN_DATA_FLOAT;
++    if (!plan.frontend_input && cudaMalloc(&plan.frontend_input, ggml_nbytes(input)) != cudaSuccess) {
++        cudaGetLastError();
++        return false;
++    }
++    if (!plan.frontend_output && cudaMalloc(&plan.frontend_output, ggml_nbytes(dst)) != cudaSuccess) {
++        cudaGetLastError();
++        return false;
++    }
++    if (!plan.frontend_weight && cudaMalloc(&plan.frontend_weight, ggml_nbytes(kernel)) != cudaSuccess) {
++        cudaGetLastError();
++        return false;
++    }
++
++    cudaStream_t stream = nullptr;
++    cudnnGetStream(cctx.handle, &stream);
++    nchw_to_nhwc(kernel->data, plan.frontend_weight, data_type, kernel->ne[3], kernel->ne[2],
++                 kernel->ne[1], kernel->ne[0], stream);
++    nchw_to_nhwc(input->data, plan.frontend_input, data_type, input->ne[3], input->ne[2],
++                 input->ne[1], input->ne[0], stream);
++
++    if (convert_bias && data_type == CUDNN_DATA_HALF && !plan.frontend_bias) {
++        const size_t bias_bytes = dst->ne[2] * sizeof(half);
++        if (cudaMalloc(&plan.frontend_bias, bias_bytes) != cudaSuccess) {
++            cudaGetLastError();
++            return false;
++        }
++        const int blocks = (dst->ne[2] + CUDA_CONV2D_BLOCK_SIZE - 1) / CUDA_CONV2D_BLOCK_SIZE;
++        fp32_to_fp16_kernel<<<blocks, CUDA_CONV2D_BLOCK_SIZE, 0, stream>>>(
++            (const float *) dst->src[2]->data, (half *) plan.frontend_bias, dst->ne[2]);
++    }
++    return true;
++}
++
++static bool create_frontend_plan(cudnn_conv_context & cctx, const ggml_tensor * dst, cudnn_conv_plan & plan) {
++    const ggml_tensor * kernel = dst->src[0];
++    const ggml_tensor * input = dst->src[1];
++    const int32_t * p = (const int32_t *) dst->op_params;
++    const cudnnDataType_t data_type = input->type == GGML_TYPE_F16 ? CUDNN_DATA_HALF : CUDNN_DATA_FLOAT;
++
++    int64_t x_dim[] = {input->ne[3], input->ne[2], input->ne[1], input->ne[0]};
++    int64_t y_dim[] = {dst->ne[3], dst->ne[2], dst->ne[1], dst->ne[0]};
++    int64_t w_dim[] = {kernel->ne[3], kernel->ne[2], kernel->ne[1], kernel->ne[0]};
++    int64_t x_stride[] = {input->ne[1] * input->ne[0] * input->ne[2], 1, input->ne[0] * input->ne[2], input->ne[2]};
++    int64_t y_stride[] = {dst->ne[1] * dst->ne[0] * dst->ne[2], 1, dst->ne[0] * dst->ne[2], dst->ne[2]};
++    int64_t w_stride[] = {kernel->ne[1] * kernel->ne[0] * kernel->ne[2], 1,
++                          kernel->ne[0] * kernel->ne[2], kernel->ne[2]};
++    int64_t padding[] = {p[3], p[2]};
++    int64_t stride[] = {p[1], p[0]};
++    int64_t dilation[] = {p[5], p[4]};
++    const bool fuse_bias_silu = dst->src[2] && p[7] == 1;
++
++    if (!prepare_nhwc_buffers(cctx, dst, plan, fuse_bias_silu)) return false;
++    cudaStream_t frontend_stream = nullptr;
++    cudnnGetStream(cctx.handle, &frontend_stream);
++
++    try {
++        auto x = cudnn_frontend::TensorBuilder()
++                     .setDim(4, x_dim).setStride(4, x_stride).setId('x').setAlignment(16)
++                     .setDataType(data_type).build();
++        auto w = cudnn_frontend::TensorBuilder()
++                     .setDim(4, w_dim).setStride(4, w_stride).setId('w').setAlignment(16)
++                     .setDataType(data_type).build();
++        auto conv = cudnn_frontend::ConvDescBuilder()
++                        .setComputeType(CUDNN_DATA_FLOAT).setMathMode(CUDNN_CROSS_CORRELATION)
++                        .setSpatialDimCount(2).setSpatialStride(2, stride)
++                        .setPrePadding(2, padding).setPostPadding(2, padding).setDilation(2, dilation).build();
++        auto select_plan = [&](cudnn_frontend::OperationGraph & graph, bool fused) {
++            cudnn_frontend::EngineConfigList configs;
++            cudnn_frontend::get_heuristics_list<2>(
++                {"heuristics_instant", "heuristics_fallback"}, graph,
++                [](cudnnBackendDescriptor_t) { return false; }, configs, true);
++            cudnn_frontend::executionPlans_t candidates;
++            for (auto & config : configs) {
++                try {
++                    auto candidate = cudnn_frontend::ExecutionPlanBuilder()
++                                         .setHandle(cctx.handle).setEngineConfig(config, graph.getTag()).build();
++                    if (candidate.getWorkspaceSize() <= (int64_t)cctx.workspace_bytes) {
++                        candidates.emplace_back(std::move(candidate));
++                        break;
++                    }
++                } catch (cudnn_frontend::cudnnException &) {
++                }
++            }
++            if (candidates.empty()) return false;
++
++            void * data_ptrs[] = {
++                plan.frontend_input, plan.frontend_output, plan.frontend_weight,
++                plan.frontend_bias ? plan.frontend_bias : (dst->src[2] ? dst->src[2]->data : nullptr)};
++            int64_t uids[] = {'x', 'y', 'w', 'b'};
++            const int64_t pointer_count = fused ? 4 : 3;
++            auto variant = cudnn_frontend::VariantPackBuilder()
++                               .setWorkspacePointer(cctx.workspace).setDataPointers(pointer_count, data_ptrs)
++                               .setUids(pointer_count, uids).build();
++            auto timed = cudnn_frontend::time_sorted_plan<
++                cudnn_frontend::CudnnFindSamplingTechnique::CUDNN_FIND_SAMPLE_ONCE>(
++                    cctx.handle, std::move(candidates), variant, 1);
++            if (timed.empty()) return false;
++            plan.frontend_plan = timed.front().get_desc();
++
++            auto execute = [&]() {
++                nchw_to_nhwc(input->data, plan.frontend_input, data_type, input->ne[3], input->ne[2],
++                             input->ne[1], input->ne[0], frontend_stream);
++                const cudnnStatus_t status = cudnnBackendExecute(
++                    cctx.handle, plan.frontend_plan->get_backend_descriptor(), variant.get_raw_desc());
++                if (status == CUDNN_STATUS_SUCCESS) {
++                    nhwc_to_nchw(plan.frontend_output, dst->data, data_type, dst->ne[3], dst->ne[2],
++                                 dst->ne[1], dst->ne[0], frontend_stream);
++                }
++                return status;
++            };
++            if (execute() != CUDNN_STATUS_SUCCESS || cudaStreamSynchronize(frontend_stream) != cudaSuccess) {
++                cudaGetLastError();
++                plan.frontend_plan.reset();
++                return false;
++            }
++            cudaEvent_t start = nullptr;
++            cudaEvent_t stop = nullptr;
++            cudaEventCreate(&start);
++            cudaEventCreate(&stop);
++            std::array<float, 3> times{};
++            for (float & time : times) {
++                cudaEventRecord(start, frontend_stream);
++                if (execute() != CUDNN_STATUS_SUCCESS) {
++                    plan.frontend_plan.reset();
++                    break;
++                }
++                cudaEventRecord(stop, frontend_stream);
++                cudaEventSynchronize(stop);
++                cudaEventElapsedTime(&time, start, stop);
++            }
++            cudaEventDestroy(stop);
++            cudaEventDestroy(start);
++            if (!plan.frontend_plan) return false;
++            std::sort(times.begin(), times.end());
++            plan.frontend_time_ms = times[1];
++            return true;
++        };
++
++        const float alpha = 1.0f;
++        const float beta = 0.0f;
++        auto y = cudnn_frontend::TensorBuilder()
++                     .setDim(4, y_dim).setStride(4, y_stride).setId('y').setAlignment(16)
++                     .setDataType(data_type).build();
++        if (!fuse_bias_silu) {
++            auto operation = cudnn_frontend::OperationBuilder(CUDNN_BACKEND_OPERATION_CONVOLUTION_FORWARD_DESCRIPTOR)
++                                 .setxDesc(x).setyDesc(y).setwDesc(w).setcDesc(conv)
++                                 .setAlpha(alpha).setBeta(beta).build();
++            std::array<cudnn_frontend::Operation const *, 1> operations = {&operation};
++            auto graph = cudnn_frontend::OperationGraphBuilder()
++                             .setHandle(cctx.handle).setOperationGraph(operations.size(), operations.data()).build();
++            return select_plan(graph, false);
++        }
++
++        int64_t b_dim[] = {1, dst->ne[2], 1, 1};
++        int64_t b_stride[] = {dst->ne[2], 1, dst->ne[2], dst->ne[2]};
++        auto b = cudnn_frontend::TensorBuilder()
++                     .setDim(4, b_dim).setStride(4, b_stride).setId('b').setAlignment(16)
++                     .setDataType(data_type).build();
++        auto after_conv = cudnn_frontend::TensorBuilder()
++                              .setDim(4, y_dim).setStride(4, y_stride).setId('c').setAlignment(16)
++                              .setDataType(data_type).setVirtual().build();
++        auto after_bias = cudnn_frontend::TensorBuilder()
++                              .setDim(4, y_dim).setStride(4, y_stride).setId('z').setAlignment(16)
++                              .setDataType(data_type).setVirtual().build();
++        auto add = cudnn_frontend::PointWiseDescBuilder()
++                       .setMode(CUDNN_POINTWISE_ADD).setMathPrecision(CUDNN_DATA_FLOAT).build();
++        auto silu = cudnn_frontend::PointWiseDescBuilder()
++                        .setMode(CUDNN_POINTWISE_SWISH_FWD).setMathPrecision(CUDNN_DATA_FLOAT).build();
++        auto conv_op = cudnn_frontend::OperationBuilder(CUDNN_BACKEND_OPERATION_CONVOLUTION_FORWARD_DESCRIPTOR)
++                           .setxDesc(x).setyDesc(after_conv).setwDesc(w).setcDesc(conv)
++                           .setAlpha(alpha).setBeta(beta).build();
++        auto bias_op = cudnn_frontend::OperationBuilder(CUDNN_BACKEND_OPERATION_POINTWISE_DESCRIPTOR)
++                           .setxDesc(conv_op.getOutputTensor()).setbDesc(b).setyDesc(after_bias).setpwDesc(add)
++                           .setAlpha(alpha).setAlpha2(alpha).build();
++        auto silu_op = cudnn_frontend::OperationBuilder(CUDNN_BACKEND_OPERATION_POINTWISE_DESCRIPTOR)
++                           .setxDesc(bias_op.getOutputTensor()).setyDesc(y).setpwDesc(silu).build();
++        std::array<cudnn_frontend::Operation const *, 3> operations = {&conv_op, &bias_op, &silu_op};
++        auto graph = cudnn_frontend::OperationGraphBuilder()
++                         .setHandle(cctx.handle).setOperationGraph(operations.size(), operations.data()).build();
++        plan.frontend_fused = select_plan(graph, true);
++        return plan.frontend_fused;
++    } catch (cudnn_frontend::cudnnException & error) {
++        GGML_LOG_WARN("cuDNN frontend plan failed: %s\n", error.what());
++    }
++    return false;
++}
++
++static bool cudnn_ok(cudnnStatus_t status, const char * operation) {
++    if (status == CUDNN_STATUS_SUCCESS) return true;
++    GGML_LOG_WARN("cuDNN %s failed: %s\n", operation, cudnnGetErrorString(status));
++    return false;
++}
++
++static float time_legacy_plan(cudnn_conv_context & cctx, ggml_tensor * dst, cudnn_conv_plan & plan,
++                              const cudnnConvolutionFwdAlgoPerf_t & candidate) {
++    const float alpha = 1.0f;
++    const float beta = 0.0f;
++    cudaStream_t stream = nullptr;
++    cudnnGetStream(cctx.handle, &stream);
++    auto execute = [&]() {
++        const cudnnStatus_t status = cudnnConvolutionForward(
++            cctx.handle, &alpha, plan.x_desc, dst->src[1]->data, plan.w_desc, dst->src[0]->data,
++            plan.conv_desc, candidate.algo, cctx.workspace, candidate.memory, &beta, plan.y_desc, dst->data);
++        if (status == CUDNN_STATUS_SUCCESS) bias_silu_cuda(dst, stream);
++        return status;
++    };
++
++    if (execute() != CUDNN_STATUS_SUCCESS || cudaDeviceSynchronize() != cudaSuccess) {
++        cudaGetLastError();
++        return std::numeric_limits<float>::max();
++    }
++
++    cudaEvent_t start = nullptr;
++    cudaEvent_t stop = nullptr;
++    if (cudaEventCreate(&start) != cudaSuccess || cudaEventCreate(&stop) != cudaSuccess) {
++        if (start) cudaEventDestroy(start);
++        if (stop) cudaEventDestroy(stop);
++        cudaGetLastError();
++        return std::numeric_limits<float>::max();
++    }
++
++    std::array<float, 3> times{};
++    bool valid = true;
++    for (float & time : times) {
++        if (cudaEventRecord(start, stream) != cudaSuccess || execute() != CUDNN_STATUS_SUCCESS ||
++            cudaEventRecord(stop, stream) != cudaSuccess || cudaEventSynchronize(stop) != cudaSuccess ||
++            cudaEventElapsedTime(&time, start, stop) != cudaSuccess) {
++            valid = false;
++            break;
++        }
++    }
++    cudaEventDestroy(stop);
++    cudaEventDestroy(start);
++    if (!valid) {
++        cudaGetLastError();
++        return std::numeric_limits<float>::max();
++    }
++    std::sort(times.begin(), times.end());
++    return times[1];
++}
++
++static cudnn_conv_plan * create_cudnn_plan(cudnn_conv_context & cctx, const ggml_tensor * dst, bool depthwise) {
++    const ggml_tensor * kernel = dst->src[0];
++    const ggml_tensor * input = dst->src[1];
++    const cudnnDataType_t data_type = input->type == GGML_TYPE_F16 ? CUDNN_DATA_HALF : CUDNN_DATA_FLOAT;
++    auto plan = std::make_unique<cudnn_conv_plan>();
++
++    if (!cudnn_ok(cudnnCreateTensorDescriptor(&plan->x_desc), "create input descriptor") ||
++        !cudnn_ok(cudnnCreateTensorDescriptor(&plan->y_desc), "create output descriptor") ||
++        !cudnn_ok(cudnnCreateFilterDescriptor(&plan->w_desc), "create filter descriptor") ||
++        !cudnn_ok(cudnnCreateConvolutionDescriptor(&plan->conv_desc), "create convolution descriptor")) {
++        return nullptr;
++    }
++
++    const int32_t * p = (const int32_t *) dst->op_params;
++    if (!cudnn_ok(cudnnSetTensor4dDescriptor(plan->x_desc, CUDNN_TENSOR_NCHW, data_type,
++                                              input->ne[3], input->ne[2], input->ne[1], input->ne[0]),
++                  "set input descriptor") ||
++        !cudnn_ok(cudnnSetTensor4dDescriptor(plan->y_desc, CUDNN_TENSOR_NCHW, data_type,
++                                              dst->ne[3], dst->ne[2], dst->ne[1], dst->ne[0]),
++                  "set output descriptor") ||
++        !cudnn_ok(cudnnSetFilter4dDescriptor(plan->w_desc, data_type, CUDNN_TENSOR_NCHW,
++                                              kernel->ne[3], kernel->ne[2], kernel->ne[1], kernel->ne[0]),
++                  "set filter descriptor") ||
++        !cudnn_ok(cudnnSetConvolution2dDescriptor(plan->conv_desc, p[3], p[2], p[1], p[0], p[5], p[4],
++                                                   CUDNN_CROSS_CORRELATION, CUDNN_DATA_FLOAT),
++                  "set convolution descriptor")) {
++        return nullptr;
++    }
++    if (depthwise && !cudnn_ok(cudnnSetConvolutionGroupCount(plan->conv_desc, input->ne[2]), "set group count")) {
++        return nullptr;
++    }
++    if (!cudnn_ok(cudnnSetConvolutionMathType(plan->conv_desc, CUDNN_TENSOR_OP_MATH_ALLOW_CONVERSION),
++                  "enable tensor operations")) {
++        return nullptr;
++    }
++
++    const cudnn_conv_shape shape = get_conv_shape(dst, depthwise);
++    float legacy_time = std::numeric_limits<float>::max();
++    bool has_frontend_plan = false;
++#ifdef GGML_CUDA_USE_CUTLASS
++    auto create_cutlass_plan = [&]() {
++        if (depthwise || data_type != CUDNN_DATA_HALF || env_enabled("GGML_CUDA_DISABLE_CUTLASS") ||
++            !prepare_nhwc_buffers(cctx, dst, *plan, false)) {
++            return false;
++        }
++        plan->cutlass_plan = ggml_cuda_cutlass_conv_create(
++            plan->frontend_input, plan->frontend_weight, plan->frontend_output,
++            input->ne[3], input->ne[1], input->ne[0], input->ne[2],
++            dst->ne[1], dst->ne[0], dst->ne[2], kernel->ne[1], kernel->ne[0],
++            p[3], p[2], p[1], p[0], p[5], p[4]);
++        return plan->cutlass_plan != nullptr;
++    };
++#endif
++
++    auto cached = cctx.choices.find(shape);
++    if (cached != cctx.choices.end()) {
++        const cudnn_conv_choice & choice = cached->second;
++        plan->frontend_time_ms = choice.frontend_time_ms;
++        plan->cutlass_time_ms = choice.cutlass_time_ms;
++        legacy_time = choice.legacy_time_ms;
++        plan->algorithms = choice.algorithms;
++        plan->algorithm_count = choice.algorithm_count;
++        plan->algorithm_index = choice.algorithm_index;
++
++        bool restored = false;
++        if (choice.backend == cudnn_conv_backend::frontend && choice.frontend_plan &&
++            prepare_nhwc_buffers(cctx, dst, *plan, choice.frontend_fused)) {
++            plan->frontend_plan = choice.frontend_plan;
++            plan->frontend_fused = choice.frontend_fused;
++            has_frontend_plan = true;
++            restored = true;
++        }
++#ifdef GGML_CUDA_USE_CUTLASS
++        if (choice.backend == cudnn_conv_backend::cutlass) restored = create_cutlass_plan();
++#endif
++        if (choice.backend == cudnn_conv_backend::legacy) {
++            restored = plan->algorithm_index < plan->algorithm_count;
++        }
++
++        if (restored) {
++            if (env_enabled("GGML_CUDA_LOG_CUDNN_PLANS")) {
++                const char * selected = choice.backend == cudnn_conv_backend::frontend ? "frontend" :
++                                       choice.backend == cudnn_conv_backend::cutlass ? "cutlass" : "legacy";
++                GGML_LOG_INFO("CUDA reused %s plan for %" PRId64 "x%" PRId64 "x%" PRId64
++                              " -> %" PRId64 "x%" PRId64 "x%" PRId64 "\n",
++                              selected, input->ne[0], input->ne[1], input->ne[2],
++                              dst->ne[0], dst->ne[1], dst->ne[2]);
++            }
++            cudnn_conv_plan * result = plan.get();
++            cctx.plans.emplace(dst, std::move(plan));
++            return result;
++        }
++        cctx.choices.erase(cached);
++    }
++
++    has_frontend_plan = !env_enabled("GGML_CUDA_DISABLE_CUDNN_FRONTEND") &&
++                        create_frontend_plan(cctx, dst, *plan);
++#ifdef GGML_CUDA_USE_CUTLASS
++    if (create_cutlass_plan()) {
++        cudaStream_t stream = nullptr;
++        cudnnGetStream(cctx.handle, &stream);
++        plan->cutlass_time_ms = time_cutlass_plan(const_cast<ggml_tensor *>(dst), *plan, stream);
++        if (plan->cutlass_time_ms == std::numeric_limits<float>::max()) {
++            ggml_cuda_cutlass_conv_destroy(plan->cutlass_plan);
++            plan->cutlass_plan = nullptr;
++        }
++    }
++#endif
++
++    int count = 0;
++    cudnnConvolutionFwdAlgoPerf_t perf[CUDNN_CONVOLUTION_FWD_ALGO_COUNT];
++    if (!cudnn_ok(cudnnGetConvolutionForwardAlgorithm_v7(
++                      cctx.handle, plan->x_desc, plan->w_desc, plan->conv_desc, plan->y_desc,
++                      CUDNN_CONVOLUTION_FWD_ALGO_COUNT, &count, perf),
++                  "query convolution algorithms") && !has_frontend_plan
++#ifdef GGML_CUDA_USE_CUTLASS
++                  && !plan->cutlass_plan
++#endif
++                  ) {
++        return nullptr;
++    }
++    for (int i = 0; i < count; ++i) {
++        if (perf[i].status == CUDNN_STATUS_SUCCESS && perf[i].memory <= cctx.workspace_bytes) {
++            plan->algorithms[plan->algorithm_count++] = perf[i];
++        }
++    }
++    if (plan->algorithm_count > 0) {
++        legacy_time = time_legacy_plan(cctx, const_cast<ggml_tensor *>(dst), *plan, plan->algorithms[0]);
++        if (legacy_time == std::numeric_limits<float>::max()) {
++            plan->algorithm_index = 1;
++        } else {
++            plan->algorithms[0].time = legacy_time;
++        }
++    }
++    if (has_frontend_plan && std::min(legacy_time, plan->cutlass_time_ms) < plan->frontend_time_ms) {
++        plan->frontend_plan.reset();
++    }
++#ifdef GGML_CUDA_USE_CUTLASS
++    if (plan->cutlass_plan && std::min(legacy_time, plan->frontend_time_ms) < plan->cutlass_time_ms) {
++        ggml_cuda_cutlass_conv_destroy(plan->cutlass_plan);
++        plan->cutlass_plan = nullptr;
++    }
++    if (plan->cutlass_plan) plan->frontend_plan.reset();
++#endif
++    if (!plan->frontend_plan &&
++#ifdef GGML_CUDA_USE_CUTLASS
++        !plan->cutlass_plan &&
++#endif
++        plan->algorithm_count == 0) return nullptr;
++
++    bool uses_nhwc = plan->frontend_plan != nullptr;
++#ifdef GGML_CUDA_USE_CUTLASS
++    uses_nhwc = uses_nhwc || plan->cutlass_plan != nullptr;
++#endif
++    if (!uses_nhwc) {
++        cudaFree(plan->frontend_bias);
++        cudaFree(plan->frontend_weight);
++        cudaFree(plan->frontend_output);
++        cudaFree(plan->frontend_input);
++        plan->frontend_bias = nullptr;
++        plan->frontend_weight = nullptr;
++        plan->frontend_output = nullptr;
++        plan->frontend_input = nullptr;
++    }
++
++    cudnn_conv_choice choice;
++    choice.backend = plan->frontend_plan ? cudnn_conv_backend::frontend :
++#ifdef GGML_CUDA_USE_CUTLASS
++                     plan->cutlass_plan ? cudnn_conv_backend::cutlass :
++#endif
++                     cudnn_conv_backend::legacy;
++    choice.frontend_plan = plan->frontend_plan;
++    choice.frontend_fused = plan->frontend_fused;
++    choice.frontend_time_ms = plan->frontend_time_ms;
++    choice.cutlass_time_ms = plan->cutlass_time_ms;
++    choice.legacy_time_ms = legacy_time;
++    choice.algorithms = plan->algorithms;
++    choice.algorithm_count = plan->algorithm_count;
++    choice.algorithm_index = plan->algorithm_index;
++    cctx.choices.emplace(shape, std::move(choice));
++
++    if (env_enabled("GGML_CUDA_LOG_CUDNN_PLANS")) {
++        const char * selected = plan->frontend_plan ? "frontend" :
++#ifdef GGML_CUDA_USE_CUTLASS
++                                plan->cutlass_plan ? "cutlass" :
++#endif
++                                "legacy";
++        GGML_LOG_INFO("CUDA selected %s plan (frontend %.4f ms, CUTLASS %.4f ms, legacy %.4f ms) for %" PRId64 "x%" PRId64
++                      "x%" PRId64 " -> %" PRId64 "x%" PRId64 "x%" PRId64 "\n",
++                      selected, plan->frontend_time_ms, plan->cutlass_time_ms, legacy_time,
++                      input->ne[0], input->ne[1], input->ne[2], dst->ne[0], dst->ne[1], dst->ne[2]);
++    }
++
++    cudnn_conv_plan * result = plan.get();
++    cctx.plans.emplace(dst, std::move(plan));
++    return result;
++}
++
++static bool conv2d_cudnn(ggml_backend_cuda_context & ctx, ggml_tensor * dst, bool depthwise) {
++    const bool f32 = dst->src[0]->type == GGML_TYPE_F32 && dst->src[1]->type == GGML_TYPE_F32 &&
++                     dst->type == GGML_TYPE_F32;
++    const bool f16 = dst->src[0]->type == GGML_TYPE_F16 && dst->src[1]->type == GGML_TYPE_F16 &&
++                     dst->type == GGML_TYPE_F16;
++    if (!f32 && !f16) {
++        return false;
++    }
++    if (!ctx.cudnn_context) {
++        ctx.cudnn_context = new cudnn_conv_context(ctx.device);
++    }
++    auto & cctx = *(cudnn_conv_context *) ctx.cudnn_context;
++    if (!cctx.handle) return false;
++    if (!cudnn_ok(cudnnSetStream(cctx.handle, ctx.stream()), "set stream")) return false;
++
++    auto it = cctx.plans.find(dst);
++    cudnn_conv_plan * plan = it == cctx.plans.end() ? create_cudnn_plan(cctx, dst, depthwise) : it->second.get();
++    if (!plan) return false;
++    if (plan->disabled) return false;
++
++    const float alpha = 1.0f;
++    const float beta = 0.0f;
++#ifdef GGML_CUDA_USE_CUTLASS
++    if (plan->cutlass_plan) {
++        if (run_cutlass_plan(dst, *plan, ctx.stream())) return true;
++        ggml_cuda_cutlass_conv_destroy(plan->cutlass_plan);
++        plan->cutlass_plan = nullptr;
++    }
++#endif
++    if (plan->frontend_plan) {
++        const cudnnDataType_t data_type = dst->type == GGML_TYPE_F16 ? CUDNN_DATA_HALF : CUDNN_DATA_FLOAT;
++        nchw_to_nhwc(dst->src[1]->data, plan->frontend_input, data_type,
++                     dst->src[1]->ne[3], dst->src[1]->ne[2], dst->src[1]->ne[1], dst->src[1]->ne[0], ctx.stream());
++        void * data_ptrs[] = {plan->frontend_input, plan->frontend_output, plan->frontend_weight,
++                              plan->frontend_bias ? plan->frontend_bias : (dst->src[2] ? dst->src[2]->data : nullptr)};
++        int64_t uids[] = {'x', 'y', 'w', 'b'};
++        const int64_t pointer_count = plan->frontend_fused ? 4 : 3;
++        try {
++            auto variant = cudnn_frontend::VariantPackBuilder()
++                               .setWorkspacePointer(cctx.workspace).setDataPointers(pointer_count, data_ptrs)
++                               .setUids(pointer_count, uids).build();
++            if (cudnnBackendExecute(cctx.handle, plan->frontend_plan->get_backend_descriptor(),
++                                    variant.get_raw_desc()) == CUDNN_STATUS_SUCCESS) {
++                nhwc_to_nchw(plan->frontend_output, dst->data, data_type,
++                             dst->ne[3], dst->ne[2], dst->ne[1], dst->ne[0], ctx.stream());
++                if (!plan->frontend_fused) bias_silu_cuda(dst, ctx.stream());
++                return true;
++            }
++        } catch (cudnn_frontend::cudnnException &) {
++        }
++        plan->frontend_plan.reset();
++    }
++    while (plan->algorithm_index < plan->algorithm_count) {
++        const auto & candidate = plan->algorithms[plan->algorithm_index];
++        const cudnnStatus_t status = cudnnConvolutionForward(
++            cctx.handle, &alpha, plan->x_desc, dst->src[1]->data, plan->w_desc, dst->src[0]->data,
++            plan->conv_desc, candidate.algo, cctx.workspace, candidate.memory, &beta, plan->y_desc, dst->data);
++        if (status == CUDNN_STATUS_SUCCESS) {
++            bias_silu_cuda(dst, ctx.stream());
++            return true;
++        }
++        GGML_LOG_WARN("cuDNN convolution algorithm %d failed for %" PRId64 "x%" PRId64 "x%" PRId64
++                      " -> %" PRId64 "x%" PRId64 "x%" PRId64 ": %s; trying fallback\n",
++                      (int) candidate.algo, dst->src[1]->ne[0], dst->src[1]->ne[1], dst->src[1]->ne[2],
++                      dst->ne[0], dst->ne[1], dst->ne[2], cudnnGetErrorString(status));
++        ++plan->algorithm_index;
++    }
++    plan->disabled = true;
++    return false;
++}
++
++} // namespace
++
++bool ggml_cuda_conv2d_cudnn(ggml_backend_cuda_context & ctx, ggml_tensor * dst, bool depthwise) {
++    return conv2d_cudnn(ctx, dst, depthwise);
++}
++
++void ggml_cuda_free_cudnn(ggml_backend_cuda_context & ctx) {
++    delete (cudnn_conv_context *) ctx.cudnn_context;
++    ctx.cudnn_context = nullptr;
++}
++#endif
++
+ void ggml_cuda_op_conv2d(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
+     const ggml_tensor * kernel = dst->src[0];
+     const ggml_tensor * input  = dst->src[1];
+-    float *             K_D    = (float *) kernel->data;
+-    const float *       X_D    = (const float *) input->data;
+-    float *             Y_D    = (float *) dst->data;
+ 
+     GGML_ASSERT(ggml_is_contiguous(input));
+     GGML_ASSERT(ggml_is_contiguous(kernel));
+@@ -135,6 +921,10 @@ void ggml_cuda_op_conv2d(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
+ 
+     cudaStream_t st = ctx.stream();
+ 
++#ifdef GGML_CUDA_USE_CUDNN
++    if (ggml_cuda_conv2d_cudnn(ctx, dst, false)) return;
++#endif
++
+     const int32_t * p    = (const int32_t *) dst->op_params;
+     const int       ST_X = p[0];  // stride_x
+     const int       ST_Y = p[1];  // stride_y
+@@ -159,9 +949,13 @@ void ggml_cuda_op_conv2d(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
+     const int64_t total  = B * OC * OH * OW;
+     conv_params   params = { IW, IH, OW, OH, KW, KH, ST_X, ST_Y, PD_X, PD_Y, DL_X, DL_Y, IC, OC, B, total };
+ 
+-    if (kernel->type == GGML_TYPE_F16) {
+-        conv2d_cuda_f16(X_D, (half *) K_D, Y_D, params, st);
++    if (input->type == GGML_TYPE_F16 && kernel->type == GGML_TYPE_F16 && dst->type == GGML_TYPE_F16) {
++        conv2d_cuda((const half *) input->data, (const half *) kernel->data, (half *) dst->data, params, st);
++    } else if (input->type == GGML_TYPE_F32 && kernel->type == GGML_TYPE_F16 && dst->type == GGML_TYPE_F32) {
++        conv2d_cuda((const float *) input->data, (const half *) kernel->data, (float *) dst->data, params, st);
+     } else {
+-        conv2d_cuda_f32(X_D, K_D, Y_D, params, st);
++        GGML_ASSERT(input->type == GGML_TYPE_F32 && kernel->type == GGML_TYPE_F32 && dst->type == GGML_TYPE_F32);
++        conv2d_cuda((const float *) input->data, (const float *) kernel->data, (float *) dst->data, params, st);
+     }
++    bias_silu_cuda(dst, st);
+ }
+diff --git a/src/ggml-cuda/conv2d.cuh b/src/ggml-cuda/conv2d.cuh
+index ce4802c7ed7979e041a4e3d3040121617e6f950c..da973031dd160d4f5ac9a18433f5dfa55493344c 100644
+--- a/src/ggml-cuda/conv2d.cuh
++++ b/src/ggml-cuda/conv2d.cuh
+@@ -3,3 +3,8 @@
+ 
+ #define CUDA_CONV2D_BLOCK_SIZE 256
+ void ggml_cuda_op_conv2d(ggml_backend_cuda_context & ctx, ggml_tensor * dst);
++
++#ifdef GGML_CUDA_USE_CUDNN
++bool ggml_cuda_conv2d_cudnn(ggml_backend_cuda_context & ctx, ggml_tensor * dst, bool depthwise);
++void ggml_cuda_free_cudnn(ggml_backend_cuda_context & ctx);
++#endif
+diff --git a/src/ggml-cuda/cutlass-conv2d.cu b/src/ggml-cuda/cutlass-conv2d.cu
+new file mode 100644
+index 0000000000000000000000000000000000000000..bda22dc0cb181d1ad31c8f95c9f8e5f6ab4525d6
+--- /dev/null
++++ b/src/ggml-cuda/cutlass-conv2d.cu
+@@ -0,0 +1,103 @@
++#include "cutlass-conv2d.cuh"
++
++#ifdef GGML_CUDA_USE_CUTLASS
++
++#include "cutlass/conv/kernel/default_conv2d_fprop.h"
++#include "cutlass/conv/device/implicit_gemm_convolution.h"
++
++#include <new>
++
++namespace {
++
++using ElementAccumulator = float;
++using ElementCompute = float;
++using ElementInput = cutlass::half_t;
++using ElementOutput = cutlass::half_t;
++using Layout = cutlass::layout::TensorNHWC;
++using Epilogue = cutlass::epilogue::thread::LinearCombination<
++    ElementOutput, 8, ElementAccumulator, ElementCompute>;
++using Kernel = typename cutlass::conv::kernel::DefaultConv2dFprop<
++    ElementInput, Layout,
++    ElementInput, Layout,
++    ElementOutput, Layout,
++    ElementAccumulator,
++    cutlass::arch::OpClassTensorOp,
++    cutlass::arch::Sm80,
++    cutlass::gemm::GemmShape<128, 128, 64>,
++    cutlass::gemm::GemmShape<64, 64, 64>,
++    cutlass::gemm::GemmShape<16, 8, 16>,
++    Epilogue,
++    cutlass::gemm::threadblock::GemmIdentityThreadblockSwizzle<>,
++    3,
++    cutlass::arch::OpMultiplyAdd,
++    cutlass::conv::IteratorAlgorithm::kOptimized,
++    cutlass::conv::StrideSupport::kUnity>::Kernel;
++using ImplicitGemm = cutlass::conv::device::ImplicitGemmConvolution<Kernel>;
++
++} // namespace
++
++struct ggml_cuda_cutlass_conv {
++    ImplicitGemm op;
++    void * workspace = nullptr;
++
++    ~ggml_cuda_cutlass_conv() {
++        if (workspace) cudaFree(workspace);
++    }
++};
++
++ggml_cuda_cutlass_conv * ggml_cuda_cutlass_conv_create(
++        void * input, void * weight, void * output,
++        int64_t batches, int64_t input_height, int64_t input_width, int64_t input_channels,
++        int64_t output_height, int64_t output_width, int64_t output_channels,
++        int64_t kernel_height, int64_t kernel_width,
++        int64_t pad_height, int64_t pad_width,
++        int64_t stride_height, int64_t stride_width,
++        int64_t dilation_height, int64_t dilation_width) {
++    if (input_channels % 8 != 0 || output_channels % 8 != 0) return nullptr;
++
++    const cutlass::Tensor4DCoord input_size(batches, input_height, input_width, input_channels);
++    const cutlass::Tensor4DCoord filter_size(output_channels, kernel_height, kernel_width, input_channels);
++    const cutlass::Tensor4DCoord padding(pad_height, pad_height, pad_width, pad_width);
++    const cutlass::Tensor4DCoord output_size(batches, output_height, output_width, output_channels);
++    const cutlass::conv::Conv2dProblemSize problem(
++        input_size, filter_size, padding,
++        cutlass::MatrixCoord(stride_height, stride_width),
++        cutlass::MatrixCoord(dilation_height, dilation_width), output_size,
++        cutlass::conv::Mode::kCrossCorrelation, 1);
++
++    cutlass::TensorRef<ElementInput, Layout> input_ref(
++        static_cast<ElementInput *>(input), Layout::packed(input_size));
++    cutlass::TensorRef<ElementInput, Layout> weight_ref(
++        static_cast<ElementInput *>(weight), Layout::packed(filter_size));
++    cutlass::TensorRef<ElementOutput, Layout> output_ref(
++        static_cast<ElementOutput *>(output), Layout::packed(output_size));
++    typename ImplicitGemm::Arguments arguments{
++        problem, input_ref, weight_ref, output_ref, output_ref, {1.0f, 0.0f}};
++
++    auto * plan = new (std::nothrow) ggml_cuda_cutlass_conv;
++    if (!plan || plan->op.can_implement(arguments) != cutlass::Status::kSuccess) {
++        delete plan;
++        return nullptr;
++    }
++    const size_t workspace_bytes = plan->op.get_workspace_size(arguments);
++    if (workspace_bytes > 0 && cudaMalloc(&plan->workspace, workspace_bytes) != cudaSuccess) {
++        cudaGetLastError();
++        delete plan;
++        return nullptr;
++    }
++    if (plan->op.initialize(arguments, plan->workspace) != cutlass::Status::kSuccess) {
++        delete plan;
++        return nullptr;
++    }
++    return plan;
++}
++
++bool ggml_cuda_cutlass_conv_run(ggml_cuda_cutlass_conv * plan, cudaStream_t stream) {
++    return plan && plan->op(stream) == cutlass::Status::kSuccess;
++}
++
++void ggml_cuda_cutlass_conv_destroy(ggml_cuda_cutlass_conv * plan) {
++    delete plan;
++}
++
++#endif
+diff --git a/src/ggml-cuda/cutlass-conv2d.cuh b/src/ggml-cuda/cutlass-conv2d.cuh
+new file mode 100644
+index 0000000000000000000000000000000000000000..ac3e0862ffe102c7ebdcbe985a67d1cc50f5ea3f
+--- /dev/null
++++ b/src/ggml-cuda/cutlass-conv2d.cuh
+@@ -0,0 +1,23 @@
++#pragma once
++
++#ifdef GGML_CUDA_USE_CUTLASS
++
++#include <cuda_runtime.h>
++
++#include <cstdint>
++
++struct ggml_cuda_cutlass_conv;
++
++ggml_cuda_cutlass_conv * ggml_cuda_cutlass_conv_create(
++    void * input, void * weight, void * output,
++    int64_t batches, int64_t input_height, int64_t input_width, int64_t input_channels,
++    int64_t output_height, int64_t output_width, int64_t output_channels,
++    int64_t kernel_height, int64_t kernel_width,
++    int64_t pad_height, int64_t pad_width,
++    int64_t stride_height, int64_t stride_width,
++    int64_t dilation_height, int64_t dilation_width);
++
++bool ggml_cuda_cutlass_conv_run(ggml_cuda_cutlass_conv * plan, cudaStream_t stream);
++void ggml_cuda_cutlass_conv_destroy(ggml_cuda_cutlass_conv * plan);
++
++#endif
+diff --git a/src/ggml-cuda/ggml-cuda.cu b/src/ggml-cuda/ggml-cuda.cu
+index 561ab7ac599f9e285d2a0296caee0ab0a14ea5c8..76a70bca7859c75c945749ca6509589652bb7561 100644
+--- a/src/ggml-cuda/ggml-cuda.cu
++++ b/src/ggml-cuda/ggml-cuda.cu
+@@ -703,6 +703,10 @@ ggml_backend_cuda_context::~ggml_backend_cuda_context() {
+     std::unique_lock<std::mutex> lock(ggml_cuda_lock);
+     ggml_cuda_lock_cv.wait(lock, []{ return ggml_cuda_lock_counter.load(std::memory_order_relaxed) == 0; });
+ 
++#ifdef GGML_CUDA_USE_CUDNN
++    ggml_cuda_free_cudnn(*this);
++#endif
++
+     if (copy_event != nullptr) {
+         CUDA_CHECK(cudaEventDestroy(copy_event));
+     }
+@@ -5107,7 +5111,7 @@ static bool ggml_backend_cuda_device_supports_op(ggml_backend_dev_t dev, const g
+         case GGML_OP_CONV_2D:
+             return (ggml_is_contiguous(op->src[0]) && ggml_is_contiguous(op->src[1]));
+         case GGML_OP_CONV_2D_DW:
+-            return op->src[0]->type == GGML_TYPE_F32;
++            return op->src[0]->type == GGML_TYPE_F32 || op->src[0]->type == GGML_TYPE_F16;
+         case GGML_OP_CONV_TRANSPOSE_2D:
+         case GGML_OP_POOL_2D:
+             return true;
+diff --git a/src/ggml-cuda/pool2d.cu b/src/ggml-cuda/pool2d.cu
+index c6d51e4d655a3251f853838156381555501af798..b90cc2bc2cc19732ec27f03a78990f20ca91b402 100644
+--- a/src/ggml-cuda/pool2d.cu
++++ b/src/ggml-cuda/pool2d.cu
+@@ -1,4 +1,5 @@
+ #include "pool2d.cuh"
++#include "convert.cuh"
+ 
+ template <typename Ti, typename To>
+ static  __global__ void pool2d_nchw_kernel(
+@@ -24,8 +25,8 @@ static  __global__ void pool2d_nchw_kernel(
+     const int start_w = cur_ow * sw - pw;
+     const int bw = max(0, start_w);
+     const int ew = min(iw, start_w + kw);
+-    const To scale = 1. / (kh * kw);
+-    To res = 0;
++    const float scale = 1.0f / (kh * kw);
++    float res = 0.0f;
+ 
+     switch (op) {
+         case GGML_OP_POOL_AVG: res = 0; break;
+@@ -41,20 +42,21 @@ static  __global__ void pool2d_nchw_kernel(
+             Ti cur = i_ptr[i * iw + j];
+ #endif
+             switch (op) {
+-                case GGML_OP_POOL_AVG: res += cur * scale; break;
+-                case GGML_OP_POOL_MAX: res = max(res, (To)cur); break;
++                case GGML_OP_POOL_AVG: res += ggml_cuda_cast<float>(cur) * scale; break;
++                case GGML_OP_POOL_MAX: res = fmaxf(res, ggml_cuda_cast<float>(cur)); break;
+                 default: assert(false);
+             }
+         }
+     }
+-    o_ptr[cur_oh * ow + cur_ow] = res;
++    o_ptr[cur_oh * ow + cur_ow] = ggml_cuda_cast<To>(res);
+ }
+ 
+-static void pool2d_nchw_kernel_f32_f32_cuda(
++template <typename T>
++static void pool2d_nchw_cuda(
+         const int ih, const int iw, const int oh, const int ow,
+         const int kh, const int kw, const int sh, const int sw,
+         const int ph, const int pw, const int parallel_elements,
+-        const float * src, float * dst, const enum ggml_op_pool op,
++        const T * src, T * dst, const enum ggml_op_pool op,
+         cudaStream_t stream) {
+ 
+     const int num_blocks = (parallel_elements + CUDA_POOL2D_BLOCK_SIZE - 1) / CUDA_POOL2D_BLOCK_SIZE;
+@@ -64,12 +66,10 @@ static void pool2d_nchw_kernel_f32_f32_cuda(
+ 
+ void ggml_cuda_op_pool2d(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
+     const ggml_tensor * src0 = dst->src[0];
+-    const float * src0_d = (const float *)src0->data;
+-    float * dst_d = (float *)dst->data;
+     cudaStream_t stream = ctx.stream();
+ 
+-    GGML_ASSERT(src0->type == GGML_TYPE_F32);
+-    GGML_ASSERT( dst->type == GGML_TYPE_F32);
++    GGML_ASSERT(src0->type == dst->type);
++    GGML_ASSERT(src0->type == GGML_TYPE_F32 || src0->type == GGML_TYPE_F16);
+ 
+     const int32_t * opts = (const int32_t *)dst->op_params;
+     enum ggml_op_pool op = static_cast<ggml_op_pool>(opts[0]);
+@@ -90,5 +90,11 @@ void ggml_cuda_op_pool2d(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
+ 
+     const int parallel_elements = N * OC * OH * OW;
+ 
+-    pool2d_nchw_kernel_f32_f32_cuda(IH, IW, OH, OW, k1, k0, s1, s0, p1, p0, parallel_elements, src0_d, dst_d, op, stream);
++    if (src0->type == GGML_TYPE_F16) {
++        pool2d_nchw_cuda(IH, IW, OH, OW, k1, k0, s1, s0, p1, p0, parallel_elements,
++                         (const half *) src0->data, (half *) dst->data, op, stream);
++    } else {
++        pool2d_nchw_cuda(IH, IW, OH, OW, k1, k0, s1, s0, p1, p0, parallel_elements,
++                         (const float *) src0->data, (float *) dst->data, op, stream);
++    }
+ }
+diff --git a/src/ggml-cuda/scale.cu b/src/ggml-cuda/scale.cu
+index 7b2e59a4383f2bb2c3c63f8f132193cbfb9d8122..83a58482f222e8f0d5358ab3c9114990834729ae 100644
+--- a/src/ggml-cuda/scale.cu
++++ b/src/ggml-cuda/scale.cu
+@@ -1,37 +1,42 @@
+ #include "scale.cuh"
++#include "convert.cuh"
+ 
+ #define MAX_GRIDDIM_X 0x7FFFFFFF
+ 
+-static __global__ void scale_f32(const float * x, float * dst, const float scale, const float bias, const int64_t nelements) {
++template <typename T>
++static __global__ void scale_kernel(const T * x, T * dst, const float scale, const float bias, const int64_t nelements) {
+     ggml_cuda_pdl_lc();
+     int64_t tid = (int64_t)blockIdx.x * (int64_t)blockDim.x + (int64_t)threadIdx.x;
+     int64_t stride = (int64_t)blockDim.x * (int64_t)gridDim.x;
+ 
+     ggml_cuda_pdl_sync();
+     for (int64_t i = tid; i < nelements; i += stride) {
+-        dst[i] = scale * x[i] + bias;
++        dst[i] = ggml_cuda_cast<T>(scale * ggml_cuda_cast<float>(x[i]) + bias);
+     }
+ }
+ 
+-static void scale_f32_cuda(const float * x, float * dst, const float scale, const float bias, const int64_t nelements, cudaStream_t stream) {
++template <typename T>
++static void scale_cuda(const T * x, T * dst, const float scale, const float bias, const int64_t nelements, cudaStream_t stream) {
+     const int64_t num_blocks = (nelements + CUDA_SCALE_BLOCK_SIZE - 1) / CUDA_SCALE_BLOCK_SIZE;
+     const ggml_cuda_kernel_launch_params launch_params = ggml_cuda_kernel_launch_params(MIN(MAX_GRIDDIM_X, num_blocks), CUDA_SCALE_BLOCK_SIZE, 0, stream);
+-    ggml_cuda_kernel_launch(scale_f32, launch_params, x, dst, scale, bias, nelements);
++    ggml_cuda_kernel_launch(scale_kernel<T>, launch_params, x, dst, scale, bias, nelements);
+ }
+ 
+ void ggml_cuda_op_scale(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
+     const ggml_tensor * src0 = dst->src[0];
+-    const float * src0_d = (const float *)src0->data;
+-    float * dst_d = (float *)dst->data;
+     cudaStream_t stream = ctx.stream();
+ 
+-    GGML_ASSERT(src0->type == GGML_TYPE_F32);
+-    GGML_ASSERT( dst->type == GGML_TYPE_F32);
++    GGML_ASSERT(src0->type == dst->type);
++    GGML_ASSERT(src0->type == GGML_TYPE_F32 || src0->type == GGML_TYPE_F16);
+ 
+     float scale;
+     float bias;
+     memcpy(&scale, (float *) dst->op_params + 0, sizeof(float));
+     memcpy(&bias,  (float *) dst->op_params + 1, sizeof(float));
+ 
+-    scale_f32_cuda(src0_d, dst_d, scale, bias, ggml_nelements(src0), stream);
++    if (src0->type == GGML_TYPE_F16) {
++        scale_cuda((const half *) src0->data, (half *) dst->data, scale, bias, ggml_nelements(src0), stream);
++    } else {
++        scale_cuda((const float *) src0->data, (float *) dst->data, scale, bias, ggml_nelements(src0), stream);
++    }
+ }
+diff --git a/src/ggml-cuda/upscale.cu b/src/ggml-cuda/upscale.cu
+index 6bdf3cd996bfc48555e24917778dd45eddf786e0..3b03e9289f95c38ed0fb17ed22159e6af58cf583 100644
+--- a/src/ggml-cuda/upscale.cu
++++ b/src/ggml-cuda/upscale.cu
+@@ -1,6 +1,7 @@
+ #include "upscale.cuh"
+ 
+-static __global__ void upscale_f32(const float * x, float * dst,
++template <typename T>
++static __global__ void upscale_nearest(const T * x, T * dst,
+         const int nb00, const int nb01, const int nb02, const int nb03,
+         const int ne10, const int ne11, const int ne12, const int ne13,
+         const float sf0, const float sf1, const float sf2, const float sf3) {
+@@ -19,7 +20,7 @@ static __global__ void upscale_f32(const float * x, float * dst,
+     int i02 = i12 / sf2;
+     int i03 = i13 / sf3;
+ 
+-    dst[index] = *( (const float *)((const char *)x + i03 * nb03 + i02 * nb02 + i01 * nb01 + i00 * nb00) );
++    dst[index] = *( (const T *)((const char *)x + i03 * nb03 + i02 * nb02 + i01 * nb01 + i00 * nb00) );
+ }
+ 
+ static __global__ void upscale_f32_bilinear(const float * x, float * dst,
+@@ -215,7 +216,8 @@ static __global__ void upscale_f32_bicubic(const float * x, float * dst,
+     dst[index] = result;
+ }
+ 
+-static void upscale_f32_cuda(const float * x, float * dst,
++template <typename T>
++static void upscale_nearest_cuda(const T * x, T * dst,
+         const int nb00, const int nb01, const int nb02, const int nb03,
+         const int ne10, const int ne11, const int ne12, const int ne13,
+         const float sf0, const float sf1, const float sf2, const float sf3,
+@@ -223,7 +225,7 @@ static void upscale_f32_cuda(const float * x, float * dst,
+     const int64_t dst_size   = ne10 * ne11 * ne12 * ne13;
+     const int64_t num_blocks = (dst_size + CUDA_UPSCALE_BLOCK_SIZE - 1) / CUDA_UPSCALE_BLOCK_SIZE;
+ 
+-    upscale_f32<<<num_blocks, CUDA_UPSCALE_BLOCK_SIZE,0,stream>>>(x, dst, nb00, nb01, nb02, nb03, ne10, ne11, ne12, ne13, sf0, sf1, sf2, sf3);
++    upscale_nearest<<<num_blocks, CUDA_UPSCALE_BLOCK_SIZE,0,stream>>>(x, dst, nb00, nb01, nb02, nb03, ne10, ne11, ne12, ne13, sf0, sf1, sf2, sf3);
+ }
+ 
+ static void upscale_f32_bilinear_cuda(const float * x, float * dst,
+@@ -256,12 +258,10 @@ static void upscale_f32_bicubic_cuda(const float * x, float * dst,
+ 
+ void ggml_cuda_op_upscale(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
+     const ggml_tensor * src0 = dst->src[0];
+-    const float * src0_d = (const float *)src0->data;
+-    float * dst_d = (float *)dst->data;
+     cudaStream_t stream = ctx.stream();
+ 
+-    GGML_ASSERT(src0->type == GGML_TYPE_F32);
+-    GGML_ASSERT( dst->type == GGML_TYPE_F32);
++    GGML_ASSERT(src0->type == dst->type);
++    GGML_ASSERT(src0->type == GGML_TYPE_F32 || src0->type == GGML_TYPE_F16);
+ 
+     const int mode_flags = dst->op_params[0];
+     const ggml_scale_mode mode = (ggml_scale_mode)(mode_flags & 0xFF);
+@@ -279,13 +279,27 @@ void ggml_cuda_op_upscale(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
+     }
+ 
+     if (mode == GGML_SCALE_MODE_NEAREST) {
+-        upscale_f32_cuda(src0_d, dst_d, src0->nb[0], src0->nb[1], src0->nb[2], src0->nb[3], dst->ne[0], dst->ne[1], dst->ne[2], dst->ne[3], sf0, sf1, sf2, sf3, stream);
++        if (src0->type == GGML_TYPE_F16) {
++            upscale_nearest_cuda((const half *) src0->data, (half *) dst->data,
++                                 src0->nb[0], src0->nb[1], src0->nb[2], src0->nb[3],
++                                 dst->ne[0], dst->ne[1], dst->ne[2], dst->ne[3], sf0, sf1, sf2, sf3, stream);
++        } else {
++            upscale_nearest_cuda((const float *) src0->data, (float *) dst->data,
++                                 src0->nb[0], src0->nb[1], src0->nb[2], src0->nb[3],
++                                 dst->ne[0], dst->ne[1], dst->ne[2], dst->ne[3], sf0, sf1, sf2, sf3, stream);
++        }
+     } else if (mode == GGML_SCALE_MODE_BILINEAR) {
++        GGML_ASSERT(src0->type == GGML_TYPE_F32);
++        const float * src0_d = (const float *) src0->data;
++        float * dst_d = (float *) dst->data;
+         const bool antialias = (mode_flags & GGML_SCALE_FLAG_ANTIALIAS);
+         upscale_f32_bilinear_cuda(src0_d, dst_d, src0->nb[0], src0->nb[1], src0->nb[2], src0->nb[3],
+                                  src0->ne[0], src0->ne[1], dst->ne[0], dst->ne[1], dst->ne[2], dst->ne[3],
+                                  sf0, sf1, sf2, sf3, pixel_offset, antialias, stream);
+     } else if (mode == GGML_SCALE_MODE_BICUBIC) {
++        GGML_ASSERT(src0->type == GGML_TYPE_F32);
++        const float * src0_d = (const float *) src0->data;
++        float * dst_d = (float *) dst->data;
+         upscale_f32_bicubic_cuda(src0_d, dst_d, src0->nb[0], src0->nb[1], src0->nb[2], src0->nb[3],
+                                  src0->ne[0], src0->ne[1], dst->ne[0], dst->ne[1], dst->ne[2], dst->ne[3],
+                                  sf0, sf1, sf2, sf3, pixel_offset, stream);
+diff --git a/src/ggml-vulkan/ggml-vulkan.cpp b/src/ggml-vulkan/ggml-vulkan.cpp
+index 510fb6892b376cc709d512d55a3628e645d54d25..3cd01aaddf1b869cf222b7fc0c7f79d8205fe7a3 100644
+--- a/src/ggml-vulkan/ggml-vulkan.cpp
++++ b/src/ggml-vulkan/ggml-vulkan.cpp
+@@ -511,9 +511,9 @@ struct vk_conv_block_size {
+ vk_conv_block_size vk_conv_block_sizes[CONV_SHAPE_COUNT] = {
+     // K   NPQ  CRS
+     { 128, 128, 16 }, // CONV_SHAPE_128x128
+-    {  64,  32, 32 }, // CONV_SHAPE_64x32
++    {  64,  32, 64 }, // CONV_SHAPE_64x32
+     {  32, 256, 16 }, // CONV_SHAPE_32x256
+-    {  64, 128, 16 }, // CONV_SHAPE_64x128
++    {  64, 128, 32 }, // CONV_SHAPE_64x128
+ };
+ 
+ enum dmmv_wg_sizes {
+@@ -795,6 +795,7 @@ struct vk_device_struct {
+     bool add_rms_fusion;
+     uint32_t partials_binding_alignment;
+     uint32_t max_nodes_per_submit;
++    uint32_t target_submits;
+ 
+     bool shader_64b_indexing;
+ 
+@@ -912,7 +913,8 @@ struct vk_device_struct {
+ 
+     vk_pipeline pipeline_concat_i8, pipeline_concat_i16, pipeline_concat_i32, pipeline_concat_i64;
+     vk_pipeline pipeline_upscale_nearest_f32, pipeline_upscale_bilinear_f32, pipeline_upscale_bicubic_f32, pipeline_upscale_bilinear_antialias_f32;
+-    vk_pipeline pipeline_scale_f32;
++    vk_pipeline pipeline_upscale_nearest_f16, pipeline_upscale_bilinear_f16, pipeline_upscale_bicubic_f16, pipeline_upscale_bilinear_antialias_f16;
++    vk_pipeline pipeline_scale_f32, pipeline_scale_f16;
+     vk_pipeline pipeline_log[2];
+     vk_pipeline pipeline_tri[2];
+     vk_pipeline pipeline_diag[2];
+@@ -1023,7 +1025,7 @@ struct vk_device_struct {
+     vk_pipeline pipeline_snake_f16;
+     vk_pipeline pipeline_snake_bf16;
+     vk_pipeline pipeline_pool1d_f32;
+-    vk_pipeline pipeline_pool2d_f32;
++    vk_pipeline pipeline_pool2d_f32, pipeline_pool2d_f16;
+     vk_pipeline pipeline_rwkv_wkv6_f32;
+     vk_pipeline pipeline_rwkv_wkv7_f32;
+     // [size_idx][kda] where size_idx: 0=d16, 1=d32, 2=d64, 3=d128
+@@ -1037,12 +1039,14 @@ struct vk_device_struct {
+     vk_pipeline pipeline_opt_step_sgd_f32;
+     std::map<vk_conv2d_pipeline_state, vk_pipeline> pipeline_conv2d_f32[CONV_SHAPE_COUNT];
+     std::map<vk_conv2d_pipeline_state, vk_pipeline> pipeline_conv2d_f16_f32[CONV_SHAPE_COUNT];
++    std::map<vk_conv2d_pipeline_state, vk_pipeline> pipeline_conv2d_f16[CONV_SHAPE_COUNT];
+     std::map<vk_conv2d_pipeline_state, vk_pipeline> pipeline_conv_transpose_2d_f32[CONV_SHAPE_COUNT];
+     std::map<vk_conv2d_pipeline_state, vk_pipeline> pipeline_conv_transpose_2d_f16_f32[CONV_SHAPE_COUNT];
++    std::map<vk_conv2d_pipeline_state, vk_pipeline> pipeline_conv_transpose_2d_f16[CONV_SHAPE_COUNT];
+     std::map<vk_conv3d_pipeline_state, vk_pipeline> pipeline_conv3d_f32[CONV_SHAPE_COUNT];
+     std::map<vk_conv3d_pipeline_state, vk_pipeline> pipeline_conv3d_f16_f32[CONV_SHAPE_COUNT];
+-    vk_pipeline pipeline_conv2d_dw_whcn_f32, pipeline_conv2d_dw_whcn_f16_f32;
+-    vk_pipeline pipeline_conv2d_dw_cwhn_f32, pipeline_conv2d_dw_cwhn_f16_f32;
++    vk_pipeline pipeline_conv2d_dw_whcn_f32, pipeline_conv2d_dw_whcn_f16_f32, pipeline_conv2d_dw_whcn_f16;
++    vk_pipeline pipeline_conv2d_dw_cwhn_f32, pipeline_conv2d_dw_cwhn_f16_f32, pipeline_conv2d_dw_cwhn_f16;
+ 
+     std::map<vk_fa_pipeline_state, vk_pipeline> pipeline_flash_attn_f32_f16;
+ 
+@@ -1796,6 +1800,8 @@ struct vk_op_conv2d_push_constants {
+     uint32_t nb2;
+     uint32_t nb3;
+ 
++    uint32_t fuse_bias_silu;
++
+     // init_fastdiv_values constants for dividing by OW, OW*OH
+     uint32_t OWmp;   uint32_t OWL;
+     uint32_t OWOHmp; uint32_t OWOHL;
+@@ -2288,22 +2294,26 @@ static uint32_t get_misalign_bytes(const ggml_backend_vk_context * ctx, const gg
+     return ((vk_tensor_offset(t) + t->view_offs) & (ctx->device->properties.limits.minStorageBufferOffsetAlignment - 1));;
+ }
+ 
+-static uint32_t ggml_vk_concat_unit_size(ggml_type type) {
+-    const uint32_t type_size = ggml_type_size(type);
+-
+-    if (!ggml_is_quantized(type)) {
+-        return type_size;
+-    }
++static uint32_t ggml_vk_concat_unit_size(const ggml_tensor * src0, const ggml_tensor * src1, const ggml_tensor * dst) {
++    const uint32_t type_size  = ggml_type_size(dst->type);
++    const uint32_t block_size = ggml_blck_size(dst->type);
+ 
+-    // Use the widest existing concat shader that evenly divides a quant block.
+-    if (type_size % 8 == 0) {
+-        return 8;
+-    }
+-    if (type_size % 4 == 0) {
+-        return 4;
+-    }
+-    if (type_size % 2 == 0) {
+-        return 2;
++    // Concatenation is a raw copy. Use the widest shader compatible with row
++    // boundaries, strides, and suballocation offsets so each invocation can
++    // move several F16/F32 elements without changing their representation.
++    for (uint32_t unit_size : { 8u, 4u, 2u, 1u }) {
++        bool aligned = true;
++        for (const ggml_tensor * tensor : { src0, src1, dst }) {
++            const uint64_t row_bytes = tensor->ne[0] / block_size * type_size;
++            const uint64_t offset    = vk_tensor_offset(tensor) + tensor->view_offs;
++            aligned = aligned && row_bytes % unit_size == 0 && offset % unit_size == 0;
++            for (int dim = 1; dim < GGML_MAX_DIMS; ++dim) {
++                aligned = aligned && tensor->nb[dim] % unit_size == 0;
++            }
++        }
++        if (aligned) {
++            return unit_size;
++        }
+     }
+     return 1;
+ }
+@@ -2313,13 +2323,9 @@ static bool ggml_vk_concat_supported(const ggml_tensor * src0, const ggml_tensor
+         return false;
+     }
+ 
+-    if (!ggml_is_quantized(src0->type)) {
+-        const size_t type_size = ggml_type_size(src0->type);
+-        return type_size == 1 || type_size == 2 || type_size == 4 || type_size == 8;
+-    }
+-
+-    // Quantized tensor rows are block-aligned when created.
+-    return ggml_is_contiguous_rows(src0) && ggml_is_contiguous_rows(src1) && ggml_is_contiguous_rows(dst);
++    const size_t type_size = ggml_type_size(src0->type);
++    return (type_size == 1 || type_size == 2 || type_size == 4 || type_size == 8 || ggml_is_quantized(src0->type)) &&
++        ggml_is_contiguous_rows(src0) && ggml_is_contiguous_rows(src1) && ggml_is_contiguous_rows(dst);
+ }
+ 
+ template <typename T> void init_pushconst_tensor_offsets(ggml_backend_vk_context * ctx, T &p, const ggml_tensor * src0, const ggml_tensor * src1, const ggml_tensor * src2, const ggml_tensor * src3, ggml_tensor * dst) {
+@@ -5450,8 +5456,13 @@ static void ggml_vk_load_shaders(vk_device& device, vk_pipeline requested) {
+     ggml_vk_create_pipeline(device, device->pipeline_upscale_bilinear_f32, "upscale_f32", upscale_f32_len, upscale_f32_data, "main", 2, sizeof(vk_op_upscale_push_constants), {512, 1, 1}, {GGML_SCALE_MODE_BILINEAR}, 1);
+     ggml_vk_create_pipeline(device, device->pipeline_upscale_bicubic_f32, "upscale_f32", upscale_f32_len, upscale_f32_data, "main", 2, sizeof(vk_op_upscale_push_constants), {512, 1, 1}, {GGML_SCALE_MODE_BICUBIC}, 1);
+     ggml_vk_create_pipeline(device, device->pipeline_upscale_bilinear_antialias_f32, "upscale_f32", upscale_f32_len, upscale_f32_data, "main", 2, sizeof(vk_op_upscale_push_constants), {512, 1, 1}, {GGML_SCALE_MODE_BILINEAR | GGML_SCALE_FLAG_ANTIALIAS}, 1);
++    ggml_vk_create_pipeline(device, device->pipeline_upscale_nearest_f16, "upscale_f16", upscale_f16_len, upscale_f16_data, "main", 2, sizeof(vk_op_upscale_push_constants), {512, 1, 1}, {GGML_SCALE_MODE_NEAREST}, 1);
++    ggml_vk_create_pipeline(device, device->pipeline_upscale_bilinear_f16, "upscale_f16", upscale_f16_len, upscale_f16_data, "main", 2, sizeof(vk_op_upscale_push_constants), {512, 1, 1}, {GGML_SCALE_MODE_BILINEAR}, 1);
++    ggml_vk_create_pipeline(device, device->pipeline_upscale_bicubic_f16, "upscale_f16", upscale_f16_len, upscale_f16_data, "main", 2, sizeof(vk_op_upscale_push_constants), {512, 1, 1}, {GGML_SCALE_MODE_BICUBIC}, 1);
++    ggml_vk_create_pipeline(device, device->pipeline_upscale_bilinear_antialias_f16, "upscale_f16", upscale_f16_len, upscale_f16_data, "main", 2, sizeof(vk_op_upscale_push_constants), {512, 1, 1}, {GGML_SCALE_MODE_BILINEAR | GGML_SCALE_FLAG_ANTIALIAS}, 1);
+ 
+     ggml_vk_create_pipeline(device, device->pipeline_scale_f32, "scale_f32", scale_f32_len, scale_f32_data, "main", 2, sizeof(vk_op_unary_push_constants), {512, 1, 1}, {}, 1);
++    ggml_vk_create_pipeline(device, device->pipeline_scale_f16, "scale_f16", scale_f16_len, scale_f16_data, "main", 2, sizeof(vk_op_unary_push_constants), {512, 1, 1}, {}, 1);
+ 
+     ggml_vk_create_pipeline(device, device->pipeline_log[0], "log_f32", log_f32_len, log_f32_data, "main", 2, sizeof(vk_op_unary_push_constants), {512, 1, 1}, {}, 1);
+     ggml_vk_create_pipeline(device, device->pipeline_log[1], "log_f16", log_f16_len, log_f16_data, "main", 2, sizeof(vk_op_unary_push_constants), {512, 1, 1}, {}, 1);
+@@ -5660,6 +5671,7 @@ static void ggml_vk_load_shaders(vk_device& device, vk_pipeline requested) {
+ 
+     ggml_vk_create_pipeline(device, device->pipeline_pool1d_f32, "pool1d_f32", pool1d_f32_len, pool1d_f32_data, "main", 2, sizeof(vk_op_pool1d_push_constants), {512, 1, 1}, {}, 1);
+     ggml_vk_create_pipeline(device, device->pipeline_pool2d_f32, "pool2d_f32", pool2d_f32_len, pool2d_f32_data, "main", 2, sizeof(vk_op_pool2d_push_constants), {512, 1, 1}, {}, 1);
++    ggml_vk_create_pipeline(device, device->pipeline_pool2d_f16, "pool2d_f16", pool2d_f16_len, pool2d_f16_data, "main", 2, sizeof(vk_op_pool2d_push_constants), {512, 1, 1}, {}, 1);
+ 
+     ggml_vk_create_pipeline(device, device->pipeline_rwkv_wkv6_f32, "rwkv_wkv6_f32", rwkv_wkv6_f32_len, rwkv_wkv6_f32_data, "main", 7, sizeof(vk_op_rwkv_wkv6_push_constants), {1, 1, 1}, {device->subgroup_size}, 1);
+ 
+@@ -5757,6 +5769,17 @@ static void ggml_vk_load_shaders(vk_device& device, vk_pipeline requested) {
+         vk_conv_block_size conv2d_BS = vk_conv_block_sizes[s];
+         bool conv2d_UNROLL = true;
+ 
++        // Wider CRS tiles amortize cooperative-matrix barriers on NVIDIA.
++        // Keep the upstream sizes on other vendors, whose shared-memory and
++        // register limits differ from the measured device.
++        if (device->vendor_id != VK_VENDOR_ID_NVIDIA) {
++            if (s == CONV_SHAPE_64x32) {
++                conv2d_BS.CRS = 32;
++            } else if (s == CONV_SHAPE_64x128) {
++                conv2d_BS.CRS = 16;
++            }
++        }
++
+ #if defined(GGML_VULKAN_COOPMAT2_GLSLC_SUPPORT)
+         if (device->coopmat2) {
+             conv2d_SHMEM_PAD = 8; // 8 float16_t
+@@ -5878,14 +5901,16 @@ static void ggml_vk_load_shaders(vk_device& device, vk_pipeline requested) {
+             spec_constants_cpy.push_back(conv2d_WN); \
+             ggml_vk_create_pipeline( \
+                 device, c.second, #name #type_suffix, \
+-                name##type_suffix##spv_suffix##_len, name##type_suffix##spv_suffix##_data, "main", 3, \
++                name##type_suffix##spv_suffix##_len, name##type_suffix##spv_suffix##_data, "main", 4, \
+                 sizeof(vk_op_conv2d_push_constants), wg_denoms, spec_constants_cpy, 1, true, use_collectives || conv2d_required_subgroup_size, conv2d_required_subgroup_size);    \
+         }
+ #define CREATE_CONVS(spv_suffix) \
+         CREATE_CONV(conv2d, _f32, spv_suffix) \
+         CREATE_CONV(conv2d, _f16_f32, spv_suffix) \
++        CREATE_CONV(conv2d, _f16, spv_suffix) \
+         CREATE_CONV(conv_transpose_2d, _f32, spv_suffix) \
+-        CREATE_CONV(conv_transpose_2d, _f16_f32, spv_suffix)
++        CREATE_CONV(conv_transpose_2d, _f16_f32, spv_suffix) \
++        CREATE_CONV(conv_transpose_2d, _f16, spv_suffix)
+ #if defined(GGML_VULKAN_COOPMAT2_GLSLC_SUPPORT)
+         if (device->coopmat2) {
+             CREATE_CONVS(_cm2)
+@@ -5956,6 +5981,8 @@ static void ggml_vk_load_shaders(vk_device& device, vk_pipeline requested) {
+     ggml_vk_create_pipeline(device, device->pipeline_conv2d_dw_cwhn_f32, "conv2d_dw_cwhn_f32", conv2d_dw_cwhn_f32_len, conv2d_dw_cwhn_f32_data, "main", 3, sizeof(vk_op_conv2d_dw_push_constants), {512, 1, 1}, {}, 1);
+     ggml_vk_create_pipeline(device, device->pipeline_conv2d_dw_whcn_f16_f32, "conv2d_dw_whcn_f16_f32", conv2d_dw_whcn_f16_f32_len, conv2d_dw_whcn_f16_f32_data, "main", 3, sizeof(vk_op_conv2d_dw_push_constants), {512, 1, 1}, {}, 1);
+     ggml_vk_create_pipeline(device, device->pipeline_conv2d_dw_cwhn_f16_f32, "conv2d_dw_cwhn_f16_f32", conv2d_dw_cwhn_f16_f32_len, conv2d_dw_cwhn_f16_f32_data, "main", 3, sizeof(vk_op_conv2d_dw_push_constants), {512, 1, 1}, {}, 1);
++    ggml_vk_create_pipeline(device, device->pipeline_conv2d_dw_whcn_f16, "conv2d_dw_whcn_f16", conv2d_dw_whcn_f16_len, conv2d_dw_whcn_f16_data, "main", 3, sizeof(vk_op_conv2d_dw_push_constants), {512, 1, 1}, {}, 1);
++    ggml_vk_create_pipeline(device, device->pipeline_conv2d_dw_cwhn_f16, "conv2d_dw_cwhn_f16", conv2d_dw_cwhn_f16_len, conv2d_dw_cwhn_f16_data, "main", 3, sizeof(vk_op_conv2d_dw_push_constants), {512, 1, 1}, {}, 1);
+ 
+     for (uint32_t use_push = 0; use_push < 2; ++use_push) {
+         for (uint32_t i = 0; i < num_topk_moe_pipelines; ++i) {
+@@ -6265,6 +6292,13 @@ static vk_device ggml_vk_get_device(size_t idx) {
+             uint32_t max_nodes_per_submit = std::stoul(GGML_VK_MAX_NODES_PER_SUBMIT);
+             device->max_nodes_per_submit = std::max(max_nodes_per_submit, 1u);
+         }
++        // NVIDIA vision graphs benefit from fewer, larger submissions. Zero
++        // selects the measured FLOP-dependent 4/8 policy below.
++        device->target_submits = device->vendor_id == VK_VENDOR_ID_NVIDIA ? 0 : 40;
++        const char * GGML_VK_TARGET_SUBMITS = getenv("GGML_VK_TARGET_SUBMITS");
++        if (GGML_VK_TARGET_SUBMITS != nullptr) {
++            device->target_submits = std::max(std::stoul(GGML_VK_TARGET_SUBMITS), 1ul);
++        }
+ 
+         const bool force_disable_f16 = getenv("GGML_VK_DISABLE_F16") != nullptr;
+ 
+@@ -10978,7 +11012,7 @@ static vk_pipeline ggml_vk_op_get_pipeline(ggml_backend_vk_context * ctx, const
+         if (!ggml_vk_concat_supported(src0, src1, dst)) {
+             return nullptr;
+         }
+-        switch (ggml_vk_concat_unit_size(src0->type)) {
++        switch (ggml_vk_concat_unit_size(src0, src1, dst)) {
+         case 1:
+             return ctx->device->pipeline_concat_i8;
+         case 2:
+@@ -10992,25 +11026,26 @@ static vk_pipeline ggml_vk_op_get_pipeline(ggml_backend_vk_context * ctx, const
+         }
+     }
+     case GGML_OP_UPSCALE:
+-        if (src0->type == GGML_TYPE_F32 && dst->type == GGML_TYPE_F32) {
++        if (src0->type == dst->type && (src0->type == GGML_TYPE_F32 || src0->type == GGML_TYPE_F16)) {
++            const bool f16 = src0->type == GGML_TYPE_F16;
+             uint32_t mode = (ggml_get_op_params_i32(dst, 0) & (0xFF | GGML_SCALE_FLAG_ANTIALIAS));
+             switch (mode) {
+                 case GGML_SCALE_MODE_NEAREST:
+-                    return ctx->device->pipeline_upscale_nearest_f32;
++                    return f16 ? ctx->device->pipeline_upscale_nearest_f16 : ctx->device->pipeline_upscale_nearest_f32;
+                 case GGML_SCALE_MODE_BILINEAR:
+-                    return ctx->device->pipeline_upscale_bilinear_f32;
++                    return f16 ? ctx->device->pipeline_upscale_bilinear_f16 : ctx->device->pipeline_upscale_bilinear_f32;
+                 case GGML_SCALE_MODE_BICUBIC:
+-                    return ctx->device->pipeline_upscale_bicubic_f32;
++                    return f16 ? ctx->device->pipeline_upscale_bicubic_f16 : ctx->device->pipeline_upscale_bicubic_f32;
+                 case GGML_SCALE_MODE_BILINEAR | GGML_SCALE_FLAG_ANTIALIAS:
+-                    return ctx->device->pipeline_upscale_bilinear_antialias_f32;
++                    return f16 ? ctx->device->pipeline_upscale_bilinear_antialias_f16 : ctx->device->pipeline_upscale_bilinear_antialias_f32;
+                 default:
+                     return nullptr;
+             }
+         }
+         return nullptr;
+     case GGML_OP_SCALE:
+-        if (src0->type == GGML_TYPE_F32 && dst->type == GGML_TYPE_F32) {
+-            return ctx->device->pipeline_scale_f32;
++        if (src0->type == dst->type && (src0->type == GGML_TYPE_F32 || src0->type == GGML_TYPE_F16)) {
++            return src0->type == GGML_TYPE_F16 ? ctx->device->pipeline_scale_f16 : ctx->device->pipeline_scale_f32;
+         }
+         return nullptr;
+     case GGML_OP_SQR:
+@@ -11378,8 +11413,8 @@ static vk_pipeline ggml_vk_op_get_pipeline(ggml_backend_vk_context * ctx, const
+         }
+         return nullptr;
+     case GGML_OP_POOL_2D:
+-        if (src0->type == GGML_TYPE_F32 && dst->type == GGML_TYPE_F32) {
+-            return ctx->device->pipeline_pool2d_f32;
++        if (src0->type == dst->type && (src0->type == GGML_TYPE_F32 || src0->type == GGML_TYPE_F16)) {
++            return src0->type == GGML_TYPE_F16 ? ctx->device->pipeline_pool2d_f16 : ctx->device->pipeline_pool2d_f32;
+         }
+         return nullptr;
+     case GGML_OP_RWKV_WKV6:
+@@ -11445,7 +11480,8 @@ static vk_pipeline ggml_vk_op_get_pipeline(ggml_backend_vk_context * ctx, const
+         return nullptr;
+     case GGML_OP_CONV_2D:
+     case GGML_OP_CONV_TRANSPOSE_2D:
+-        if (src1->type == GGML_TYPE_F32 && dst->type == GGML_TYPE_F32) {
++        if ((src1->type == GGML_TYPE_F32 && dst->type == GGML_TYPE_F32) ||
++            (src0->type == GGML_TYPE_F16 && src1->type == GGML_TYPE_F16 && dst->type == GGML_TYPE_F16)) {
+             uint32_t K = dst->ne[2]; // Cout
+             uint32_t NPQ = dst->ne[3] * dst->ne[1] * dst->ne[0]; // N * OH * OW
+             vk_conv_shapes shape = ggml_vk_conv_select_shape(ctx, K, NPQ);
+@@ -11476,12 +11512,16 @@ static vk_pipeline ggml_vk_op_get_pipeline(ggml_backend_vk_context * ctx, const
+             if (op == GGML_OP_CONV_2D) {
+                 if (src0->type == GGML_TYPE_F32) {
+                     pipelines = &ctx->device->pipeline_conv2d_f32[shape];
++                } else if (src1->type == GGML_TYPE_F16) {
++                    pipelines = &ctx->device->pipeline_conv2d_f16[shape];
+                 } else if (src0->type == GGML_TYPE_F16) {
+                     pipelines = &ctx->device->pipeline_conv2d_f16_f32[shape];
+                 }
+             } else if (op == GGML_OP_CONV_TRANSPOSE_2D) {
+                 if (src0->type == GGML_TYPE_F32) {
+                     pipelines = &ctx->device->pipeline_conv_transpose_2d_f32[shape];
++                } else if (src1->type == GGML_TYPE_F16) {
++                    pipelines = &ctx->device->pipeline_conv_transpose_2d_f16[shape];
+                 } else if (src0->type == GGML_TYPE_F16) {
+                     pipelines = &ctx->device->pipeline_conv_transpose_2d_f16_f32[shape];
+                 }
+@@ -11515,6 +11555,12 @@ static vk_pipeline ggml_vk_op_get_pipeline(ggml_backend_vk_context * ctx, const
+             } else if (ggml_is_contiguous_channels(src1)) {
+                 return ctx->device->pipeline_conv2d_dw_cwhn_f16_f32;
+             }
++        } else if (src0->type == GGML_TYPE_F16 && src1->type == GGML_TYPE_F16 && dst->type == GGML_TYPE_F16) {
++            if (ggml_is_contiguous(src1)) {
++                return ctx->device->pipeline_conv2d_dw_whcn_f16;
++            } else if (ggml_is_contiguous_channels(src1)) {
++                return ctx->device->pipeline_conv2d_dw_cwhn_f16;
++            }
+         }
+         return nullptr;
+     case GGML_OP_CONV_3D:
+@@ -11676,7 +11722,7 @@ template <> void init_pushconst_tensor_offsets(ggml_backend_vk_context * ctx, vk
+ }
+ 
+ template <> void init_pushconst_tensor_offsets(ggml_backend_vk_context * ctx, vk_op_concat_push_constants &p, const ggml_tensor * src0, const ggml_tensor * src1, const ggml_tensor * src2, const ggml_tensor * src3, ggml_tensor * dst) {
+-    const uint32_t unit_size = ggml_vk_concat_unit_size(dst->type);
++    const uint32_t unit_size = ggml_vk_concat_unit_size(src0, src1, dst);
+     const uint32_t a_offset = get_misalign_bytes(ctx, src0) / unit_size;
+     const uint32_t b_offset = get_misalign_bytes(ctx, src1) / unit_size;
+     const uint32_t d_offset = get_misalign_bytes(ctx, dst) / unit_size;
+@@ -11722,7 +11768,9 @@ static void ggml_vk_op_f32(ggml_backend_vk_context * ctx, vk_context& subctx, co
+     }
+     std::cerr << "), (" << dst << ", name=" << dst->name << ", type=" << dst->type << ", ne0=" << dst->ne[0] << ", ne1=" << dst->ne[1] << ", ne2=" << dst->ne[2] << ", ne3=" << dst->ne[3] << ", nb0=" << dst->nb[0] << ", nb1=" << dst->nb[1] << ", nb2=" << dst->nb[2] << ", nb3=" << dst->nb[3];
+     std::cerr << "), " << ggml_op_name(op) << ")");
+-    GGML_ASSERT(op == GGML_OP_GET_ROWS || op == GGML_OP_CPY || op == GGML_OP_CONCAT || (!ggml_is_quantized(src0->type) && (src1 == nullptr || !ggml_is_quantized(src1->type))));  // NOLINT
++    // IM2COL/IM2COL_3D never bind src0 (dispatch uses only src1/dst buffers);
++    // a quantized src0 only lends KH/KW/IC shape metadata to the patch loop.
++    GGML_ASSERT(op == GGML_OP_GET_ROWS || op == GGML_OP_CPY || op == GGML_OP_CONCAT || op == GGML_OP_IM2COL || op == GGML_OP_IM2COL_3D || (!ggml_is_quantized(src0->type) && (src1 == nullptr || !ggml_is_quantized(src1->type))));  // NOLINT
+     GGML_ASSERT(dst->buffer != nullptr);
+     const uint64_t ne00 = src0->ne[0];
+     const uint64_t ne01 = src0->ne[1];
+@@ -11984,8 +12032,9 @@ static void ggml_vk_op_f32(ggml_backend_vk_context * ctx, vk_context& subctx, co
+                     ne *= ggml_type_size(src0->type) / 2;
+                 }
+             }
+-            if (op == GGML_OP_CONCAT && ggml_is_quantized(dst->type)) {
+-                ne = ne / ggml_blck_size(dst->type) * ggml_type_size(dst->type) / ggml_vk_concat_unit_size(dst->type);
++            if (op == GGML_OP_CONCAT) {
++                ne = ne / ggml_blck_size(dst->type) * ggml_type_size(dst->type) /
++                    ggml_vk_concat_unit_size(src0, src1, dst);
+             }
+             // copy_to_quant has block size of 32, and each thread does QUANT_K elements.
+             // Splitting into 512x512xZ wouldn't work well since each workgroup does 1024 elements.
+@@ -12084,6 +12133,10 @@ static void ggml_vk_op_f32(ggml_backend_vk_context * ctx, vk_context& subctx, co
+     } else if (op == GGML_OP_OPT_STEP_SGD) {
+         // OPT_STEP_SGD works on src0, it does not need dst
+         ggml_vk_dispatch_pipeline(ctx, subctx, pipeline, { src0_buf, src1_buf, src2_buf }, pc, elements);
++    } else if (op == GGML_OP_CONV_2D || op == GGML_OP_CONV_TRANSPOSE_2D) {
++        // Direct convolution always declares the optional FP32 bias binding.
++        ggml_vk_dispatch_pipeline(ctx, subctx, pipeline,
++            { src0_buf, src1_buf, dst_buf, use_src2 ? src2_buf : src0_buf }, pc, elements);
+     } else if (use_src3) {
+         ggml_vk_dispatch_pipeline(ctx, subctx, pipeline, { src0_buf, src1_buf, src2_buf, src3_buf, dst_buf }, pc, elements);
+     } else if (use_src2) {
+@@ -12627,18 +12680,17 @@ static void ggml_vk_opt_step_sgd(ggml_backend_vk_context * ctx, vk_context& subc
+ static void ggml_vk_concat(ggml_backend_vk_context * ctx, vk_context& subctx, const ggml_tensor * src0, const ggml_tensor * src1, ggml_tensor * dst) {
+     int * op_params = (int *)dst->op_params;
+ 
+-    const uint32_t unit_size = ggml_vk_concat_unit_size(dst->type);
+-    const uint32_t units_per_block = ggml_type_size(dst->type) / unit_size;
++    const uint32_t unit_size = ggml_vk_concat_unit_size(src0, src1, dst);
++    const uint32_t type_size = ggml_type_size(dst->type);
+     const uint32_t block_size = ggml_blck_size(dst->type);
+-    const bool quantized = ggml_is_quantized(dst->type);
+ 
+     // Address dimension 0 in packed storage units; higher strides may be noncontiguous.
+-    const uint32_t ne00 = src0->ne[0] / block_size * units_per_block;
+-    const uint32_t ne10 = src1->ne[0] / block_size * units_per_block;
+-    const uint32_t ne20 =  dst->ne[0] / block_size * units_per_block;
+-    const uint32_t nb00 = quantized ? 1 : src0->nb[0] / unit_size;
+-    const uint32_t nb10 = quantized ? 1 : src1->nb[0] / unit_size;
+-    const uint32_t nb20 = quantized ? 1 :  dst->nb[0] / unit_size;
++    const uint32_t ne00 = src0->ne[0] / block_size * type_size / unit_size;
++    const uint32_t ne10 = src1->ne[0] / block_size * type_size / unit_size;
++    const uint32_t ne20 =  dst->ne[0] / block_size * type_size / unit_size;
++    const uint32_t nb00 = 1;
++    const uint32_t nb10 = 1;
++    const uint32_t nb20 = 1;
+ 
+     vk_op_concat_push_constants pc {{
+         ne20 * (uint32_t)dst->ne[1] * (uint32_t)dst->ne[2] * (uint32_t)dst->ne[3],
+@@ -13889,15 +13941,15 @@ static void ggml_vk_pool_2d(ggml_backend_vk_context * ctx, vk_context& subctx, c
+ }
+ 
+ static void ggml_vk_conv_2d(ggml_backend_vk_context * ctx, vk_context & subctx, const ggml_tensor * src0,
+-                            const ggml_tensor * src1, ggml_tensor * dst) {
++                            const ggml_tensor * src1, const ggml_tensor * src2, ggml_tensor * dst) {
+     GGML_ASSERT(src0->type == GGML_TYPE_F32 || src0->type == GGML_TYPE_F16);
+-    GGML_ASSERT(src1->type == GGML_TYPE_F32);
+-    GGML_ASSERT(dst->type == GGML_TYPE_F32);
++    GGML_ASSERT(src1->type == dst->type);
++    GGML_ASSERT(src1->type == GGML_TYPE_F32 || src1->type == GGML_TYPE_F16);
+ 
+     GGML_TENSOR_BINARY_OP_LOCALS
+     GGML_ASSERT(nb00 == sizeof(float) || nb00 == sizeof(ggml_fp16_t));
+-    GGML_ASSERT(nb10 == sizeof(float));
+-    GGML_ASSERT(nb0 == sizeof(float));
++    GGML_ASSERT(nb10 == ggml_type_size(src1->type));
++    GGML_ASSERT(nb0 == ggml_type_size(dst->type));
+ 
+     bool transpose = dst->op == GGML_OP_CONV_TRANSPOSE_2D;
+ 
+@@ -13924,8 +13976,9 @@ static void ggml_vk_conv_2d(ggml_backend_vk_context * ctx, vk_context & subctx,
+     p.nb1 = static_cast<uint32_t>(nb1 / nb0);
+     p.nb2 = static_cast<uint32_t>(nb2 / nb0);
+     p.nb3 = static_cast<uint32_t>(nb3 / nb0);
++    p.fuse_bias_silu = src2 && ggml_get_op_params_i32(dst, 7) == 1;
+ 
+-    ggml_vk_op_f32(ctx, subctx, src0, src1, nullptr, nullptr, dst, dst->op, std::move(p));
++    ggml_vk_op_f32(ctx, subctx, src0, src1, src2, nullptr, dst, dst->op, std::move(p));
+ }
+ 
+ static void ggml_vk_conv_3d(ggml_backend_vk_context * ctx, vk_context & subctx, const ggml_tensor * src0,
+@@ -15382,7 +15435,7 @@ static bool ggml_vk_build_graph(ggml_backend_vk_context * ctx, ggml_cgraph * cgr
+         break;
+     case GGML_OP_CONV_2D:
+     case GGML_OP_CONV_TRANSPOSE_2D:
+-        ggml_vk_conv_2d(ctx, compute_ctx, src0, src1, node);
++        ggml_vk_conv_2d(ctx, compute_ctx, src0, src1, src2, node);
+ 
+         break;
+     case GGML_OP_CONV_3D:
+@@ -16792,7 +16845,9 @@ static ggml_status ggml_backend_vk_graph_compute(ggml_backend_t backend, ggml_cg
+             flops_cap = 2'000'000'000ULL * ctx->device->shader_core_count;
+         }
+     }
+-    uint64_t flops_per_submit = std::min(flops_cap, ctx->last_total_flops / 40u);
++    const uint32_t target_submits = ctx->device->target_submits != 0 ? ctx->device->target_submits :
++        (ctx->last_total_flops >= 150'000'000'000ULL ? 4u : 8u);
++    uint64_t flops_per_submit = std::min(flops_cap, ctx->last_total_flops / target_submits);
+ 
+     for (int i = 0; i < cgraph->n_nodes; i++) {
+         if (first_node_in_batch) {
+@@ -18045,7 +18100,8 @@ static bool ggml_backend_vk_device_supports_op(ggml_backend_dev_t dev, const ggm
+                     return false;
+                 }
+             }
+-            return op->src[0]->type == GGML_TYPE_F32;
++            return op->src[0]->type == op->type &&
++                (op->type == GGML_TYPE_F32 || op->type == GGML_TYPE_F16);
+         case GGML_OP_ACC:
+             return op->src[0]->type == GGML_TYPE_F32 && op->src[1]->type == GGML_TYPE_F32 && op->type == GGML_TYPE_F32;
+         case GGML_OP_SET:
+@@ -18063,7 +18119,8 @@ static bool ggml_backend_vk_device_supports_op(ggml_backend_dev_t dev, const ggm
+         case GGML_OP_FILL:
+             return op->type == GGML_TYPE_F32 || op->type == GGML_TYPE_F16;
+         case GGML_OP_SCALE:
+-            return ggml_is_contiguous(op->src[0]) && op->src[0]->type == GGML_TYPE_F32;
++            return ggml_is_contiguous(op->src[0]) && op->src[0]->type == op->type &&
++                (op->type == GGML_TYPE_F32 || op->type == GGML_TYPE_F16);
+         case GGML_OP_PAD:
+         case GGML_OP_ROLL:
+             return op->src[0]->type == GGML_TYPE_F32;
+@@ -18119,12 +18176,15 @@ static bool ggml_backend_vk_device_supports_op(ggml_backend_dev_t dev, const ggm
+         case GGML_OP_TIMESTEP_EMBEDDING:
+             return op->src[0]->type == GGML_TYPE_F32;
+         case GGML_OP_CONV_2D_DW:
+-            return (op->src[0]->type == GGML_TYPE_F32 || op->src[0]->type == GGML_TYPE_F16)
+-                && op->src[1]->type == GGML_TYPE_F32;
++            return (op->src[0]->type == GGML_TYPE_F32 || op->src[0]->type == GGML_TYPE_F16) &&
++                op->src[1]->type == op->type &&
++                (op->type == GGML_TYPE_F32 ||
++                 (op->src[0]->type == GGML_TYPE_F16 && op->type == GGML_TYPE_F16));
+         case GGML_OP_POOL_1D:
+             return ggml_is_contiguous(op->src[0]) && op->src[0]->type == GGML_TYPE_F32;
+         case GGML_OP_POOL_2D:
+-            return ggml_is_contiguous(op->src[0]) && op->src[0]->type == GGML_TYPE_F32;
++            return ggml_is_contiguous(op->src[0]) && op->src[0]->type == op->type &&
++                (op->type == GGML_TYPE_F32 || op->type == GGML_TYPE_F16);
+         case GGML_OP_RWKV_WKV6:
+         case GGML_OP_RWKV_WKV7:
+             return true; // all inputs are contiguous, see ggml.c
+@@ -18198,10 +18258,17 @@ static bool ggml_backend_vk_device_supports_op(ggml_backend_dev_t dev, const ggm
+                 const int64_t cin  = !transpose ? op->src[0]->ne[2] : op->src[0]->ne[3];
+ 
+                 // Channel-contiguous format is not supported yet.
++                const bool f32_io = op->src[1]->type == GGML_TYPE_F32 && op->type == GGML_TYPE_F32;
++                const bool f16_io = op->src[0]->type == GGML_TYPE_F16 &&
++                    op->src[1]->type == GGML_TYPE_F16 && op->type == GGML_TYPE_F16;
++                const bool valid_post_op = !op->src[2] ||
++                    (op->src[2]->type == GGML_TYPE_F32 &&
++                     ggml_nelements(op->src[2]) == cout &&
++                     ggml_get_op_params_i32(op, 7) == 1);
+                 return ((op->src[0]->type == GGML_TYPE_F32 || op->src[0]->type == GGML_TYPE_F16) &&
+                     (op->src[0]->nb[0] == sizeof(float) || op->src[0]->nb[0] == sizeof(ggml_fp16_t) ) &&
+-                    op->src[1]->type == GGML_TYPE_F32 &&
+-                    op->type == GGML_TYPE_F32 &&
++                    (f32_io || f16_io) &&
++                    valid_post_op &&
+                     cout == op->ne[2] &&
+                     cin == op->src[1]->ne[2] &&
+                     ggml_is_contiguous(op->src[0]) &&
+diff --git a/src/ggml-vulkan/vulkan-shaders/conv2d_mm.comp b/src/ggml-vulkan/vulkan-shaders/conv2d_mm.comp
+index 99400098bf2b708d59b414b1ec1749990d278911..cdf11b4feb65154bb4ece5632531c42fca8388d5 100644
+--- a/src/ggml-vulkan/vulkan-shaders/conv2d_mm.comp
++++ b/src/ggml-vulkan/vulkan-shaders/conv2d_mm.comp
+@@ -33,6 +33,10 @@ layout(binding = 2) writeonly buffer D {
+     D_TYPE dst_data[];
+ };  // dst - result:    [OW, OH, Cout, N]
+ 
++layout(binding = 3) readonly buffer Bias {
++    float bias_data[];
++};
++
+ layout(push_constant) uniform parameter {
+     // I/O channels, batch size
+     uint32_t Cout;
+@@ -58,6 +62,8 @@ layout(push_constant) uniform parameter {
+     uint32_t nb2;
+     uint32_t nb3;
+ 
++    uint32_t fuse_bias_silu;
++
+     // fastdiv helper values
+     uint32_t OWmp;   uint32_t OWL;
+     uint32_t OWOHmp; uint32_t OWOHL;
+@@ -201,6 +207,14 @@ uint fastdiv(uint n, uint mp, uint L) {
+     return (msbs + n) >> L;
+ }
+ 
++float apply_post_op(float value, uint channel) {
++    if (p.fuse_bias_silu == 0) {
++        return value;
++    }
++    value += bias_data[channel];
++    return value / (1.0 + exp(-value));
++}
++
+ #ifdef COOPMAT2
+ #define ACC_TYPE float16_t
+ 
+@@ -213,7 +227,7 @@ ACC_TYPE perElemOpStore(const in uint32_t r, const in uint32_t c, const in ACC_T
+     uint32_t OW_idx  = NPQ_idx - N_idx * p.OH * p.OW - OH_idx * p.OW;
+     uint32_t dst_idx = OW_idx + OH_idx * p.nb1 + K_idx * p.nb2 + N_idx * p.nb3;
+     if (aligned != 0 || (K_idx < K && NPQ_idx < NPQ)) {
+-        dst_data[dst_idx] = D_TYPE(elem);
++        dst_data[dst_idx] = D_TYPE(apply_post_op(float(elem), K_idx));
+     }
+     return elem;
+ }
+@@ -451,7 +465,7 @@ void main() {
+             uint32_t OW_idx  = NPQ_idx - N_idx * p.OH * p.OW - OH_idx * p.OW;
+             uint32_t dst_idx = OW_idx + OH_idx * p.nb1 + K_idx * p.nb2 + N_idx * p.nb3;
+             if (aligned != 0 || (K_idx < K && NPQ_idx < NPQ)) {
+-                dst_data[dst_idx] = D_TYPE(Csh[k_local * Csh_stride + npq_thread]);
++                dst_data[dst_idx] = D_TYPE(apply_post_op(float(Csh[k_local * Csh_stride + npq_thread]), K_idx));
+             }
+         }
+     }
+@@ -471,7 +485,7 @@ void main() {
+                 uint32_t OW_idx  = NPQ_idx - N_idx * p.OH * p.OW - OH_idx * p.OW;
+                 uint32_t dst_idx = OW_idx + OH_idx * p.nb1 + K_idx * p.nb2 + N_idx * p.nb3;
+                 if (aligned != 0 || (K_idx < K && NPQ_idx < NPQ)) {
+-                    dst_data[dst_idx] = regC[T_ly][T_lx];
++                    dst_data[dst_idx] = D_TYPE(apply_post_op(regC[T_ly][T_lx], K_idx));
+                 }
+             }
+         }
+diff --git a/src/ggml-vulkan/vulkan-shaders/pool2d.comp b/src/ggml-vulkan/vulkan-shaders/pool2d.comp
+index d9d7166e3617cc173a4c042ee6416de38329e5ce..3d064958ee6ddb1c43cdf0159e817223b55904ec 100644
+--- a/src/ggml-vulkan/vulkan-shaders/pool2d.comp
++++ b/src/ggml-vulkan/vulkan-shaders/pool2d.comp
+@@ -70,5 +70,5 @@ void main() {
+         }
+     }
+ 
+-    data_d[nc * O_HW + cur_oh * p.OW + cur_ow] = res;
++    data_d[nc * O_HW + cur_oh * p.OW + cur_ow] = D_TYPE(res);
+ }
+diff --git a/src/ggml-vulkan/vulkan-shaders/vulkan-shaders-gen.cpp b/src/ggml-vulkan/vulkan-shaders/vulkan-shaders-gen.cpp
+index 0223d2e01e917f5a7c3ef49ba750c0729116640d..596932f4980e5500f035657390389024543bfdb8 100644
+--- a/src/ggml-vulkan/vulkan-shaders/vulkan-shaders-gen.cpp
++++ b/src/ggml-vulkan/vulkan-shaders/vulkan-shaders-gen.cpp
+@@ -887,6 +887,7 @@ void process_shaders() {
+     string_to_spv("repeat_i16", "repeat.comp", {{"A_TYPE", "int16_t"}, {"D_TYPE", "int16_t"}});
+ 
+     string_to_spv("scale_f32", "scale.comp", {{"A_TYPE", "float"}, {"D_TYPE", "float"}, {"FLOAT_TYPE", "float"}});
++    string_to_spv("scale_f16", "scale.comp", {{"A_TYPE", "float16_t"}, {"D_TYPE", "float16_t"}, {"FLOAT_TYPE", "float"}});
+ 
+     string_to_spv("pad_f32", "pad.comp", {{"A_TYPE", "float"}, {"D_TYPE", "float"}});
+ 
+@@ -896,6 +897,7 @@ void process_shaders() {
+     string_to_spv("concat_i64", "concat.comp", {{"A_TYPE", "uvec2"}, {"B_TYPE", "uvec2"}, {"D_TYPE", "uvec2"}});
+ 
+     string_to_spv("upscale_f32", "upscale.comp", {{"A_TYPE", "float"}, {"B_TYPE", "float"}, {"D_TYPE", "float"}});
++    string_to_spv("upscale_f16", "upscale.comp", {{"A_TYPE", "float16_t"}, {"B_TYPE", "float16_t"}, {"D_TYPE", "float16_t"}});
+ 
+     string_to_spv("exp_f16",        "unary.comp",       {{"A_TYPE", "float16_t"},   {"D_TYPE", "float16_t"}, {"OP", "op_exp"}});
+     string_to_spv("exp_f32",        "unary.comp",       {{"A_TYPE", "float"},       {"D_TYPE", "float"},     {"OP", "op_exp"}});
+@@ -1054,6 +1056,7 @@ void process_shaders() {
+ 
+     string_to_spv("pool1d_f32", "pool1d.comp", merge_maps(base_dict, {{"A_TYPE", "float"}, {"D_TYPE", "float"}}));
+     string_to_spv("pool2d_f32", "pool2d.comp", merge_maps(base_dict, {{"A_TYPE", "float"}, {"D_TYPE", "float"}}));
++    string_to_spv("pool2d_f16", "pool2d.comp", merge_maps(base_dict, {{"A_TYPE", "float16_t"}, {"D_TYPE", "float16_t"}}));
+ 
+     string_to_spv("rwkv_wkv6_f32", "wkv6.comp", merge_maps(base_dict, {{"A_TYPE", "float"}}));
+ 
+@@ -1070,14 +1073,18 @@ void process_shaders() {
+ 
+     for (auto transpose : {false, true}) {
+         for (auto unroll : {false, true}) {
+-            for (auto a_f16 : {false, true}) {
++            for (auto io_type : {0, 1, 2}) {
++                const bool a_f16 = io_type != 0;
++                const bool io_f16 = io_type == 2;
+                 std::map<std::string, std::string> defines = {
+-                    {"A_TYPE", a_f16 ? "float16_t" : "float"}, {"B_TYPE", "float"}, {"D_TYPE", "float"},
++                    {"A_TYPE", a_f16 ? "float16_t" : "float"},
++                    {"B_TYPE", io_f16 ? "float16_t" : "float"},
++                    {"D_TYPE", io_f16 ? "float16_t" : "float"},
+                     {"USE_COLLECTIVES", "1"}, {"UNROLL", unroll ? "[[unroll]]" : ""},
+                 };
+                 if (transpose) defines["TRANSPOSE"] = "1";
+                 std::string name = std::string(transpose ? "conv_transpose_2d": "conv2d")
+-                    + (a_f16 ? "_f16" : "") + "_f32";
++                    + (a_f16 ? "_f16" : "") + (io_f16 ? "" : "_f32");
+                 string_to_spv(name + (unroll ? "_unroll" : ""), "conv2d_mm.comp", defines);
+ #if defined(GGML_VULKAN_COOPMAT2_GLSLC_SUPPORT)
+                 if (unroll) {
+@@ -1126,6 +1133,8 @@ void process_shaders() {
+     string_to_spv("conv2d_dw_cwhn_f32", "conv2d_dw.comp", merge_maps(base_dict, {{"A_TYPE", "float"}, {"B_TYPE", "float"}, {"D_TYPE", "float"}, {"CWHN", "1"}}));
+     string_to_spv("conv2d_dw_whcn_f16_f32", "conv2d_dw.comp", merge_maps(base_dict, {{"A_TYPE", "float16_t"}, {"B_TYPE", "float"}, {"D_TYPE", "float"}, {"WHCN", "1"}}));
+     string_to_spv("conv2d_dw_cwhn_f16_f32", "conv2d_dw.comp", merge_maps(base_dict, {{"A_TYPE", "float16_t"}, {"B_TYPE", "float"}, {"D_TYPE", "float"}, {"CWHN", "1"}}));
++    string_to_spv("conv2d_dw_whcn_f16", "conv2d_dw.comp", merge_maps(base_dict, {{"A_TYPE", "float16_t"}, {"B_TYPE", "float16_t"}, {"D_TYPE", "float16_t"}, {"WHCN", "1"}}));
++    string_to_spv("conv2d_dw_cwhn_f16", "conv2d_dw.comp", merge_maps(base_dict, {{"A_TYPE", "float16_t"}, {"B_TYPE", "float16_t"}, {"D_TYPE", "float16_t"}, {"CWHN", "1"}}));
+ 
+     string_to_spv("roll_f32", "roll.comp", merge_maps(base_dict, {{"A_TYPE", "float"}, {"D_TYPE", "float"}}));
+ 
+diff --git a/src/ggml.c b/src/ggml.c
+index 59191c663eb0202e9efcda22a8b3549b16ccbf1b..a2435b548965c9b2bc702d8f19023e4f1e7d9926 100644
+--- a/src/ggml.c
++++ b/src/ggml.c
+@@ -4885,6 +4885,24 @@ struct ggml_tensor * ggml_conv_2d_direct(
+     return result;
+ }
+ 
++struct ggml_tensor * ggml_conv_2d_direct_bias_silu(
++        struct ggml_context * ctx,
++        struct ggml_tensor  * a,
++        struct ggml_tensor  * b,
++        struct ggml_tensor  * bias,
++        int                   s0,
++        int                   s1,
++        int                   p0,
++        int                   p1,
++        int                   d0,
++        int                   d1) {
++    struct ggml_tensor * result = ggml_conv_2d_direct(ctx, a, b, s0, s1, p0, p1, d0, d1);
++    GGML_ASSERT(bias->ne[0] == result->ne[2] && ggml_nelements(bias) == result->ne[2]);
++    result->src[2] = bias;
++    ggml_set_op_params_i32(result, 7, 1);
++    return result;
++}
++
+ // ggml_conv_3d_direct
+ 
+ struct ggml_tensor * ggml_conv_3d_direct(
+@@ -4954,7 +4972,7 @@ struct ggml_tensor * ggml_conv_transpose_2d_p0(
+         a->ne[2], b->ne[3],
+     };
+ 
+-    struct ggml_tensor* result = ggml_new_tensor(ctx, GGML_TYPE_F32, 4, ne);
++    struct ggml_tensor* result = ggml_new_tensor(ctx, b->type, 4, ne);
+ 
+     ggml_set_op_params_i32(result, 0, stride);
+ 
+@@ -5021,7 +5039,7 @@ struct ggml_tensor * ggml_pool_2d(
+     GGML_ASSERT(ne[0] > 0);
+     GGML_ASSERT(ne[1] > 0);
+ 
+-    result = ggml_new_tensor(ctx, GGML_TYPE_F32, 4, ne);
++    result = ggml_new_tensor(ctx, a->type, 4, ne);
+ 
+     int32_t params[] = { op, k0, k1, s0, s1, p0, p1 };
+     ggml_set_op_params(result, params, sizeof(params));
+@@ -5069,7 +5087,7 @@ static struct ggml_tensor * ggml_interpolate_impl(
+     GGML_ASSERT((mode & 0xFF) < GGML_SCALE_MODE_COUNT);
+     // TODO: implement antialias for modes other than bilinear
+     GGML_ASSERT(!(mode & GGML_SCALE_FLAG_ANTIALIAS) || (mode & 0xFF) == GGML_SCALE_MODE_BILINEAR);
+-    GGML_ASSERT(a->type == GGML_TYPE_F32);
++    GGML_ASSERT(a->type == GGML_TYPE_F32 || a->type == GGML_TYPE_F16);
+ 
+     struct ggml_tensor * result = ggml_new_tensor_4d(ctx, a->type, ne0, ne1, ne2, ne3);
+ 

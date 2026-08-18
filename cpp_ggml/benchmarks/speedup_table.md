@@ -1,0 +1,50 @@
+# ggml vs PyTorch speedup (e2e mean, bus.jpg)
+
+## Coverage
+
+| Evidence                          |                                                                                     Expected |             Present | Status   |
+| --------------------------------- | -------------------------------------------------------------------------------------------: | ------------------: | -------- |
+| GGML backend/model/precision keys |                                                                                           99 |                  99 | complete |
+| PyTorch CUDA model references     |                                                                                           11 |                  11 | complete |
+| GGML per-row latency fields       | preprocess mean/p50/p90; graph mean/min/p50/p90/max; post mean/p50; e2e mean/min/p50/p90/max | all required fields | complete |
+| PyTorch per-row latency fields    |                                                                     e2e mean/min/p50/p90/max | all required fields | complete |
+
+The latency matrix is complete. Accuracy evidence is separate: focused F16 parity covers every model on the documented image, while dataset-level COCO and NYU Depth V2 validation is not yet established.
+
+## Latency and speedup
+
+| model         | dtype | PyTorch | CUDA  | speedup | Vulkan | speedup | CPU 8T | speedup |
+| ------------- | ----- | ------- | ----- | ------- | ------ | ------- | ------ | ------- |
+| yolov8n       | f32   | 5.70    | 4.36  | x1.31   | 9.90   | x0.58   | 66.79  | x0.09   |
+| yolov8n       | f16   | 5.70    | 4.11  | x1.39   | 6.44   | x0.88   | 64.08  | x0.09   |
+| yolov8n       | q8_0  | 5.70    | 9.52  | x0.60   | 16.73  | x0.34   | 77.25  | x0.07   |
+| yolov8s       | f32   | 5.93    | 6.71  | x0.88   | 16.70  | x0.35   | 149.24 | x0.04   |
+| yolov8s       | f16   | 5.93    | 5.37  | x1.10   | 8.33   | x0.71   | 146.94 | x0.04   |
+| yolov8s       | q8_0  | 5.93    | 16.70 | x0.35   | 26.82  | x0.22   | 163.56 | x0.04   |
+| yolov8m       | f32   | 10.48   | 13.90 | x0.75   | 32.67  | x0.32   | 327.41 | x0.03   |
+| yolov8m       | f16   | 10.48   | 9.29  | x1.13   | 14.75  | x0.71   | 325.11 | x0.03   |
+| yolov8m       | q8_0  | 10.48   | 29.37 | x0.36   | 54.63  | x0.19   | 320.04 | x0.03   |
+| yolov8l       | f32   | 15.16   | 22.24 | x0.68   | 48.88  | x0.31   | 619.82 | x0.02   |
+| yolov8l       | f16   | 15.16   | 13.87 | x1.09   | 21.60  | x0.70   | 603.20 | x0.03   |
+| yolov8l       | q8_0  | 15.16   | 45.53 | x0.33   | 59.87  | x0.25   | 565.11 | x0.03   |
+| yolov8x       | f32   | 24.16   | 33.36 | x0.72   | 60.52  | x0.40   | 883.22 | x0.03   |
+| yolov8x       | f16   | 24.16   | 18.33 | x1.32   | 31.04  | x0.78   | 869.13 | x0.03   |
+| yolov8x       | q8_0  | 24.16   | 55.87 | x0.43   | 84.52  | x0.29   | 727.73 | x0.03   |
+| yolo26n       | f32   | 7.86    | 4.48  | x1.76   | 11.17  | x0.70   | 65.22  | x0.12   |
+| yolo26n       | f16   | 7.86    | 3.91  | x2.01   | 5.96   | x1.32   | 64.97  | x0.12   |
+| yolo26n       | q8_0  | 7.86    | 12.10 | x0.65   | 26.69  | x0.29   | 74.56  | x0.11   |
+| yolo26s       | f32   | 7.96    | 6.84  | x1.16   | 16.75  | x0.48   | 145.72 | x0.05   |
+| yolo26s       | f16   | 7.96    | 5.30  | x1.50   | 8.36   | x0.95   | 143.43 | x0.06   |
+| yolo26s       | q8_0  | 7.96    | 21.27 | x0.37   | 38.77  | x0.21   | 153.98 | x0.05   |
+| yolo26m       | f32   | 9.28    | 12.94 | x0.72   | 32.00  | x0.29   | 334.56 | x0.03   |
+| yolo26m       | f16   | 9.28    | 8.38  | x1.11   | 11.75  | x0.79   | 324.81 | x0.03   |
+| yolo26m       | q8_0  | 9.28    | 37.77 | x0.25   | 54.73  | x0.17   | 326.93 | x0.03   |
+| yolo26l       | f32   | 12.40   | 16.68 | x0.74   | 38.52  | x0.32   | 434.92 | x0.03   |
+| yolo26l       | f16   | 12.40   | 11.51 | x1.08   | 15.64  | x0.79   | 423.18 | x0.03   |
+| yolo26l       | q8_0  | 12.40   | 49.16 | x0.25   | 61.78  | x0.20   | 448.31 | x0.03   |
+| yolo26x       | f32   | 19.98   | 32.55 | x0.61   | 53.09  | x0.38   | 785.71 | x0.03   |
+| yolo26x       | f16   | 19.98   | 19.16 | x1.04   | 24.65  | x0.81   | 762.95 | x0.03   |
+| yolo26x       | q8_0  | 19.98   | 71.63 | x0.28   | 84.68  | x0.24   | 708.10 | x0.03   |
+| yolo26n-depth | f32   | 11.75   | 9.30  | x1.26   | 21.06  | x0.56   | 209.02 | x0.06   |
+| yolo26n-depth | f16   | 11.75   | 6.17  | x1.90   | 10.43  | x1.13   | 205.49 | x0.06   |
+| yolo26n-depth | q8_0  | 11.75   | 42.66 | x0.28   | 34.04  | x0.35   | 210.43 | x0.06   |

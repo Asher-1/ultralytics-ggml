@@ -32,6 +32,21 @@
 
 如需商业用途，请在 [Ultralytics 授权许可](https://www.ultralytics.com/license)申请企业许可证。
 
+## GGML C++ 推理集成
+
+本仓库包含独立的 [GGML C++ 运行时](cpp_ggml/README.md)，支持 YOLOv8、YOLO26 目标检测和 YOLO26n 绝对深度估计，
+可在 CPU、CUDA 和 Vulkan 上运行 F32、F16、Q8_0 GGUF 模型，运行时不依赖 Python 或 PyTorch。模型输入与生成文件的
+唯一目录布局见[模型卡](cpp_ggml/models/MODEL_CARD.md)。
+
+| 端到端延迟对比                                                   | 检测输出一致性对比                                                       |
+| ---------------------------------------------------------------- | ------------------------------------------------------------------------ |
+| ![GGML 后端延迟对比](cpp_ggml/benchmarks/latency_by_backend.png) | ![PyTorch 与 GGML 检测结果对比](cpp_ggml/benchmarks/parity_grid_bus.png) |
+
+完整原始数据、构建和运行命令、精度验证范围以及剩余验证项请参阅[基准与一致性报告](cpp_ggml/benchmarks/README.md)。在实测
+RTX 3060 上，F16 ggml CUDA 的 11/11 个模型均超过 PyTorch-CUDA（x1.04-x2.01）；F16 Vulkan 的 11/11 个模型均达到明确定义
+的 x0.70 吞吐接近线（x0.70-x1.32）。聚焦一致性验证已覆盖全部模型，但完整 COCO 和 NYU Depth V2 数据集验证仍是发布级精度
+结论的必要条件。
+
 <a href="https://platform.ultralytics.com/ultralytics/yolo26" target="_blank">
   <img width="100%" src="https://raw.githubusercontent.com/ultralytics/assets/refs/heads/main/yolo/performance-comparison.png" alt="YOLO26 performance plots">
 </a>
