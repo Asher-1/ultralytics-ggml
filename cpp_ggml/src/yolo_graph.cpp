@@ -10,6 +10,7 @@
 #include <cstdlib>
 #include <cstring>
 #include <filesystem>
+#include <utility>
 
 namespace yolo {
 
@@ -103,15 +104,18 @@ struct GraphBuilder {
                                       (int)op.ai("d", 0), (int)op.ai("d", 1));
         } else
 #elif defined(YOLO_USE_CUDA)
-        // All CUDA dtypes run the f16 direct flow: f32 weights are cast to
-        // f16 once at load (see create_session) — same 10-bit mantissa as
-        // cuBLAS TF32 mode — and Q8_0 joins via the plan-time dequant.
-        if (!depthwise && direct_types && bias && silu) {
+        // CUDA has direct kernels for matching F32 and F16 tensors. Q8_0
+        // joins via the plan-time direct path below.
+        // The F32 direct kernel uses Ampere TF32 WMMA internally.  Keep the
+        // tensor-core path for F16, but route F32 through the standard ggml
+        // convolution/GEMM implementation to preserve the F32 reference.
+        const bool cuda_direct_types = direct_types && wT->type != GGML_TYPE_F32;
+        if (!depthwise && cuda_direct_types && bias && silu) {
             return ggml_conv_2d_direct_bias_silu(gctx, wT, x, bias,
                                                  (int)op.ai("s", 0), (int)op.ai("s", 1),
                                                  (int)op.ai("p", 0), (int)op.ai("p", 1),
                                                  (int)op.ai("d", 0), (int)op.ai("d", 1));
-        } else if (direct_types) {
+        } else if (cuda_direct_types) {
             out = depthwise
                 ? ggml_conv_2d_dw_direct(gctx, wT, x, (int)op.ai("s", 0), (int)op.ai("s", 1),
                                          (int)op.ai("p", 0), (int)op.ai("p", 1),
@@ -148,7 +152,6 @@ struct GraphBuilder {
                                (long long)w4d->ne[2], (long long)w4d->ne[3], (long long)x->ne[0], (long long)x->ne[1],
                                (long long)x->ne[2], (long long)x->ne[3]);
             }
-            if (depthwise) w4d = dw_kernel(w4d);
             out = depthwise
                 ? ggml_conv_2d_dw(gctx, w4d, x, (int)op.ai("s", 0), (int)op.ai("s", 1),
                                   (int)op.ai("p", 0), (int)op.ai("p", 1),
@@ -165,13 +168,6 @@ struct GraphBuilder {
         GGML_ASSERT(wT && "transpose conv without weight");
         ggml_tensor* out = ggml_conv_transpose_2d_p0(gctx, wT, x, (int)op.ip("s"));
         return add_bias_act(op, prefix, out);
-    }
-
-    // ggml 0.18.1 conv_2d_dw builds mul_mat(F32 kernel, F16 im2col) which asserts on
-    // CPU (src1 must be F32 when src0 is F32). Cast F32 kernels to F16 — matching
-    // the im2col F16 dtype — so both operands are F16 like every other conv.
-    ggml_tensor* dw_kernel(ggml_tensor* wT) {
-        return wT->type == GGML_TYPE_F32 ? ggml_cast(gctx, wT, GGML_TYPE_F16) : wT;
     }
 
     // Quantized conv: ggml_conv_2d would build mul_mat(F16 im2col, Q8 kernel) which
@@ -215,12 +211,12 @@ struct GraphBuilder {
                     : ggml_conv_2d_direct(gctx, wT, x, 1, 1, 0, 0, 1, 1);
             } else {
                 out = k > 1
-                    ? ggml_conv_2d_dw(gctx, dw_kernel(wT), x, 1, 1, (int)(k / 2), (int)(k / 2), 1, 1)
+                    ? ggml_conv_2d_dw(gctx, wT, x, 1, 1, (int)(k / 2), (int)(k / 2), 1, 1)
                     : ggml_conv_2d(gctx, wT, x, 1, 1, 0, 0, 1, 1);
             }
 #else
             out = k > 1
-                ? ggml_conv_2d_dw(gctx, dw_kernel(wT), x, 1, 1, (int)(k / 2), (int)(k / 2), 1, 1)
+                ? ggml_conv_2d_dw(gctx, wT, x, 1, 1, (int)(k / 2), (int)(k / 2), 1, 1)
                 : ggml_conv_2d(gctx, wT, x, 1, 1, 0, 0, 1, 1);
 #endif
         }
@@ -264,6 +260,261 @@ struct GraphBuilder {
         ggml_tensor* sum = ggml_add(gctx, out, pe);
         return attention_conv(prefix, "proj", sum);
     }
+
+    // ------------------------------------------------------------------
+    // YOLO-World ops (open-vocabulary detection, op-graph v3)
+    // ------------------------------------------------------------------
+
+    // Exact AdaptiveMaxPool2d(k, k): out(i, j) = max over the window
+    // [floor(i*H/k), ceil((i+1)*H/k)) x [floor(j*W/k), ceil((j+1)*W/k)).
+    // Windows overlap when dim % k != 0, so each output cell is a separate
+    // non-overlapping view_4d + max_pool_2d pair, then tiles are assembled
+    // with concat/permute into a [C, k*k] (channel, patch) tensor.
+    ggml_tensor* adaptive_max_pool2d(ggml_tensor* x, int k) {
+        const int64_t W = x->ne[0], H = x->ne[1], C = x->ne[2], N = x->ne[3];
+        GGML_ASSERT(N == 1);
+        auto win = [&](int i, int64_t dim) {
+            // ATen adaptive pooling window edges (AdaptivePooling.h):
+            //   start = (a/b)*c + ((a%b)*c)/b  == floor(a*c/b)  (multiply FIRST)
+            //   end   = 1 + ((a+1)*c-1)/b      == ceil((a+1)*c/b)
+            // The naive (i/k)*dim differs whenever i % k != 0, shifting every
+            // pooled window and corrupting the image-aware text update (drives
+            // the world confidence drift vs PyTorch).
+            const int64_t s = ((int64_t)i * dim) / k;
+            const int64_t e = ((int64_t)(i + 1) * dim + k - 1) / k;
+            return std::make_pair((int)s, (int)e);
+        };
+        std::vector<ggml_tensor*> rows;
+        for (int i = 0; i < k; i++) {
+            auto [h0, h1] = win(i, H);
+            std::vector<ggml_tensor*> cols;
+            for (int j = 0; j < k; j++) {
+                auto [w0, w1] = win(j, W);
+                ggml_tensor* v = ggml_view_4d(gctx, x, w1 - w0, h1 - h0, C, 1, x->nb[1], x->nb[2], x->nb[3],
+                                              ((size_t)h0 * W + w0) * x->nb[0]);
+                // ggml_pool_2d inherits the input type, but the CPU pool kernel
+                // unconditionally writes F32; an F16 dst would overflow its
+                // buffer by 2x (heap corruption on split graphs). Cast up so
+                // the pool output is F32-sized.
+                if (v->type != GGML_TYPE_F32) v = ggml_cast(gctx, v, GGML_TYPE_F32);
+                cols.push_back(ggml_pool_2d(gctx, v, GGML_OP_POOL_MAX, w1 - w0, h1 - h0, w1 - w0, h1 - h0, 0, 0));
+            }
+            ggml_tensor* row = cols[0];
+            for (int j = 1; j < k; j++) row = ggml_concat(gctx, row, cols[j], 0);  // [k, 1, C]
+            rows.push_back(ggml_cont(gctx, ggml_permute(gctx, row, 1, 0, 2, 3)));  // [1, k, C]
+        }
+        ggml_tensor* grid = rows[0];
+        for (int i = 1; i < k; i++) grid = ggml_concat(gctx, grid, rows[i], 0);  // [k, k, C] (row i, col j, chan)
+        // permute(2,1,0,3): ne[axis_i]=a->ne[i] -> [C, k, k] (chan, col j, row i).
+        // Reshape only preserves the channel-contiguous layout while flattening
+        // (j, i) row-major: p = j + i*k, matching PyTorch's
+        // adaptive_max_pool2d(...).view(B, C, -1).
+        grid = ggml_cont(gctx, ggml_permute(gctx, grid, 2, 1, 0, 3));            // [C, k, k]
+        return ggml_reshape_2d(gctx, grid, C, k * k);                            // [C, k*k]
+    }
+
+    // LayerNorm(ct) + Linear(ct -> ec) over the ne0 (column) axis of `src`.
+    // ggml_norm/scale are F32-only on the CPU backend, so F16 inputs are cast
+    // up for the norm+linear math and cast back to the input type on exit.
+    ggml_tensor* ln_linear(const std::string& prefix, const char* tag, ggml_tensor* src, float eps) {
+        const enum ggml_type in_type = src->type;
+        if (src->type != GGML_TYPE_F32) src = ggml_cast(gctx, src, GGML_TYPE_F32);
+        ggml_tensor* y = ggml_norm(gctx, src, eps);
+        if (ggml_tensor* w_ = w(prefix, (std::string(tag) + "_ln_w").c_str())) {
+            if (w_->type != GGML_TYPE_F32) w_ = ggml_cast(gctx, w_, GGML_TYPE_F32);
+            y = ggml_mul(gctx, y, w_);
+        }
+        if (ggml_tensor* b_ = w(prefix, (std::string(tag) + "_ln_b").c_str())) {
+            if (b_->type != GGML_TYPE_F32) b_ = ggml_cast(gctx, b_, GGML_TYPE_F32);
+            y = ggml_add(gctx, y, b_);
+        }
+        if (ggml_tensor* w_ = w(prefix, (std::string(tag) + "_w").c_str())) {
+            if (w_->type != GGML_TYPE_F32) w_ = ggml_cast(gctx, w_, GGML_TYPE_F32);
+            y = ggml_mul_mat(gctx, w_, y);
+        }
+        if (ggml_tensor* b_ = w(prefix, (std::string(tag) + "_b").c_str())) {
+            y = ggml_add(gctx, y, ggml_reshape_2d(gctx, b_, b_->ne[0], 1));
+        }
+        if (in_type != GGML_TYPE_F32) y = ggml_cast(gctx, y, in_type);
+        return y;
+    }
+
+    // Element-wise max without a native ggml op: max(a, b) == b + relu(a - b).
+    ggml_tensor* max2(ggml_tensor* a, ggml_tensor* b) {
+        return ggml_add(gctx, b, ggml_relu(gctx, ggml_sub(gctx, a, b)));
+    }
+
+    // MaxSigmoidAttnBlock gate: out = proj_conv(x) * sigmoid(max_n(embed . guide_n)/sqrt(hc) + bias).
+    // embed [w,h,ec] and proj [w,h,c2] come from plain conv ops; text is [512, nc]
+    // (nc rows of 512-d CLIP text embeddings). The max over nc classes is a
+    // static tree of max2 nodes because nc is fixed at session creation.
+    ggml_tensor* max_sigmoid_attn(const OpDef& op, const std::string& prefix, ggml_tensor* embed,
+                                  ggml_tensor* proj, ggml_tensor* text) {
+        const int64_t nh = op.ip("nh"), hc = op.ip("hc");
+        const int64_t W = embed->ne[0], H = embed->ne[1];
+        const int64_t HW = W * H, c2 = proj->ne[2], nc = text->ne[1];
+
+        ggml_tensor* guide = ggml_mul_mat(gctx, w(prefix, "gl_w"), text);  // [ec, nc]
+        // mul_mat returns F32. Keep F32 reference graphs in F32, while F16
+        // deployment graphs use the native F16 CUDA GEMM contract.
+        if (text->type == GGML_TYPE_F16) guide = ggml_cast(gctx, guide, GGML_TYPE_F16);
+        if (ggml_tensor* b = w(prefix, "gl_b")) guide = ggml_add(gctx, guide, ggml_reshape_2d(gctx, b, b->ne[0], 1));
+
+        // embed -> [ec, HW] with the channel axis on ne0 (mul_mat weight side).
+        // permute(1,2,0,3): ne[axis_i]=a->ne[i] -> [ec, W, H] from [W, H, ec].
+        ggml_tensor* eT = ggml_cont(gctx, ggml_permute(gctx, embed, 1, 2, 0, 3));  // [ec, W, H]
+        ggml_tensor* e2 = ggml_view_2d(gctx, eT, embed->ne[2], HW, eT->nb[1], 0);   // [ec, HW]
+        // proj -> [c2, HW]
+        ggml_tensor* pT = ggml_cont(gctx, ggml_permute(gctx, proj, 1, 2, 0, 3));
+        ggml_tensor* p2 = ggml_view_2d(gctx, pT, c2, HW, pT->nb[1], 0);
+
+        // Head bias is a per-head scalar constant baked into the graph from the
+        // host copy (model.tensors), never a runtime tensor.
+        auto bias_it = model.tensors.find(prefix + ".bias");
+        const float* bias_data =
+            bias_it != model.tensors.end() ? (const float*)bias_it->second.data.data() : nullptr;
+        std::vector<ggml_tensor*> head_outs;
+        for (int64_t m = 0; m < nh; m++) {
+            ggml_tensor* g_m = ggml_view_2d(gctx, guide, hc, nc, guide->nb[1], m * hc * ggml_element_size(guide));
+            ggml_tensor* e_m = ggml_view_2d(gctx, e2, hc, HW, e2->nb[1], m * hc * ggml_element_size(e2));
+            // CUDA requires matching F32/F16 operands for mul_mat. The fused
+            // F32 guide can meet an F16 activation even in an F32 model, so
+            // choose the activation type from the actual guide tensor rather
+            // than the model's nominal dtype. Keeping F32 here preserves the
+            // reference path; F16 models retain their native F16 GEMM.
+            if (e_m->type != guide->type) e_m = ggml_cast(gctx, e_m, guide->type);
+            ggml_tensor* aw = ggml_mul_mat(gctx, g_m, e_m);  // [nc, HW]
+            // tree-max over the nc rows (torch aw.max(dim=-1))
+            std::vector<ggml_tensor*> rows;
+            // aw is [nc, HW], so a fixed class is a strided column over ne1,
+            // not a contiguous row. Keep that stride in a [1, HW] view before
+            // reducing classes; view_1d would read unrelated spatial scores.
+            for (int64_t n = 0; n < nc; n++) {
+                rows.push_back(ggml_view_2d(gctx, aw, 1, HW, aw->nb[1], n * ggml_element_size(aw)));
+            }
+            while (rows.size() > 1) {
+                std::vector<ggml_tensor*> nxt;
+                for (size_t j = 0; j + 1 < rows.size(); j += 2) nxt.push_back(max2(rows[j], rows[j + 1]));
+                if (rows.size() % 2) nxt.push_back(rows.back());
+                rows.swap(nxt);
+            }
+            ggml_tensor* p_m = ggml_view_2d(gctx, p2, hc, HW, p2->nb[1], m * hc * ggml_element_size(p2));
+            // torch: aw / sqrt(hc) + bias[m] -> sigmoid (folded into one scale_bias)
+            // ggml scale_bias is F32-only on CPU: cast up and back for F16 graphs.
+            ggml_tensor* aw1 = ggml_scale_bias(gctx, ggml_cast(gctx, rows[0], GGML_TYPE_F32),
+                                               1.0f / std::sqrt((float)hc),
+                                               bias_data ? bias_data[m] : 0.0f);
+            aw1 = ggml_sigmoid(gctx, aw1);
+            if (p_m->type != GGML_TYPE_F32) aw1 = ggml_cast(gctx, aw1, p_m->type);
+            aw1 = ggml_reshape_2d(gctx, aw1, 1, HW);  // [1, HW] broadcast along channels
+            head_outs.push_back(ggml_mul(gctx, p_m, aw1));  // [hc, HW] x [1, HW] broadcast
+        }
+        ggml_tensor* out = head_outs[0];
+        // concat along channels (axis 0): [hc, HW] x nh -> [c2, HW]
+        for (size_t m = 1; m < head_outs.size(); m++) out = ggml_concat(gctx, out, head_outs[m], 0);
+        return ggml_reshape_3d(gctx, ggml_cont(gctx, ggml_permute(gctx, out, 1, 0, 2, 3)), W, H, c2);
+    }
+
+    // ImagePoolingAttn: image tokens attend into the text embedding (residual).
+    // Each input is a [w,h,ec] 1x1-projected feature map; text is [512, nc].
+    ggml_tensor* image_pooling_attn(const OpDef& op, const std::string& prefix,
+                                    const std::vector<ggml_tensor*>& feats, ggml_tensor* text) {
+        const int64_t nh = op.ip("nh"), hc = op.ip("hc"), k = op.ip("k", 3);
+        const int64_t nc = text->ne[1];
+        // ggml_pool_2d outputs F32, so the whole attention math runs in F32;
+        // the result is cast back to the text type for the residual.
+        ggml_tensor* text32 = text->type == GGML_TYPE_F32 ? text : ggml_cast(gctx, text, GGML_TYPE_F32);
+        // 1. adaptive max pool each level -> [ec, k*k] patches, concat over patches.
+        ggml_tensor* xcat = adaptive_max_pool2d(feats[0], (int)k);  // [ec, k*k]
+        for (size_t f = 1; f < feats.size(); f++) {
+            xcat = ggml_concat(gctx, xcat, adaptive_max_pool2d(feats[f], (int)k), 1);
+        }
+        // 2. q = query(text), k/v = key/value(x); LayerNorm over channels.
+        ggml_tensor* xT = xcat;  // [ec, P]
+        ggml_tensor* kT = ln_linear(prefix, "key", xT, 1e-5f);    // [ec, P]
+        ggml_tensor* vT = ln_linear(prefix, "value", xT, 1e-5f);  // [ec, P]
+        ggml_tensor* q = ln_linear(prefix, "query", text32, 1e-5f); // [ec, nc]
+        const int64_t P = xT->ne[1];
+        // 3. per-head scaled dot-product attention (llama.cpp KQ pattern).
+        std::vector<ggml_tensor*> head_outs;
+        for (int64_t m = 0; m < nh; m++) {
+            ggml_tensor* q_m = ggml_view_2d(gctx, q, hc, nc, q->nb[1], m * hc * ggml_element_size(q));      // [hc, nc]
+            ggml_tensor* k_m = ggml_view_2d(gctx, kT, hc, P, kT->nb[1], m * hc * ggml_element_size(kT));     // [hc, P]
+            ggml_tensor* v_m = ggml_view_2d(gctx, vT, hc, P, vT->nb[1], m * hc * ggml_element_size(vT));     // [hc, P]
+            ggml_tensor* aw = ggml_mul_mat(gctx, k_m, q_m);                     // [P, nc] keys on ne0
+            aw = ggml_scale(gctx, aw, 1.0f / std::sqrt((float)hc));
+            aw = ggml_soft_max(gctx, aw);                                       // over keys (dim=-1 in torch)
+            ggml_tensor* vT_m = ggml_cont(gctx, ggml_permute(gctx, v_m, 1, 0, 2, 3));  // [P, hc]
+            head_outs.push_back(ggml_mul_mat(gctx, vT_m, aw));                  // [hc, nc]
+        }
+        ggml_tensor* out = head_outs[0];
+        // concat along channels (axis 0): [hc, nc] x nh -> [ec, nc]
+        for (size_t m = 1; m < head_outs.size(); m++) out = ggml_concat(gctx, out, head_outs[m], 0);
+        ggml_tensor* pw = w(prefix, "proj_w");
+        if (pw->type != GGML_TYPE_F32) pw = ggml_cast(gctx, pw, GGML_TYPE_F32);
+        out = ggml_mul_mat(gctx, pw, out);  // [ct, nc]
+        if (ggml_tensor* b = w(prefix, "proj_b")) out = ggml_add(gctx, out, ggml_reshape_2d(gctx, b, b->ne[0], 1));
+        out = ggml_add(gctx, out, text32);  // residual (scale is 1.0 in YOLO-World)
+        if (text->type != GGML_TYPE_F32) out = ggml_cast(gctx, out, text->type);
+        return out;                        // [512, nc]
+    }
+
+    // WorldDetect and YOLOE: contrastive embedding branch + plain detect decode.
+    // feats alternate [box0, emb0, box1, emb1, ...]; text is [512, nc].
+    ggml_tensor* world_detect(const OpDef& op, const std::string& prefix,
+                              const std::vector<ggml_tensor*>& feats, ggml_tensor* text, int64_t nc) {
+        const int64_t rm = op.ip("reg_max", 16);
+        // L2-normalisation needs F32 (ggml_sum_rows is F32-only); cast the
+        // F16 graph text/embedding back for the contrastive head math.
+        ggml_tensor* text32 = text->type == GGML_TYPE_F32 ? text : ggml_cast(gctx, text, GGML_TYPE_F32);
+        // text -> L2-normalized [512, nc]
+        ggml_tensor* sq = ggml_sqr(gctx, text32);
+        ggml_tensor* t_norm = ggml_div(gctx, text32, ggml_sqrt(gctx, ggml_sum_rows(gctx, sq)));
+        ggml_tensor* out = nullptr;
+        const bool has_masks = op.ip("has_masks", 0) != 0;
+        const bool bn_contrastive = op.ip("bn_contrastive", 0) != 0;
+        const size_t stride = has_masks ? 3 : 2;
+        const size_t n_levels = feats.size() / stride;
+        for (size_t l = 0; l < n_levels; l++) {
+            ggml_tensor* box = feats[stride * l];      // [w, h, 4*rm]
+            ggml_tensor* emb = feats[stride * l + 1];  // [w, h, embed]
+            const int64_t W = box->ne[0], H = box->ne[1], HW = W * H;
+            // World normalizes image embeddings. YOLOE's BNContrastiveHead
+            // instead applies its folded BatchNorm affine transform.
+            ggml_tensor* eT = ggml_cont(gctx, ggml_permute(gctx, emb, 1, 2, 0, 3));  // [embed, W, H]
+            ggml_tensor* eT32 = eT->type == GGML_TYPE_F32 ? eT : ggml_cast(gctx, eT, GGML_TYPE_F32);
+            ggml_tensor* e2 = ggml_view_2d(gctx, eT32, emb->ne[2], HW, eT32->nb[1], 0);  // [embed, HW]
+            if (bn_contrastive) {
+                ggml_tensor* scale = w(prefix, ("cv4_" + std::to_string(l) + "_bn_scale").c_str());
+                ggml_tensor* shift = w(prefix, ("cv4_" + std::to_string(l) + "_bn_shift").c_str());
+                GGML_ASSERT(scale && shift && "YOLOE BN contrastive head missing affine tensors");
+                if (scale->type != GGML_TYPE_F32) scale = ggml_cast(gctx, scale, GGML_TYPE_F32);
+                if (shift->type != GGML_TYPE_F32) shift = ggml_cast(gctx, shift, GGML_TYPE_F32);
+                e2 = ggml_mul(gctx, e2, ggml_reshape_2d(gctx, scale, scale->ne[0], 1));
+                e2 = ggml_add(gctx, e2, ggml_reshape_2d(gctx, shift, shift->ne[0], 1));
+            } else {
+                e2 = ggml_div(gctx, e2, ggml_sqrt(gctx, ggml_sum_rows(gctx, ggml_sqr(gctx, e2))));
+            }
+            ggml_tensor* scores = ggml_mul_mat(gctx, t_norm, e2);                    // [nc, HW]
+            // scores = scores * logit_scale.exp() + bias (per-level ContrastiveHead)
+            auto ls_it = model.tensors.find(prefix + ".cv4_" + std::to_string(l) + "_logit_scale");
+            auto bs_it = model.tensors.find(prefix + ".cv4_" + std::to_string(l) + "_bias");
+            const float ls = ls_it != model.tensors.end() ? ((const float*)ls_it->second.data.data())[0] : 1.0f;
+            const float bs = bs_it != model.tensors.end() ? ((const float*)bs_it->second.data.data())[0] : 0.0f;
+            scores = ggml_scale_bias(gctx, scores, ls, bs);
+            ggml_tensor* s4 = ggml_reshape_3d(gctx, ggml_cont(gctx, ggml_permute(gctx, scores, 1, 0, 2, 3)), W, H, nc);
+            if (s4->type != box->type) s4 = ggml_cast(gctx, s4, box->type);  // concat needs matching types
+            ggml_tensor* level = ggml_concat(gctx, box, s4, 2);  // [w, h, 4*rm + nc]
+            if (has_masks) {
+                ggml_tensor* mask = feats[stride * l + 2];
+                level = ggml_concat(gctx, level, mask, 2);
+            }
+            const int64_t level_no = 4 * rm + nc + (has_masks ? op.ip("nm", 0) : 0);
+            ggml_tensor* r = ggml_reshape_2d(gctx, level, HW, level_no);
+            out = out ? ggml_concat(gctx, out, r, 0) : r;
+        }
+        return out;  // [A, 4*rm + nc]
+    }
 };
 
 }  // namespace
@@ -286,8 +537,15 @@ Session* create_session(const std::string& gguf_path, const SessionOptions& opts
         backend_enable_op_profile(s->backend);
     }
 
-    const ModelMeta& meta = s->model.meta;
-    const int no = 4 * meta.reg_max + meta.nc + meta.nm;  // segment appends nm mask coeffs
+    ModelMeta& meta = s->model.meta;
+    // YOLO-World: the class count is a runtime knob (set_classes). It fixes
+    // the text-input shape and every nc-dependent tensor in the graph, so the
+    // session must be recreated when the class list changes.
+    const int64_t world_nc = opts.world_nc > 0 ? opts.world_nc : meta.nc;
+    s->world_nc = (int)world_nc;
+    if (s->model.has_text_input) meta.nc = (int)world_nc;
+    // Per-anchor output channels: detect=4*rm+nc, segment=+nm, pose=+nk, obb=+ne.
+    const int no = 4 * meta.reg_max + meta.nc + meta.nm + meta.nk + meta.ne;
 
     // Weight context: tensor structs only; data goes to the backend buffer.
     s->wctx = ggml_init({(size_t)(s->model.tensors.size() * ggml_tensor_overhead() + 1024 * 1024),
@@ -303,13 +561,12 @@ Session* create_session(const std::string& gguf_path, const SessionOptions& opts
     }
 
     GraphBuilder gb{s->gctx, s->wctx, s->model, {}};
-#if defined(YOLO_USE_CUDA) || defined(YOLO_USE_VULKAN)
     // Route quantized convs through the direct flow only when every quantized
     // tensor conforms; a single violation falls the whole model back to the
     // F32 conv2d_q path, whose im2col requires F32 activations. K 32-alignment
-    // is the hard constraint (CUDA igemm block addressing; vulkan host dequant
-    // block walk). CUDA igemm also needs OC % 8 == 0 but writes sub-8 tails
-    // scalars; vulkan runs the plain f16 path so OC is free.
+    // is the hard constraint (CUDA igemm block addressing; vulkan / cpu host
+    // dequant block walk). CUDA igemm also needs OC % 8 == 0 but writes sub-8
+    // tails scalars; vulkan / cpu run the plain f16 path so OC is free.
     for (const auto& [name, ht] : s->model.tensors) {
         if (!ggml_is_quantized(ht.type)) continue;
         if (ht.type != GGML_TYPE_Q8_0 || ht.ne[0] % 32 != 0) {
@@ -318,12 +575,11 @@ Session* create_session(const std::string& gguf_path, const SessionOptions& opts
         }
         gb.q8_direct = true;
     }
-#endif
-#if defined(YOLO_USE_VULKAN)
-    // vulkan has no Q8 conv shader and no Q8->f16 cast pipeline; expand Q8_0
-    // weights to f16 on the host once so the whole graph runs the f16 direct-
-    // conv path (2-5x faster than the dequant-f32 mul_mat route).
+    // Backends without a native Q8 conv path (vulkan, cpu) expand Q8_0 weights
+    // to f16 on the host once so the whole graph runs the f16 direct-conv path
+    // instead of the dequant-f32 mul_mat route (2-5x faster measured on vulkan).
     if (gb.q8_direct) {
+#if !defined(YOLO_USE_CUDA)
         for (auto& [name, ht] : s->model.tensors) {
             if (ht.type != GGML_TYPE_Q8_0) continue;
             const int64_t n = ht.ne[0] * ht.ne[1] * ht.ne[2] * ht.ne[3];
@@ -337,31 +593,16 @@ Session* create_session(const std::string& gguf_path, const SessionOptions& opts
             ht.data = std::move(f16);
             ht.type = GGML_TYPE_F16;
         }
-    }
 #endif
-#if defined(YOLO_USE_CUDA)
-    // CUDA f32 models: cast weights to f16 once on the host. The igemm f16
-    // path runs fp16 tensor cores (10-bit mantissa, the same precision class
-    // as cuBLAS TF32 mode and PyTorch's default cudnn TF32 convs) at 2x the
-    // TF32 mma throughput and skips the im2col materialization entirely.
-    if (meta.dtype == "f32") for (auto& [name, ht] : s->model.tensors) {
-        if (ht.type != GGML_TYPE_F32) continue;
-        // Biases stay F32: the fused conv kernels read the bias pointer as
-        // fp32 (contract asserted in conv2d.cu), and every add_bias/attention
-        // path already casts it where needed.
-        if (name.size() > 2 && name.compare(name.size() - 2, 2, ".b") == 0) continue;
-        const int64_t n = ht.ne[0] * ht.ne[1] * ht.ne[2] * ht.ne[3];
-        std::vector<uint8_t> f16(n * sizeof(ggml_fp16_t));
-        const float * src = reinterpret_cast<const float *>(ht.data.data());
-        ggml_fp16_t * dst = reinterpret_cast<ggml_fp16_t *>(f16.data());
-        for (int64_t i = 0; i < n; ++i) {
-            dst[i] = ggml_fp32_to_fp16(src[i]);
-        }
-        ht.data = std::move(f16);
-        ht.type = GGML_TYPE_F16;
     }
-#endif
     std::vector<ggml_tensor*> values(s->model.ops.size(), nullptr);
+
+    // Debug aid: YOLO_STOP_OP=N truncates the graph at op N so a unified
+    // post-compute dump (--dump-ops) sees N as the last computed op — its
+    // inputs are then guaranteed not to have been overwritten by buffer
+    // reuse (gallocr aliases non-overlapping lifetimes).
+    const char* stop_env = getenv("YOLO_STOP_OP");
+    const int stop_op = stop_env ? atoi(stop_env) : -1;
 
     // The input tensor is always F32; F16-model graphs insert an on-device
     // cast node (below). A host-side scalar f32->f16 round-trip measured
@@ -370,11 +611,31 @@ Session* create_session(const std::string& gguf_path, const SessionOptions& opts
     ggml_set_input(s->input);  // allocated before compute nodes
     ggml_set_name(s->input, "image");
 
+    ggml_tensor* graph_text = nullptr;
+    if (s->model.has_text_input) {
+        // External [512, nc] F32 text embedding (CLIP text encoder output).
+        s->text_input = ggml_new_tensor_2d(s->gctx, GGML_TYPE_F32, 512, world_nc);
+        ggml_set_input(s->text_input);
+        ggml_set_name(s->text_input, "text");
+        graph_text = s->text_input;
+    }
+
     ggml_tensor* graph_input = s->input;
 #if defined(YOLO_USE_CUDA)
-    graph_input = ggml_cast(s->gctx, s->input, GGML_TYPE_F16);  // every CUDA dtype runs the f16 flow
-#elif defined(YOLO_USE_VULKAN)
-    if (meta.dtype == "f16" || gb.q8_direct) graph_input = ggml_cast(s->gctx, s->input, GGML_TYPE_F16);
+    // F32 is the numerical reference format. Do not silently lower it to F16
+    // on CUDA: its output is used for PyTorch parity. F16/Q8 deployment models
+    // retain the tensor-core input flow.
+    if (meta.dtype != "f32") {
+        graph_input = ggml_cast(s->gctx, s->input, GGML_TYPE_F16);
+        if (graph_text) graph_text = ggml_cast(s->gctx, s->text_input, GGML_TYPE_F16);
+    }
+#else
+    // CPU and Vulkan: cast input to F16 when model weights are F16 (native or
+    // dequantised from Q8_0) so the im2col+mul_mat pipeline stays all-F16.
+    if (meta.dtype == "f16" || gb.q8_direct) {
+        graph_input = ggml_cast(s->gctx, s->input, GGML_TYPE_F16);
+        if (graph_text) graph_text = ggml_cast(s->gctx, s->text_input, GGML_TYPE_F16);
+    }
 #endif
 
     for (size_t i = 0; i < s->model.ops.size(); i++) {
@@ -384,9 +645,26 @@ Session* create_session(const std::string& gguf_path, const SessionOptions& opts
             const int idx = op.inputs.empty() ? -1 : op.inputs[0];
             return idx < 0 ? graph_input : values[idx];
         };
+        auto in_text = [&]() {
+            const int64_t ti = op.ip("text_in", -1);
+            return ti < 0 ? graph_text : values[ti];
+        };
         ggml_tensor* out = nullptr;
 
-        if (op.type == "conv" || op.type == "dwconv") {
+        if (op.type == "max_sigmoid_attn") {
+            out = gb.max_sigmoid_attn(op, prefix, values[op.inputs[0]], values[op.inputs[1]], in_text());
+        } else if (op.type == "image_pooling_attn") {
+            std::vector<ggml_tensor*> feats;
+            for (int j : op.inputs) feats.push_back(values[j]);
+            out = gb.image_pooling_attn(op, prefix, feats, in_text());
+        } else if (op.type == "world_detect" || op.type == "world_segment") {
+            std::vector<ggml_tensor*> feats;
+            const bool has_masks = op.type == "world_segment";
+            const size_t n = has_masks ? op.inputs.size() - 1 : op.inputs.size();
+            for (size_t j = 0; j < n; j++) feats.push_back(values[op.inputs[j]]);
+            if (has_masks) s->output_proto = values[op.inputs.back()];
+            out = gb.world_detect(op, prefix, feats, in_text(), meta.nc);
+        } else if (op.type == "conv" || op.type == "dwconv") {
             out = gb.conv2d(op, prefix, in0());
         } else if (op.type == "maxpool") {
             const int k = (int)op.ip("k"), st = (int)op.ip("s"), p = (int)op.ip("p");
@@ -427,11 +705,7 @@ Session* create_session(const std::string& gguf_path, const SessionOptions& opts
                                x->nb[1], x->nb[2], x->nb[3], start * x->nb[2]);
         } else if (op.type == "psa_attention") {
             out = gb.psa_attention(op, prefix, in0());
-        } else if (op.type == "detect" || op.type == "segment") {
-            // Per-level conv output ne=[W,H,no,N] is already CHW-ordered in memory
-            // (c outer, h middle, w inner) — a plain reshape_2d matches torch's
-            // x.view(B, no, H*W); concat along the anchor dim. No permute needed.
-            // segment's last input is the proto map, kept as a second output.
+        } else if (op.type == "detect" || op.type == "segment" || op.type == "pose" || op.type == "obb") {
             const size_t n_feats = op.inputs.size() - (op.type == "segment" ? 1 : 0);
             for (size_t j = 0; j < n_feats; j++) {
                 ggml_tensor* t = values[op.inputs[j]];
@@ -440,6 +714,31 @@ Session* create_session(const std::string& gguf_path, const SessionOptions& opts
                 out = out ? ggml_concat(s->gctx, out, r, 0) : r;
             }
             if (op.type == "segment") s->output_proto = values[op.inputs.back()];
+        } else if (op.type == "semantic") {
+            // Identity marker: the head convs already emitted [W/8, H/8, nc, 1]
+            // logits; the task just declares the readback layout for argmax.
+            out = in0();
+        } else if (op.type == "avgpool") {
+            // Classify: AdaptiveAvgPool2d(1) — a global average pool whose kernel
+            // equals the input extent (imgsz/32), so k0/k1 are runtime values.
+            ggml_tensor* x = in0();
+            out = ggml_pool_2d(s->gctx, x, GGML_OP_POOL_AVG, x->ne[0], x->ne[1], 1, 1, 0, 0);
+        } else if (op.type == "linear") {
+            // Classify: y = x @ W^T + b. W is stored [in, out]; the pooled
+            // [1,1,C,1] feature is flattened to [C,1] for mul_mat.
+            ggml_tensor* x = in0();
+            const int64_t c = x->ne[0] * x->ne[1] * x->ne[2];
+            ggml_tensor* flat = ggml_reshape_2d(s->gctx, x, c, 1);
+            ggml_tensor* wT = gb.w(prefix, "w");
+            GGML_ASSERT(wT && "linear without weight");
+            out = ggml_mul_mat(s->gctx, wT, flat);  // [out, 1]
+            if (ggml_tensor* b = gb.w(prefix, "b")) {
+                out = ggml_add(s->gctx, out, ggml_reshape_2d(s->gctx, b, b->ne[0], 1));
+            }
+            out = ggml_reshape_1d(s->gctx, out, out->ne[0]);
+        } else if (op.type == "classify") {
+            // Identity marker on the [nc] logits; softmax/topk run in postprocess.
+            out = in0();
         } else if (op.type == "depth") {
             const float cal_a = (float)(op.fparams.count("cal_a") ? op.fparams.at("cal_a") : 1.0);
             const float cal_b = (float)(op.fparams.count("cal_b") ? op.fparams.at("cal_b") : 0.0);
@@ -452,9 +751,10 @@ Session* create_session(const std::string& gguf_path, const SessionOptions& opts
         }
         values[i] = out;
         s->op_values.push_back(out);
+        if (stop_op >= 0 && (int)i >= stop_op) break;
     }
 
-    s->output = values.back();
+    s->output = (stop_op >= 0 && (size_t)stop_op < values.size()) ? values[stop_op] : values.back();
     GGML_ASSERT(s->output && "graph produced no output");
     // GPU backends: cast F16 head outputs to F32 on-device. The host-side
     // scalar f16->f32 round-trip measured ~1.6ms/frame (output) plus ~1.3ms
@@ -470,7 +770,11 @@ Session* create_session(const std::string& gguf_path, const SessionOptions& opts
         s->output_proto_f16.resize(ggml_nelements(s->output_proto));
     }
 
-    s->graph = ggml_new_graph_custom(s->gctx, s->model.ops.size() * 12 + 512, /*grads*/ false);
+    // Text-conditioned max trees add O(world_nc) graph nodes. The old fixed
+    // detect-head estimate overflowed for the default 80-class World session.
+    const size_t graph_size = s->model.ops.size() * 12 + 512 +
+                              (s->model.has_text_input ? (size_t)world_nc * 64 : 0);
+    s->graph = ggml_new_graph_custom(s->gctx, graph_size, /*grads*/ false);
     if (opts.keep_all_ops) {
         // OUTPUT tensors are never freed by gallocr (ggml-alloc.c free_node),
         // so every op's data survives the full compute for --dump-ops.
@@ -478,6 +782,10 @@ Session* create_session(const std::string& gguf_path, const SessionOptions& opts
             ggml_set_output(t);
             ggml_build_forward_expand(s->graph, t);
         }
+        // GPU F16 heads append a cast after op_values was collected. Keep the
+        // public output live as well so session_read_output remains valid.
+        ggml_set_output(s->output);
+        ggml_build_forward_expand(s->graph, s->output);
     } else {
         ggml_set_output(s->output);
         ggml_build_forward_expand(s->graph, s->output);
@@ -502,6 +810,7 @@ Session* create_session(const std::string& gguf_path, const SessionOptions& opts
 
     if (s->backend.sched && s->backend.gpu) {
         ggml_backend_sched_set_tensor_backend(s->backend.sched, s->input, s->backend.gpu);
+        if (s->text_input) ggml_backend_sched_set_tensor_backend(s->backend.sched, s->text_input, s->backend.gpu);
         ggml_backend_sched_set_tensor_backend(s->backend.sched, s->output, s->backend.gpu);
         if (s->output_proto) {
             ggml_backend_sched_set_tensor_backend(s->backend.sched, s->output_proto, s->backend.gpu);
@@ -512,7 +821,9 @@ Session* create_session(const std::string& gguf_path, const SessionOptions& opts
         return nullptr;
     }
 
-    if (meta.task != "depth") {  // detect and segment share the anchor grid
+    if (meta.task == "detect" || meta.task == "segment" || meta.task == "pose" || meta.task == "obb") {
+        // Box-anchored tasks share the anchor grid; depth/semantic/classify decode
+        // dense or vector outputs and never touch it.
         // Postprocess constants (mirrors ultralytics make_anchors with 0.5 offset).
         for (int l = 0; l < meta.nl; l++) {
             const int stride = (int)meta.strides[l];
@@ -544,6 +855,18 @@ bool session_run(Session* s, const float* chw_image) {
     } else {
         ggml_backend_tensor_set(s->input, chw_image, 0, input_bytes);
     }
+
+    // Graph allocation reuses the text leaf's backing storage between runs.
+    // Keep the host embedding for the session and upload it before every graph
+    // execution, just as the image input is uploaded on every frame.
+    if (!s->text_pending.empty()) {
+        const size_t nbytes = s->text_pending.size() * sizeof(float);
+        if (s->backend.gpu) {
+            ggml_backend_tensor_set_async(s->backend.gpu, s->text_input, s->text_pending.data(), 0, nbytes);
+        } else {
+            ggml_backend_tensor_set(s->text_input, s->text_pending.data(), 0, nbytes);
+        }
+    }
     const auto t1 = std::chrono::steady_clock::now();
     const int st = backend_graph_compute(s->backend, s->graph);
     if (s->profile_gaps) {
@@ -561,9 +884,24 @@ bool session_run(Session* s, const float* chw_image) {
     return true;
 }
 
+bool session_set_text(Session* s, const float* text_embed) {
+    if (!s->text_input) {
+        YOLO_LOG_ERROR("session_set_text requires a YOLO-World model");
+        return false;
+    }
+    // Host input is row-major [nc, 512]; ggml stores [512, nc] column-major,
+    // i.e. the exact same memory layout, so a plain byte copy suffices.
+    // Queue the update and upload it at the start of the next graph run. This
+    // keeps CPU and GPU backends on the same input-buffer lifecycle and avoids
+    // writing through a tensor before its allocator has attached a buffer.
+    s->text_pending.assign(text_embed, text_embed + ggml_nelements(s->text_input));
+    return true;
+}
+
 bool session_read_output(Session* s, std::vector<float>& out, int& no, int& na) {
-    if (s->model.meta.task != "detect" && s->model.meta.task != "segment") {
-        YOLO_LOG_ERROR("session_read_output requires a detect or segment model, got %s",
+    if (s->model.meta.task != "detect" && s->model.meta.task != "segment" && s->model.meta.task != "pose" &&
+        s->model.meta.task != "obb") {
+        YOLO_LOG_ERROR("session_read_output requires a detect, segment, pose or obb model, got %s",
                        s->model.meta.task.c_str());
         return false;
     }
@@ -626,6 +964,41 @@ bool session_read_depth(Session* s, std::vector<float>& out, int& width, int& he
     return true;
 }
 
+bool session_read_semantic(Session* s, std::vector<float>& out, int& nc, int& w, int& h) {
+    if (s->model.meta.task != "semantic") {
+        YOLO_LOG_ERROR("session_read_semantic requires a semantic model, got %s", s->model.meta.task.c_str());
+        return false;
+    }
+    // logits layout: ne[0]=W, ne[1]=H, ne[2]=nc on the canvas/8 grid.
+    w = (int)s->output->ne[0];
+    h = (int)s->output->ne[1];
+    nc = (int)s->output->ne[2];
+    out.resize((size_t)w * h * nc);
+    if (s->output->type == GGML_TYPE_F16) {
+        ggml_backend_tensor_get(s->output, s->output_f16.data(), 0, s->output_f16.size() * sizeof(ggml_fp16_t));
+        ggml_fp16_to_fp32_row(s->output_f16.data(), out.data(), out.size());
+    } else {
+        ggml_backend_tensor_get(s->output, out.data(), 0, out.size() * sizeof(float));
+    }
+    return true;
+}
+
+bool session_read_logits(Session* s, std::vector<float>& out) {
+    if (s->model.meta.task != "classify") {
+        YOLO_LOG_ERROR("session_read_logits requires a classify model, got %s", s->model.meta.task.c_str());
+        return false;
+    }
+    const int64_t n = ggml_nelements(s->output);
+    out.resize(n);
+    if (s->output->type == GGML_TYPE_F16) {
+        ggml_backend_tensor_get(s->output, s->output_f16.data(), 0, s->output_f16.size() * sizeof(ggml_fp16_t));
+        ggml_fp16_to_fp32_row(s->output_f16.data(), out.data(), out.size());
+    } else {
+        ggml_backend_tensor_get(s->output, out.data(), 0, out.size() * sizeof(float));
+    }
+    return true;
+}
+
 bool session_dump_ops(const Session* s, const std::string& dir) {
     std::error_code ec;
     std::filesystem::create_directories(dir, ec);
@@ -645,6 +1018,7 @@ bool session_dump_ops(const Session* s, const std::string& dir) {
         return true;
     };
     if (s->input && s->input->type == GGML_TYPE_F32 && !write("input", s->input)) return false;
+    if (s->text_input && s->text_input->type == GGML_TYPE_F32 && !write("text", s->text_input)) return false;
     for (size_t i = 0; i < s->op_values.size(); i++) {
         const ggml_tensor* t = s->op_values[i];
         if (!t || t->type != GGML_TYPE_F32) continue;

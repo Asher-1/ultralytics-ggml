@@ -4,8 +4,10 @@
 
 Modes:
   prep   <pt> <img> <out.bin>        dump the torch LetterBox input (YINP0001)
-  raw    <pt> <in.bin> <out.bin>     run the fused model on a dumped input and
-                                     dump the pre-DFL raw head output (YRAW0001)
+  raw    <pt> <in.bin> <out.bin> [ytxt]
+                                     run the fused model on a dumped input and
+                                     dump the raw head output (YRAW0001).  For
+                                     YOLOE, ytxt is its post-reprta YTXT0001.
   diff   <torch.bin> <cpp.bin> [rm]  compare two YRAW0001 dumps
   depth <pt> <img> <out.bin> [dev]  dump official metric depth (YDEP0001)
   ddiff <torch.bin> <cpp.bin>        compare two metric-depth maps
@@ -57,6 +59,18 @@ def write_bin(path: str, magic: bytes, dims, data: np.ndarray):
         data.astype(np.float32).tofile(f)
 
 
+def read_ytxt(path: str) -> torch.Tensor:
+    """Read the [class, embedding] YTXT0001 tensor emitted by the text tools."""
+    with open(path, "rb") as f:
+        if f.read(8) != b"YTXT0001":
+            raise ValueError(f"{path} is not a YTXT0001 file")
+        nc, embed = struct.unpack("<ii", f.read(8))
+        values = np.fromfile(f, dtype=np.float32)
+    if values.size != nc * embed:
+        raise ValueError(f"{path} has {values.size} values, expected {nc * embed}")
+    return torch.from_numpy(values.reshape(1, nc, embed).copy())
+
+
 def main():
     mode = sys.argv[1]
     if mode == "prep":
@@ -80,13 +94,31 @@ def main():
         chw = data.reshape(dims).copy()
         x = torch.from_numpy(chw)[None]
         with torch.no_grad():
-            out = model.model(x)
+            if len(sys.argv) > 5:
+                tpe = read_ytxt(sys.argv[5])
+                head = model.model.model[-1]
+                if hasattr(head, "reprta"):
+                    # YTXT stores YOLOE's post-reprta, already normalized embedding.
+                    # predict() normally applies reprta to a raw MobileCLIP tensor, so
+                    # replacing it only for this reference call prevents a second pass.
+                    reprta, head.reprta = head.reprta, torch.nn.Identity()
+                    try:
+                        out = model.model.predict(x, tpe=tpe)
+                    finally:
+                        head.reprta = reprta
+                else:
+                    out = model.model.predict(x, tpe=tpe)
+            else:
+                out = model.model(x)
         # Detect returns (y, preds); preds holds the pre-DFL raw head output.
         preds = out[1]
         head = preds.get("one2one", preds)
         if "boxes" not in head:
             head = preds.get("one2many", head)
-        raw = torch.cat([head["boxes"], head["scores"]], dim=1)[0].numpy()  # [no, A]
+        parts = [head["boxes"], head["scores"]]
+        if "mask_coefficient" in head:
+            parts.append(head["mask_coefficient"])
+        raw = torch.cat(parts, dim=1)[0].numpy()  # [no, A]
         print(f"raw={raw.shape} canvas={dims}")
         write_bin(sys.argv[4], b"YRAW0001", raw.shape, raw)
 

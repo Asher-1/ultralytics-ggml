@@ -15,7 +15,7 @@ namespace yolo {
 
 // One node of the op-graph vocabulary written by scripts/convert_yolo_to_gguf.py.
 struct OpDef {
-    std::string type;  // conv|dwconv|maxpool|concat|upsample|interpolate|conv_transpose|add|slice|psa_attention|detect|depth
+    std::string type;  // primitive ops plus detect/segment/world_detect/world_segment task heads
     std::vector<int> inputs;        // op indices; -1 = graph input image
     std::map<std::string, int64_t> iparams;    // ints
     std::map<std::string, double> fparams;     // floats
@@ -50,6 +50,9 @@ struct ModelDef {
     // Flattened per-level head info, taken from the single detect op.
     bool has_detect = false;
     int detect_op_index = -1;
+    // YOLO-World: the graph consumes a runtime text-embedding input ([512, nc])
+    // alongside the image. nc is fixed at session creation (set_classes).
+    bool has_text_input = false;
 };
 
 // Read only the metadata header (cheap: no tensor data).

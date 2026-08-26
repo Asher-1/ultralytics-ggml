@@ -321,7 +321,7 @@ def test_train_reuses_loaded_checkpoint_model(monkeypatch, kwargs, uses_weights)
     """Test training reuses loaded checkpoint config while respecting the pretrained argument."""
     model = YOLO("yolo26n.yaml")
     model.ckpt = {"checkpoint": True}
-    model.ckpt_path = "/tmp/fake.pt"
+    model.ckpt_path = "fake.pt"
     model.overrides["model"] = "ul://glenn-jocher/m2/exp-14"
     model.overrides["pretrained"] = False
     original_model = model.model

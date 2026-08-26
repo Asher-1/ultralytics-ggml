@@ -1319,7 +1319,7 @@ def test_utils_checks(monkeypatch):
     monkeypatch.setattr(checks, "ONLINE", True)
     commands = []
     monkeypatch.setattr(checks.subprocess, "check_output", lambda command, **kwargs: commands.append(command) or "")
-    requirements = ["ray[tune]", "nvidia-modelopt[onnx]>=0.44", "$(touch /tmp/pwned)/missing"]
+    requirements = ["ray[tune]", "nvidia-modelopt[onnx]>=0.44", "$(touch test-sentinel)/missing"]
     assert checks.check_requirements(requirements)
     assert commands[0][5:] == requirements  # requirements remain individual argv entries, never shell source
     assert not checks.check_version("v2", ">=2.0")  # installed version-shaped package keeps metadata precedence

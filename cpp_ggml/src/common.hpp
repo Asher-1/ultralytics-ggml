@@ -45,12 +45,17 @@ struct ModelMeta {
     std::string name;
     std::string task;
     std::string dtype;
+    std::string text_model;
     int nc = 80;
     int nm = 0;             // segment: mask prototypes (0 for detect/depth)
+    int nk = 0;             // pose: keypoint values (kpt_shape[0]*kpt_shape[1])
+    int kpt_ndim = 0;       // pose: dims per keypoint (2 = xy, 3 = xy+visible)
+    int ne = 0;             // obb: angle channels (1)
     int nl = 3;
     int imgsz = 640;
     int reg_max = 16;
     bool end2end = false;
+    bool has_text_input = false;
     int max_det = 300;
     std::vector<float> strides;
     std::vector<std::string> class_names;

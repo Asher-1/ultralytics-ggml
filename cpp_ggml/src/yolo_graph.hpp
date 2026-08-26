@@ -17,6 +17,9 @@ struct Session {
     ggml_context* wctx = nullptr;              // weight tensors
     ggml_backend_buffer_t wbuf = nullptr;
     ggml_tensor* input = nullptr;              // external [W, H, 3] F32 input; F16 models cast on-device
+    ggml_tensor* text_input = nullptr;         // YOLO-World: external [512, nc] F32 text embedding
+    std::vector<float> text_pending;            // host cache for set_text before backend alloc
+    int world_nc = 0;                          // YOLO-World: class count driving the text input shape
     ggml_tensor* output = nullptr;             // raw detect [A,no] or metric depth [W,H,1,1]
     ggml_tensor* output_proto = nullptr;       // segment protos [W,H,nm,1] on the H/4 grid
     ggml_cgraph* graph = nullptr;
@@ -51,6 +54,7 @@ struct SessionOptions {
     bool keep_all_ops = false;   // keep every op output alive for --dump-ops (debug, extra memory)
     bool profile_ops = false;    // per-op wall-time table via sched eval callback (adds per-node sync)
     bool profile_gaps = false;   // per-stage (upload/compute/readback) running averages on stderr
+    int world_nc = 0;            // YOLO-World class count (0: use the GGUF yolo.nc default)
 };
 
 // Create a session for a GGUF model. See SessionOptions for the knobs.
@@ -59,6 +63,10 @@ void free_session(Session* s);
 
 // Copy a CHW float image into the input tensor, run the graph.
 bool session_run(Session* s, const float* chw_image);
+
+// YOLO-World: copy an [nc, 512] row-major text embedding into the text input
+// (column-major [512, nc] in ggml) before session_run.
+bool session_set_text(Session* s, const float* text_embed);
 
 // Read back the raw output [no, A] (row-major: no rows x A anchors). For
 // segment models `no` additionally carries nm mask-coefficient rows.
@@ -69,6 +77,12 @@ bool session_read_proto(Session* s, std::vector<float>& out, int& nm, int& w, in
 
 // Read back a metric depth map in meters, row-major [height, width].
 bool session_read_depth(Session* s, std::vector<float>& out, int& width, int& height);
+
+// Read back semantic logits [nc, H, W] on the canvas/8 grid (row-major channels).
+bool session_read_semantic(Session* s, std::vector<float>& out, int& nc, int& w, int& h);
+
+// Read back classify logits [nc] (row-major).
+bool session_read_logits(Session* s, std::vector<float>& out);
 
 // Dump every per-op output tensor to `dir` as YLYR0001 bins (4x i32 dims + f32).
 bool session_dump_ops(const Session* s, const std::string& dir);

@@ -55,8 +55,8 @@ Request an Enterprise License for commercial use at [Ultralytics Licensing](http
 ## GGML C++ Inference
 
 This fork includes a standalone [GGML C++ runtime](cpp_ggml/README.md) for YOLOv8 and YOLO26 detection plus YOLO26n
-absolute-depth estimation. It supports CPU, CUDA, and Vulkan inference with F32, F16, and Q8_0 GGUF models and does not
-require Python or PyTorch at runtime. Source checkpoints and generated models have one canonical layout documented in
+absolute-depth estimation, and a CLIP ViT-B/32 text+image encoder for semantic image similarity search. It supports CPU, CUDA, and Vulkan inference with F32, F16, and Q8_0 GGUF models and does not
+require Python or PyTorch at runtime. CPU Q8_0 models are now accelerated via compile-time dequantisation to F16, eliminating dynamic quantisation overhead in the im2col+mul_mat pipeline. Source checkpoints and generated models have one canonical layout documented in
 the [model card](cpp_ggml/models/MODEL_CARD.md).
 
 | End-to-end latency                                                             | Detection output parity                                                           |
@@ -66,8 +66,9 @@ the [model card](cpp_ggml/models/MODEL_CARD.md).
 See the [benchmark and parity report](cpp_ggml/benchmarks/README.md) for raw data, the complete model/backend/precision
 matrix, reproduction commands, accuracy scope, and remaining validation work. On the measured RTX 3060, F16 ggml CUDA
 beats PyTorch CUDA on all 11 models (x1.04-x2.01). F16 Vulkan meets the declared x0.70 throughput-proximity floor on all
-11 models (x0.70-x1.32). Focused parity covers every model; full COCO and NYU Depth V2 validation remains required before
-claiming portable dataset-level accuracy.
+11 models (x0.70-x1.32). The CPU backend now applies host-side Q8_0→F16 dequantisation (matching the Vulkan path),
+removing the dynamic quantisation step from the Q8_0 im2col+mul_mat pipeline. Focused parity covers every model; full
+COCO and NYU Depth V2 validation remains required before claiming portable dataset-level accuracy.
 
 ## 📄 Documentation
 

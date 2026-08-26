@@ -12,6 +12,7 @@ endif()
 
 # Options
 option(YOLO_GGML_BUILD_CLI   "Build the yolo-cli binary"           ON)
+option(YOLO_GGML_CLIP       "Build CLIP image-similarity support"  ON)
 option(YOLO_GGML_SHARED      "Build libyologgml as a shared library" OFF)
 
 # Backend forwarding to ggml (mirrors rf-detr.cpp pattern)
@@ -160,6 +161,10 @@ set(YOLOGGML_SOURCES
     src/yolo_graph.cpp
     src/postprocess.cpp
 )
+
+if(YOLO_GGML_CLIP)
+    list(APPEND YOLOGGML_SOURCES src/clip_graph.cpp)
+endif()
 
 if(YOLO_GGML_SHARED)
     add_library(yologgml SHARED ${YOLOGGML_SOURCES})

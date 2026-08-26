@@ -7,6 +7,7 @@ lib/
 models/pytorch/*.pt
 models/gguf/*.gguf
 models/onnx/*.onnx
+*.npz
 
 # Benchmark artifacts
 benchmarks/*.json.tmp
