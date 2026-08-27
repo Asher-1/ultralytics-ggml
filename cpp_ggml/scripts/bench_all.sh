@@ -3,8 +3,15 @@
 # bench_all.sh — collect the full performance matrix into benchmarks/bench.jsonl
 #
 # Runs yolo-cli bench for every (model x dtype) on the requested backend build
-# directory and appends one JSON line per run. Re-runs overwrite nothing: the
-# plot script de-duplicates by (backend, model, dtype) keeping the last entry.
+# directory and appends one JSON line per run. Closed-set lines go to
+# bench.jsonl; World lines go to world.jsonl because their vocabulary is part
+# of the measurement contract. Re-runs overwrite nothing: the plot script
+# de-duplicates by (backend, model, dtype) keeping the last closed-set entry.
+# The default sweep covers the 45 closed-set checkpoints (detect, segment,
+# depth, pose, obb, semantic, classify x n/s/m/l/x, plus yolov8 detect/seg).
+# Open-vocabulary World must be requested explicitly with a fixed vocabulary.
+# YOLOE requires a different, detector-specific post-reprta YTXT for each
+# checkpoint and is therefore also explicit.
 #
 # Usage: scripts/bench_all.sh BUILD_DIR [BACKEND_TAG] [models...]
 #   scripts/bench_all.sh build-cuda cuda
@@ -23,7 +30,25 @@ shift 2 || true
 if (( $# )); then
     MODELS=("$@")
 else
-    MODELS=(yolov8n yolov8s yolov8m yolov8l yolov8x yolo26n yolo26s yolo26m yolo26l yolo26x yolo26n-depth)
+    MODELS=(
+        # yolov8 detection + segmentation
+        yolov8n yolov8s yolov8m yolov8l yolov8x
+        yolov8n-seg yolov8s-seg yolov8m-seg yolov8l-seg yolov8x-seg
+        # yolo26 detection
+        yolo26n yolo26s yolo26m yolo26l yolo26x
+        # yolo26 segmentation
+        yolo26n-seg yolo26s-seg yolo26m-seg yolo26l-seg yolo26x-seg
+        # yolo26 depth
+        yolo26n-depth yolo26s-depth yolo26m-depth yolo26l-depth yolo26x-depth
+        # yolo26 pose
+        yolo26n-pose yolo26s-pose yolo26m-pose yolo26l-pose yolo26x-pose
+        # yolo26 obb
+        yolo26n-obb yolo26s-obb yolo26m-obb yolo26l-obb yolo26x-obb
+        # yolo26 semantic
+        yolo26n-sem yolo26s-sem yolo26m-sem yolo26l-sem yolo26x-sem
+        # yolo26 classify
+        yolo26n-cls yolo26s-cls yolo26m-cls yolo26l-cls yolo26x-cls
+    )
 fi
 read -r -a DTYPES <<< "${YOLO_BENCH_DTYPES:-f16 f32 q8_0}"
 SRC="../ultralytics/assets/bus.jpg"
@@ -35,6 +60,10 @@ if [[ "$TAG" == "cpu" ]]; then THREADS=8; else GPU_ARGS=(--warmup 20 --iters 50)
 
 mkdir -p benchmarks
 OUT="${YOLO_BENCH_OUT:-benchmarks/bench.jsonl}"
+WORLD_OUT="${YOLO_BENCH_WORLD_OUT:-benchmarks/world.jsonl}"
+YOLOE_OUT="${YOLO_BENCH_YOLOE_OUT:-benchmarks/yoloe.jsonl}"
+WORLD_COUNT=0
+YOLOE_COUNT=0
 echo "collecting ${#MODELS[@]} models x ${#DTYPES[@]} dtypes on $TAG -> $OUT"
 
 for m in "${MODELS[@]}"; do
@@ -42,6 +71,22 @@ for m in "${MODELS[@]}"; do
         f="models/gguf/$m-$dt.gguf"
         [[ -f "$f" ]] || { echo "[fail] $f missing" >&2; exit 1; }
         args=(--model "$f" --source "$SRC" "${GPU_ARGS[@]}")
+        if [[ "$m" == *-world ]]; then
+            : "${YOLO_BENCH_WORLD_CLASSES:?set a fixed comma-separated World vocabulary}"
+            args+=(--classes "$YOLO_BENCH_WORLD_CLASSES")
+            if [[ -n "${YOLO_BENCH_WORLD_CLIP_MODEL:-}" ]]; then
+                args+=(--clip-model "$YOLO_BENCH_WORLD_CLIP_MODEL")
+            fi
+            if [[ -n "${YOLO_BENCH_WORLD_TEXT_EMBED:-}" ]]; then
+                args+=(--text-embed "$YOLO_BENCH_WORLD_TEXT_EMBED")
+            fi
+        elif [[ "$m" == yoloe-* ]]; then
+            : "${YOLO_BENCH_YOLOE_CLASSES:?set a fixed comma-separated YOLOE vocabulary}"
+            : "${YOLO_BENCH_YOLOE_TEXT_EMBED_DIR:?set the directory holding per-model post-reprta YTXT files}"
+            ytxt="$YOLO_BENCH_YOLOE_TEXT_EMBED_DIR/$m.ytxt"
+            [[ -f "$ytxt" ]] || { echo "[fail] missing YOLOE YTXT: $ytxt" >&2; exit 1; }
+            args+=(--classes "$YOLO_BENCH_YOLOE_CLASSES" --text-embed "$ytxt")
+        fi
         [[ "$THREADS" -gt 0 ]] && args+=(--threads "$THREADS")
         # CPU m/l/x are slow; trim iterations so the sweep stays tractable.
         if [[ "$TAG" == "cpu" && ("$m" == *m || "$m" == *l || "$m" == *x) ]]; then
@@ -55,10 +100,24 @@ for m in "${MODELS[@]}"; do
         line=$(python3 -c "import json,sys; d=json.loads(sys.argv[1]); tag=sys.argv[2]; actual=d['backend'].lower(); \
 assert tag == 'cpu' and actual == 'cpu' or tag != 'cpu' and tag in actual, f'expected {tag}, got {actual}'; \
 d['backend']=tag; print(json.dumps(d))" "$line" "$TAG")
-        echo "$line" >> "$OUT"
+        if [[ "$m" == *-world ]]; then
+            echo "$line" >> "$WORLD_OUT"
+            ((WORLD_COUNT += 1))
+        elif [[ "$m" == yoloe-* ]]; then
+            echo "$line" >> "$YOLOE_OUT"
+            ((YOLOE_COUNT += 1))
+        else
+            echo "$line" >> "$OUT"
+        fi
         ms=$(python3 -c "import json,sys; print(json.loads(sys.argv[1])['e2e_ms']['mean'])" "$line")
         echo "[ok] $m-$dt e2e_ms=$ms"
         [[ "$COOLDOWN" -gt 0 ]] && sleep "$COOLDOWN"
     done
 done
-echo "done: $(wc -l < "$OUT") total entries in $OUT"
+echo "done: $(wc -l < "$OUT") closed-set entries in $OUT"
+if (( WORLD_COUNT )); then
+    echo "      $(wc -l < "$WORLD_OUT") World entries in $WORLD_OUT"
+fi
+if (( YOLOE_COUNT )); then
+    echo "      $(wc -l < "$YOLOE_OUT") YOLOE entries in $YOLOE_OUT"
+fi

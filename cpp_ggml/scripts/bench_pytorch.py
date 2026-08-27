@@ -34,17 +34,59 @@ def main() -> int:
         "--models",
         nargs="+",
         default=[
+            # yolov8 detection + segmentation
             "yolov8n",
             "yolov8s",
             "yolov8m",
             "yolov8l",
             "yolov8x",
+            "yolov8n-seg",
+            "yolov8s-seg",
+            "yolov8m-seg",
+            "yolov8l-seg",
+            "yolov8x-seg",
+            # yolo26 detection
             "yolo26n",
             "yolo26s",
             "yolo26m",
             "yolo26l",
             "yolo26x",
+            # yolo26 segmentation
+            "yolo26n-seg",
+            "yolo26s-seg",
+            "yolo26m-seg",
+            "yolo26l-seg",
+            "yolo26x-seg",
+            # yolo26 depth
             "yolo26n-depth",
+            "yolo26s-depth",
+            "yolo26m-depth",
+            "yolo26l-depth",
+            "yolo26x-depth",
+            # yolo26 pose
+            "yolo26n-pose",
+            "yolo26s-pose",
+            "yolo26m-pose",
+            "yolo26l-pose",
+            "yolo26x-pose",
+            # yolo26 obb
+            "yolo26n-obb",
+            "yolo26s-obb",
+            "yolo26m-obb",
+            "yolo26l-obb",
+            "yolo26x-obb",
+            # yolo26 semantic
+            "yolo26n-sem",
+            "yolo26s-sem",
+            "yolo26m-sem",
+            "yolo26l-sem",
+            "yolo26x-sem",
+            # yolo26 classify
+            "yolo26n-cls",
+            "yolo26s-cls",
+            "yolo26m-cls",
+            "yolo26l-cls",
+            "yolo26x-cls",
         ],
     )
     ap.add_argument("--source", default=str(ROOT.parent / "ultralytics/assets/bus.jpg"))
@@ -63,7 +105,9 @@ def main() -> int:
     for name in args.models:
         model = YOLO(ROOT / "models" / "pytorch" / f"{name}.pt")
         model.to(args.device)
-        imgsz = 768 if model.task == "depth" else args.imgsz
+        # Match the ggml canvas per task: depth checkpoints run at 768,
+        # classify at 224 (checkpoint transforms), everything else 480x640.
+        imgsz = 768 if model.task == "depth" else (224 if model.task == "classify" else args.imgsz)
         for _ in range(args.warmup):
             model.predict(image, imgsz=imgsz, device=args.device, verbose=False)
         times = []

@@ -33,10 +33,18 @@ static void parse_meta(const gguf_context* g, ModelMeta& meta) {
     meta.name = str_or(g, "general.name", "yolo");
     meta.task = str_or(g, "yolo.task", "detect");
     meta.dtype = str_or(g, "yolo.dtype", "?");
+    meta.text_model = str_or(g, "yolo.text_model", "");
     meta.nc = (int)key_or(g, "yolo.nc", 80);
     meta.nm = (int)key_or(g, "yolo.nm", 0);
+    meta.nk = (int)key_or(g, "yolo.nk", 0);
+    meta.ne = (int)key_or(g, "yolo.ne", 0);
     meta.nl = (int)key_or(g, "yolo.nl", 3);
     meta.imgsz = (int)key_or(g, "yolo.imgsz", 640);
+
+    if (int64_t id = gguf_find_key(g, "yolo.kpt_shape"); id >= 0 && gguf_get_arr_n(g, id) >= 2) {
+        const uint32_t* p = (const uint32_t*)gguf_get_arr_data(g, id);
+        meta.kpt_ndim = (int)p[1];
+    }
 
     if (int64_t id = gguf_find_key(g, "yolo.strides"); id >= 0) {
         size_t n = gguf_get_arr_n(g, id);
@@ -47,6 +55,7 @@ static void parse_meta(const gguf_context* g, ModelMeta& meta) {
         size_t n = gguf_get_arr_n(g, id);
         for (size_t i = 0; i < n; i++) meta.class_names.emplace_back(gguf_get_arr_str(g, id, i));
     }
+    meta.has_text_input = key_or(g, "yolo.world", 0) != 0;
     if (meta.strides.empty()) {
         for (int i = 0; i < meta.nl; i++) meta.strides.push_back(float(8 << i));
     }
@@ -82,7 +91,7 @@ std::unique_ptr<ModelDef> load_gguf(const std::string& path) {
     // ---- metadata ----
     parse_meta(g, model->meta);
     const int64_t graph_version = key_or(g, "yolo.op_graph_version", 0);
-    if (graph_version < 1 || graph_version > 2) {
+    if (graph_version < 1 || graph_version > 3) {
         YOLO_LOG_ERROR("unsupported yolo.op_graph_version: %lld", (long long)graph_version);
         gguf_free(g);
         ggml_free(weight_ctx);
@@ -155,22 +164,34 @@ std::unique_ptr<ModelDef> load_gguf(const std::string& path) {
                     break;
             }
         }
-        if (op.type == "detect" || op.type == "segment") {
+        if (op.type == "detect" || op.type == "segment" || op.type == "pose" || op.type == "obb" ||
+            op.type == "world_detect" || op.type == "world_segment") {
             model->has_detect = true;
             model->detect_op_index = (int)i;
             model->meta.reg_max = (int)key_or(g, (prefix + ".reg_max").c_str(), 16);
             model->meta.end2end = key_or(g, (prefix + ".end2end").c_str(), 0) != 0;
             model->meta.max_det = (int)key_or(g, (prefix + ".max_det").c_str(), 300);
         }
+        if (op.type == "max_sigmoid_attn" || op.type == "image_pooling_attn" ||
+            op.type == "world_detect" || op.type == "world_segment") {
+            model->has_text_input = true;
+        }
     }
-    if ((model->meta.task != "depth" && !model->has_detect) ||
-        (model->meta.task == "depth" && model->ops.back().type != "depth")) {
+    const std::string& tail = model->ops.back().type;
+    const bool tail_ok = (tail == "detect" || tail == "segment" || tail == "pose" || tail == "obb" ||
+                         tail == "world_detect" || tail == "world_segment") ||
+                         (model->meta.task == "depth" && tail == "depth") ||
+                         (model->meta.task == "semantic" && tail == "semantic") ||
+                         (model->meta.task == "classify" && tail == "classify");
+    if (!tail_ok) {
         YOLO_LOG_ERROR("op graph does not contain the declared %s output", model->meta.task.c_str());
         gguf_free(g);
         ggml_free(weight_ctx);
         return nullptr;
     }
-    if (model->meta.task != "detect" && model->meta.task != "depth" && model->meta.task != "segment") {
+    if (model->meta.task != "detect" && model->meta.task != "depth" && model->meta.task != "segment" &&
+        model->meta.task != "pose" && model->meta.task != "obb" && model->meta.task != "semantic" &&
+        model->meta.task != "classify") {
         YOLO_LOG_ERROR("unsupported task: %s", model->meta.task.c_str());
         gguf_free(g);
         ggml_free(weight_ctx);
@@ -178,6 +199,18 @@ std::unique_ptr<ModelDef> load_gguf(const std::string& path) {
     }
     if (model->meta.task == "segment" && model->meta.nm <= 0) {
         YOLO_LOG_ERROR("segment model without yolo.nm prototypes");
+        gguf_free(g);
+        ggml_free(weight_ctx);
+        return nullptr;
+    }
+    if (model->meta.task == "pose" && (model->meta.nk <= 0 || (model->meta.kpt_ndim != 2 && model->meta.kpt_ndim != 3))) {
+        YOLO_LOG_ERROR("pose model without valid yolo.nk/kpt_shape");
+        gguf_free(g);
+        ggml_free(weight_ctx);
+        return nullptr;
+    }
+    if (model->meta.task == "obb" && model->meta.ne <= 0) {
+        YOLO_LOG_ERROR("obb model without yolo.ne angle channels");
         gguf_free(g);
         ggml_free(weight_ctx);
         return nullptr;
@@ -209,9 +242,10 @@ std::unique_ptr<ModelDef> load_gguf(const std::string& path) {
         model->tensors[name] = std::move(ht);
     }
 
-    YOLO_LOG_INFO("loaded %s: %lld ops, %lld tensors, dtype=%s, nc=%d, nm=%d, end2end=%d",
+    YOLO_LOG_INFO("loaded %s: %lld ops, %lld tensors, dtype=%s, task=%s, nc=%d, nm=%d, nk=%d, ne=%d, end2end=%d",
                   path.c_str(), (long long)n_ops, (long long)n_tensors,
-                  model->meta.dtype.c_str(), model->meta.nc, model->meta.nm, (int)model->meta.end2end);
+                  model->meta.dtype.c_str(), model->meta.task.c_str(), model->meta.nc, model->meta.nm,
+                  model->meta.nk, model->meta.ne, (int)model->meta.end2end);
 
     gguf_free(g);
     ggml_free(weight_ctx);
