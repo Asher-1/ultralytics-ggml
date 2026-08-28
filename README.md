@@ -54,21 +54,93 @@ Request an Enterprise License for commercial use at [Ultralytics Licensing](http
 
 ## GGML C++ Inference
 
-This fork includes a standalone [GGML C++ runtime](cpp_ggml/README.md) for YOLOv8 and YOLO26 detection plus YOLO26n
-absolute-depth estimation, and a CLIP ViT-B/32 text+image encoder for semantic image similarity search. It supports CPU, CUDA, and Vulkan inference with F32, F16, and Q8_0 GGUF models and does not
-require Python or PyTorch at runtime. CPU Q8_0 models are now accelerated via compile-time dequantisation to F16, eliminating dynamic quantisation overhead in the im2col+mul_mat pipeline. Source checkpoints and generated models have one canonical layout documented in
-the [model card](cpp_ggml/models/MODEL_CARD.md).
+This fork ships a standalone [GGML C++ runtime](cpp_ggml/README.md) covering the complete YOLOv8/YOLO26 task family —
+detection, instance segmentation, absolute depth, pose, oriented boxes (OBB), semantic segmentation, and classification
+— at n/s/m/l/x scales, plus open-vocabulary YOLO-World/YOLOE-26 inference and a CLIP ViT-B/32 text+image encoder for
+semantic image search. Models are metadata-driven GGUF graphs (F32, F16, Q8_0) served by a single `yolo-cli` binary on
+CPU, CUDA, and Vulkan with no Python or PyTorch at runtime.
 
-| End-to-end latency                                                             | Detection output parity                                                           |
-| ------------------------------------------------------------------------------ | --------------------------------------------------------------------------------- |
-| ![GGML backend latency comparison](cpp_ggml/benchmarks/latency_by_backend.png) | ![PyTorch and GGML detection comparison](cpp_ggml/benchmarks/parity_grid_bus.png) |
+<img width="100%" src="cpp_ggml/benchmarks/model_family_overview.png" alt="ggml inference results across all model families">
 
-See the [benchmark and parity report](cpp_ggml/benchmarks/README.md) for raw data, the complete model/backend/precision
-matrix, reproduction commands, accuracy scope, and remaining validation work. On the measured RTX 3060, F16 ggml CUDA
-beats PyTorch CUDA on all 11 models (x1.04-x2.01). F16 Vulkan meets the declared x0.70 throughput-proximity floor on all
-11 models (x0.70-x1.32). The CPU backend now applies host-side Q8_0→F16 dequantisation (matching the Vulkan path),
-removing the dynamic quantisation step from the Q8_0 im2col+mul_mat pipeline. Focused parity covers every model; full
-COCO and NYU Depth V2 validation remains required before claiming portable dataset-level accuracy.
+**Docs:** [operational guide](cpp_ggml/README.md) · [model card](cpp_ggml/models/MODEL_CARD.md) ·
+[benchmark & parity report](cpp_ggml/benchmarks/README.md) · [open-vocabulary guide](cpp_ggml/docs/world.md)
+
+### Prebuilt GGUF models on Hugging Face
+
+Every runtime GGUF — 187 files: the 135 closed-set checkpoints (7 task families x n/s/m/l/x x F32/F16/Q8_0), 13
+YOLO-World, 30 YOLOE-26 incl. `-pf`, and the CLIP/MobileCLIP text towers with parity references — is published on
+Hugging Face, so the runtime can be used without any local conversion:
+
+[![Hugging Face](https://img.shields.io/badge/Hugging%20Face-Asher--1%2Fyolo--gguf-yellow)](https://huggingface.co/Asher-1/yolo-gguf)
+
+```bash
+pip install -U "huggingface_hub[cli]"
+huggingface-cli download Asher-1/yolo-gguf --local-dir cpp_ggml/models/gguf
+```
+
+### Quick start
+
+```bash
+# Build (CUDA example; CPU = drop the backend flag, Vulkan = -DYOLO_GGML_VULKAN=ON)
+cmake -S cpp_ggml -B cpp_ggml/build-cuda -DCMAKE_BUILD_TYPE=Release -DYOLO_GGML_CUDA=ON
+cmake --build cpp_ggml/build-cuda --parallel 6
+
+# Detection — the binary prints the backend actually used
+cpp_ggml/build-cuda/bin/yolo-cli detect \
+    --model cpp_ggml/models/gguf/yolo26n-f16.gguf \
+    --source ultralytics/assets/bus.jpg \
+    --out cpp_ggml/results/yolo26n-bus.png
+
+# Monocular absolute depth in meters
+cpp_ggml/build-cuda/bin/yolo-cli depth \
+    --model cpp_ggml/models/gguf/yolo26n-depth-f16.gguf \
+    --source ultralytics/assets/bus.jpg \
+    --out cpp_ggml/results/yolo26n-depth-bus.png
+
+# Open-vocabulary detection: plaintext classes encoded on the fly by the built-in CLIP text tower
+cpp_ggml/build-cuda/bin/yolo-cli detect \
+    --model cpp_ggml/models/gguf/yolov8s-world-f16.gguf \
+    --source ultralytics/assets/bus.jpg \
+    --classes "person,bus,car" --conf 0.25
+```
+
+Instance masks, COCO-17 skeletons, DOTA-15 rotated boxes, Cityscapes-19 class maps, and ImageNet top-k all run through
+the same CLI (`pose`, `obb`, `semantic`, `classify`, `bench`, `similarity`) — see
+[Run inference](cpp_ggml/README.md#5-run-inference).
+
+### Visual parity against PyTorch
+
+Every backend is validated against the official PyTorch reference on identical inputs:
+
+| Detection: PyTorch vs CUDA/Vulkan/CPU (bus)                       | Detection: PyTorch vs CUDA/Vulkan/CPU (zidane)                          |
+| ----------------------------------------------------------------- | ----------------------------------------------------------------------- |
+| ![Detection parity, bus](cpp_ggml/benchmarks/parity_grid_bus.png) | ![Detection parity, zidane](cpp_ggml/benchmarks/parity_grid_zidane.png) |
+
+| Absolute depth: PyTorch vs ggml backends                       | Open-vocabulary YOLOv8s-World: PyTorch vs ggml                   |
+| -------------------------------------------------------------- | ---------------------------------------------------------------- |
+| ![Depth parity, bus](cpp_ggml/benchmarks/depth_parity_bus.png) | ![World parity](cpp_ggml/benchmarks/world_parity_bus_zidane.png) |
+
+| CLIP ViT-B/32 embeddings: C++ vs PyTorch                    | CPU Q8_0 direct-kernel speedup                                        |
+| ----------------------------------------------------------- | --------------------------------------------------------------------- |
+| ![CLIP validation](cpp_ggml/benchmarks/clip_validation.png) | ![CPU Q8_0 optimization](cpp_ggml/benchmarks/cpu_q8_optimization.png) |
+
+CLIP C++ embeddings match PyTorch with cosine 1.0000000 (text) and 0.99994 (image) under the documented preprocessing.
+
+### Performance
+
+On the measured RTX 3060 (bus.jpg) the full 54-checkpoint matrix passes 486/486 model x backend x precision keys.
+Per-family best speedups over the PyTorch CUDA reference: detect x2.42, segment x1.58, depth x1.52, pose x2.07,
+obb x2.40, semantic x2.19, classify x1.07; GPU graph time stays under 30 ms for 268 of 270 GPU keys. Raw JSONL, the
+complete matrix, and reproduction commands live in the
+[benchmark and parity report](cpp_ggml/benchmarks/README.md) and the
+[speedup table](cpp_ggml/benchmarks/speedup_table.md).
+
+| Seven task families vs PyTorch                        | F16 detection latency by backend                                  |
+| ----------------------------------------------------- | ----------------------------------------------------------------- |
+| ![Task latency](cpp_ggml/benchmarks/task_latency.png) | ![Latency by backend](cpp_ggml/benchmarks/latency_by_backend.png) |
+
+These are measurements for the documented hardware, software, and protocol, not portable guarantees; dataset-level
+COCO, NYU Depth V2, Cityscapes, DOTA, and ImageNet validation remains required before production accuracy claims.
 
 ## 📄 Documentation
 

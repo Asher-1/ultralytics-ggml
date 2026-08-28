@@ -34,18 +34,89 @@
 
 ## GGML C++ 推理集成
 
-本仓库包含独立的 [GGML C++ 运行时](cpp_ggml/README.md)，支持 YOLOv8、YOLO26 目标检测和 YOLO26n 绝对深度估计，
-可在 CPU、CUDA 和 Vulkan 上运行 F32、F16、Q8_0 GGUF 模型，运行时不依赖 Python 或 PyTorch。模型输入与生成文件的
-唯一目录布局见[模型卡](cpp_ggml/models/MODEL_CARD.md)。
+本仓库内置独立的 [GGML C++ 运行时](cpp_ggml/README.md)，覆盖完整的 YOLOv8/YOLO26 任务家族 —— 目标检测、实例分割、
+绝对深度、姿态估计、旋转框（OBB）、语义分割与图像分类，均提供 n/s/m/l/x 五种规模，并支持 YOLO-World/YOLOE-26
+开放词汇推理和 CLIP ViT-B/32 文本+图像编码器语义检索。模型为元数据驱动的 GGUF 计算图（F32、F16、Q8_0），由单一
+`yolo-cli` 二进制在 CPU、CUDA 和 Vulkan 上运行，推理阶段零 Python/PyTorch 依赖。
 
-| 端到端延迟对比                                                   | 检测输出一致性对比                                                       |
-| ---------------------------------------------------------------- | ------------------------------------------------------------------------ |
-| ![GGML 后端延迟对比](cpp_ggml/benchmarks/latency_by_backend.png) | ![PyTorch 与 GGML 检测结果对比](cpp_ggml/benchmarks/parity_grid_bus.png) |
+<img width="100%" src="cpp_ggml/benchmarks/model_family_overview.png" alt="ggml 全部模型家族推理效果图">
 
-完整原始数据、构建和运行命令、精度验证范围以及剩余验证项请参阅[基准与一致性报告](cpp_ggml/benchmarks/README.md)。在实测
-RTX 3060 上，F16 ggml CUDA 的 11/11 个模型均超过 PyTorch-CUDA（x1.04-x2.01）；F16 Vulkan 的 11/11 个模型均达到明确定义
-的 x0.70 吞吐接近线（x0.70-x1.32）。聚焦一致性验证已覆盖全部模型，但完整 COCO 和 NYU Depth V2 数据集验证仍是发布级精度
-结论的必要条件。
+**文档：** [操作指南](cpp_ggml/README.md) · [模型卡](cpp_ggml/models/MODEL_CARD.md) ·
+[基准与一致性报告](cpp_ggml/benchmarks/README.md) · [开放词汇指南](cpp_ggml/docs/world.md)
+
+### Hugging Face 预构建 GGUF
+
+全部运行时 GGUF —— 共 187 个文件：135 个封闭集检查点（7 大任务家族 x n/s/m/l/x x F32/F16/Q8_0）、13 个
+YOLO-World、30 个 YOLOE-26（含 `-pf`），以及带一致性参考的 CLIP/MobileCLIP 文本塔 —— 均已发布在 Hugging Face，
+无需本地转换即可直接使用：
+
+[![Hugging Face](https://img.shields.io/badge/Hugging%20Face-Asher--1%2Fyolo--gguf-yellow)](https://huggingface.co/Asher-1/yolo-gguf)
+
+```bash
+pip install -U "huggingface_hub[cli]"
+huggingface-cli download Asher-1/yolo-gguf --local-dir cpp_ggml/models/gguf
+```
+
+### 快速开始
+
+```bash
+# 构建（以 CUDA 为例；CPU 构建去掉后端开关，Vulkan 换成 -DYOLO_GGML_VULKAN=ON）
+cmake -S cpp_ggml -B cpp_ggml/build-cuda -DCMAKE_BUILD_TYPE=Release -DYOLO_GGML_CUDA=ON
+cmake --build cpp_ggml/build-cuda --parallel 6
+
+# 目标检测 —— 二进制会打印实际使用的后端
+cpp_ggml/build-cuda/bin/yolo-cli detect \
+    --model cpp_ggml/models/gguf/yolo26n-f16.gguf \
+    --source ultralytics/assets/bus.jpg \
+    --out cpp_ggml/results/yolo26n-bus.png
+
+# 单目绝对深度（米）
+cpp_ggml/build-cuda/bin/yolo-cli depth \
+    --model cpp_ggml/models/gguf/yolo26n-depth-f16.gguf \
+    --source ultralytics/assets/bus.jpg \
+    --out cpp_ggml/results/yolo26n-depth-bus.png
+
+# 开放词汇检测：明文类别由内置 CLIP 文本塔即时编码
+cpp_ggml/build-cuda/bin/yolo-cli detect \
+    --model cpp_ggml/models/gguf/yolov8s-world-f16.gguf \
+    --source ultralytics/assets/bus.jpg \
+    --classes "person,bus,car" --conf 0.25
+```
+
+实例掩码、COCO-17 骨架、DOTA-15 旋转框、Cityscapes-19 类别图和 ImageNet top-k 均由同一 CLI 提供（`pose`、`obb`、
+`semantic`、`classify`、`bench`、`similarity`），详见[运行推理](cpp_ggml/README.md#5-run-inference)。
+
+### 与 PyTorch 的可视化一致性对比
+
+所有后端都在完全相同的输入下与官方 PyTorch 参考实现做了对比验证：
+
+| 目标检测：PyTorch vs CUDA/Vulkan/CPU（bus）                    | 目标检测：PyTorch vs CUDA/Vulkan/CPU（zidane）                       |
+| -------------------------------------------------------------- | -------------------------------------------------------------------- |
+| ![检测一致性对比 bus](cpp_ggml/benchmarks/parity_grid_bus.png) | ![检测一致性对比 zidane](cpp_ggml/benchmarks/parity_grid_zidane.png) |
+
+| 绝对深度：PyTorch vs ggml 后端                                  | 开放词汇 YOLOv8s-World：PyTorch vs ggml                              |
+| --------------------------------------------------------------- | -------------------------------------------------------------------- |
+| ![深度一致性对比 bus](cpp_ggml/benchmarks/depth_parity_bus.png) | ![World 一致性对比](cpp_ggml/benchmarks/world_parity_bus_zidane.png) |
+
+| CLIP ViT-B/32 嵌入：C++ vs PyTorch                    | CPU Q8_0 直接内核加速                                         |
+| ----------------------------------------------------- | ------------------------------------------------------------- |
+| ![CLIP 验证](cpp_ggml/benchmarks/clip_validation.png) | ![CPU Q8_0 优化](cpp_ggml/benchmarks/cpu_q8_optimization.png) |
+
+在文档规定的预处理下，CLIP C++ 嵌入与 PyTorch 的余弦相似度为：文本 1.0000000、图像 0.99994。
+
+### 性能
+
+在实测的 RTX 3060（bus.jpg）上，54 检查点完整矩阵的 486/486 个“模型 x 后端 x 精度”组合全部通过。相对 PyTorch
+CUDA 参考的各家族最佳加速：detect x2.42、segment x1.58、depth x1.52、pose x2.07、obb x2.40、semantic x2.19、
+classify x1.07；270 个 GPU 组合中 268 个的图执行时间低于 30 ms。原始 JSONL、完整矩阵与复现命令见
+[基准与一致性报告](cpp_ggml/benchmarks/README.md)与[加速对照表](cpp_ggml/benchmarks/speedup_table.md)。
+
+| 七大任务家族 vs PyTorch                           | F16 检测延迟（按后端）                                    |
+| ------------------------------------------------- | --------------------------------------------------------- |
+| ![任务延迟](cpp_ggml/benchmarks/task_latency.png) | ![按后端延迟](cpp_ggml/benchmarks/latency_by_backend.png) |
+
+以上为特定硬件、软件与协议下的实测数据，并非可移植保证；在声称生产级精度之前，仍需完成 COCO、NYU Depth V2、
+Cityscapes、DOTA 与 ImageNet 的数据集级验证。
 
 <a href="https://platform.ultralytics.com/ultralytics/yolo26" target="_blank">
   <img width="100%" src="https://raw.githubusercontent.com/ultralytics/assets/refs/heads/main/yolo/performance-comparison.png" alt="YOLO26 performance plots">
