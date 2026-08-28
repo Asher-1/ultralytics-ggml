@@ -3,7 +3,7 @@
 """Render the CLIP ViT-B/32 validation and architecture charts.
 
 Inputs:
-    models/gguf/clip-ViT-B-32.ref.npz          (PyTorch reference, gen_clip_ref.py)
+    models/gguf/clip-ViT-B-32-f16.ref.npz      (PyTorch reference, gen_clip_ref.py)
     cpp_txt_embed.txt                          (yolo-similarity --text "a photo of a bus" --dump_embed)
     cpp_img_embed.txt                          (yolo-similarity --image bus.jpg --dump_embed)
 
@@ -39,7 +39,7 @@ def parse_embed(path: Path, key: str) -> np.ndarray:
 
 def main() -> None:
     ap = argparse.ArgumentParser(description=__doc__)
-    ap.add_argument("--ref", type=Path, default=ROOT / "models" / "gguf" / "clip-ViT-B-32.ref.npz")
+    ap.add_argument("--ref", type=Path, default=ROOT / "models" / "gguf" / "clip-ViT-B-32-f16.ref.npz")
     ap.add_argument("--cpp-text", type=Path, required=True, help="yolo-similarity text dump")
     ap.add_argument("--cpp-image", type=Path, required=True, help="yolo-similarity image dump")
     args = ap.parse_args()

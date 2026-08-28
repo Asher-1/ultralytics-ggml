@@ -17,13 +17,19 @@
 //   clip_free_session(s);
 //
 // Precision: all internal computation runs in F32 for numerical stability;
-// F16/Q8_0 weight matrices are cast to F32 at graph build time.
+// weight matrices are stored as F16 in the GGUF and cast to F32 at graph
+// build time (identical to the PyTorch CLIP forward pass).
 
 #include "backend.hpp"
 
+#include <cstdint>
 #include <string>
 #include <unordered_map>
 #include <vector>
+
+struct ggml_context;
+struct ggml_tensor;
+struct gguf_context;
 
 namespace clip {
 
@@ -40,6 +46,15 @@ constexpr int VISUAL_N_LAYERS = 12;
 constexpr int VISUAL_N_HEADS = 12;
 constexpr int VISUAL_N_PATCHES = (IMAGE_SIZE / PATCH_SIZE) * (IMAGE_SIZE / PATCH_SIZE);  // 49
 constexpr int VISUAL_N_TOKENS = VISUAL_N_PATCHES + 1;  // 50 (patches + cls)
+
+// BPE tokenizer tables rebuilt from the GGUF KV arrays; shared by CLIP and
+// MobileCLIP (both embed the same CLIP SimpleTokenizer tables).
+struct ClipBpe {
+    std::vector<std::string> vocab;                          // tokens by id
+    std::vector<std::pair<std::string, std::string>> merges; // merges by rank
+    std::unordered_map<std::string, int> encoder;            // token -> id
+    std::unordered_map<std::string, std::string> bpe_cache;  // token -> merged
+};
 
 struct ClipSession {
     ggml_context* wctx = nullptr;              // weight tensor structs
@@ -102,10 +117,7 @@ struct ClipSession {
     std::vector<float> image_embed_scratch;
 
     // BPE tokenizer tables (loaded from the GGUF; rebuilt by clip_tokenize_text).
-    std::vector<std::string> vocab;                                   // 49408 tokens by id
-    std::vector<std::pair<std::string, std::string>> merges;          // BPE merges by rank
-    std::unordered_map<std::string, int> encoder;                     // token -> id
-    std::unordered_map<std::string, std::string> bpe_cache;           // token -> merged form
+    ClipBpe bpe;
 
     // Encoder graphs (text and image are separate ggml compute graphs).
     ggml_cgraph* text_graph = nullptr;
@@ -166,5 +178,39 @@ inline float clip_cosine_similarity(const float* a, const float* b, int d) {
     for (int i = 0; i < d; i++) dot += a[i] * b[i];
     return dot;
 }
+
+// ---------------------------------------------------------------------------
+// Shared encoder building blocks (also used by mobileclip_graph.cpp)
+// ---------------------------------------------------------------------------
+
+// LayerNorm over ne0 with fixed eps=1e-5.
+ggml_tensor* clip_layer_norm(ggml_context* ctx, ggml_tensor* x,
+                             ggml_tensor* weight, ggml_tensor* bias);
+
+// Multi-head self-attention; x is [D, S], causal enables the lower-triangular
+// mask. Weights may be F16/Q8_0 (cast to F32 internally).
+ggml_tensor* clip_self_attention(ggml_context* ctx, ggml_tensor* x,
+                                 ggml_tensor* in_proj_w, ggml_tensor* in_proj_b,
+                                 ggml_tensor* out_proj_w, ggml_tensor* out_proj_b,
+                                 int n_heads, int d_head, bool causal);
+
+// Two-layer MLP; exact_gelu selects erf-GELU (MobileCLIP) over QuickGELU
+// (CLIP).
+ggml_tensor* clip_mlp_block(ggml_context* ctx, ggml_tensor* x,
+                            ggml_tensor* fc_w, ggml_tensor* fc_b,
+                            ggml_tensor* proj_w, ggml_tensor* proj_b,
+                            bool exact_gelu);
+
+// L2-normalise the last dimension.
+ggml_tensor* clip_l2_norm(ggml_context* ctx, ggml_tensor* x);
+
+// Load vocab/merges KV arrays written by the converters.
+bool clip_bpe_load(ClipBpe& bpe, const gguf_context* g,
+                   const char* vocab_key, const char* merges_key, int expect_vocab);
+
+// Tokenize `text` into ctx_len token ids exactly like clip.tokenize:
+// lowercase -> BPE -> [sot, ..., eot], zero-padded, truncating at ctx_len.
+// Returns the number of tokens written (<= ctx_len).
+int clip_bpe_tokenize(ClipBpe& bpe, const char* text, int ctx_len, int32_t* tokens);
 
 }  // namespace clip

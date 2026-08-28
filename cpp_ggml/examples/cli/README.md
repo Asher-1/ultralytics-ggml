@@ -6,15 +6,15 @@ runs it end to end on the ggml C++ stack (CPU / CUDA / Vulkan, any GGUF
 precision — the model file selects all of that). They share the inference
 plumbing in `examples_common.{hpp,cpp}` and only implement the scenario logic.
 
-| Program | Task model | Official scenario | Output |
-| --- | --- | --- | --- |
-| `yolo-region-count` | detect | [Region Counting](https://docs.ultralytics.com/solutions/region-counting) | per-ROI object counts + annotated PNG |
-| `yolo-crop` | segment | [Object Cropping](https://docs.ultralytics.com/solutions/object-cropping) | transparent-background instance PNGs |
-| `yolo-workout` | pose | [Workout Monitoring](https://docs.ultralytics.com/solutions/workout-monitoring) | joint angles + pose stage + skeleton PNG |
-| `yolo-obb` | obb | oriented detection (DOTA-style) | rotated boxes + CSV export + PNG |
-| `yolo-city` | semantic | Cityscapes semantic segmentation | per-class area histogram + class map PNG |
-| `yolo-topk` | classify | image classification | top-k classes with probability bars |
-| `yolo-distance` | depth | [Distance Calculation](https://docs.ultralytics.com/solutions/distance-calculation) | metric distances (center / point / 3x3 grid) + depth PNG |
+| Program             | Task model | Official scenario                                                                   | Output                                                   |
+| ------------------- | ---------- | ----------------------------------------------------------------------------------- | -------------------------------------------------------- |
+| `yolo-region-count` | detect     | [Region Counting](https://docs.ultralytics.com/solutions/region-counting)           | per-ROI object counts + annotated PNG                    |
+| `yolo-crop`         | segment    | [Object Cropping](https://docs.ultralytics.com/solutions/object-cropping)           | transparent-background instance PNGs                     |
+| `yolo-workout`      | pose       | [Workout Monitoring](https://docs.ultralytics.com/solutions/workout-monitoring)     | joint angles + pose stage + skeleton PNG                 |
+| `yolo-obb`          | obb        | oriented detection (DOTA-style)                                                     | rotated boxes + CSV export + PNG                         |
+| `yolo-city`         | semantic   | Cityscapes semantic segmentation                                                    | per-class area histogram + class map PNG                 |
+| `yolo-topk`         | classify   | image classification                                                                | top-k classes with probability bars                      |
+| `yolo-distance`     | depth      | [Distance Calculation](https://docs.ultralytics.com/solutions/distance-calculation) | metric distances (center / point / 3x3 grid) + depth PNG |
 
 ## Build
 
@@ -65,34 +65,49 @@ GPU backends are selected by the build directory, not by the program.
 
 ## World and YOLOE with CLIP
 
-The `yolo-cli detect` command runs CLIP text encoding before YOLO inference.
-The sessions may select the same physical CUDA device, but keep independent
-graph allocators and schedulers; an allocator is graph-owned, not a process
-singleton. In the embedded World path CLIP stays on CPU so a Vulkan backend is
-never initialized or destroyed while the YOLO session owns the GPU:
+A World model detects the vocabulary its checkpoint shipped with (80 COCO
+classes), stored in the GGUF as `yolo.vocab_txt`; that path loads no text
+encoder at all, exactly like `YOLO("yolov8s-world.pt")` in Python:
+
+```bash
+./build-cpu/bin/yolo-cli detect \
+    --model models/gguf/yolov8s-world-f16.gguf \
+    --source ../../ultralytics/assets/bus.jpg --out world.png
+```
+
+`--classes` swaps in an open vocabulary, encoded on the fly by CLIP before
+YOLO inference. The sessions may select the same physical CUDA device, but keep
+independent graph allocators and schedulers; an allocator is graph-owned, not a
+process singleton. In the embedded World path CLIP stays on CPU so a Vulkan
+backend is never initialized or destroyed while the YOLO session owns the GPU:
 
 ```bash
 ./build-cpu/bin/yolo-cli detect \
     --model models/gguf/yolov8s-world-f16.gguf \
     --source ../../ultralytics/assets/bus.jpg \
     --classes "bus,person,car" \
-    --clip-model models/gguf/clip-ViT-B-32.gguf \
+    --clip-model models/gguf/clip-ViT-B-32-f16.gguf \
     --out world.png
 ```
 
-YOLOE-26 uses the same `[512, nc]` runtime shape after MobileCLIP text
-encoding, its detector-specific `reprta` transform, and L2 normalization.
-Convert a `yoloe-26*.pt` checkpoint with
-`scripts/convert_yolo_to_gguf.py`, encode the vocabulary, then provide the
-`YTXT0001` blob via `--text-embed`:
+YOLOE-26 uses the same `[512, nc]` runtime shape; the checkpoint's `reprta`
+transform runs inside the op-graph v4 GGUF, so the graph text input is the raw
+L2-normalised MobileCLIP feature. `--classes` alone encodes plaintext through
+the native MobileCLIP GGUF tower:
 
 ```bash
-python scripts/encode_mobileclip_text.py --detector models/pytorch/yoloe-26n-seg.pt \
+./build-cpu/bin/yolo-cli detect --model models/gguf/yoloe-26n-seg-f16.gguf \
+    --source ../../ultralytics/assets/bus.jpg \
+    --classes "bus,person,car" \
+    --text-model models/gguf/mobileclip2_b-f16.gguf --out yoloe.png
+```
+
+Or precompute a checkpoint-agnostic `YTXT0002` blob once (one blob serves every
+YOLOE checkpoint that shares the MobileCLIP text tower):
+
+```bash
+python scripts/encode_mobileclip_text.py \
     --classes "bus,person,car" --output classes.ytxt
 ./build-cpu/bin/yolo-cli detect --model models/gguf/yoloe-26n-seg-f16.gguf \
     --source ../../ultralytics/assets/bus.jpg --text-embed classes.ytxt --out yoloe.png
 ```
-
-YOLOE deliberately requires `--text-embed`; `--classes` alone is only valid
-for YOLO-World's ViT-B/32 CLIP encoder. A YTXT belongs to the exact YOLOE
-checkpoint that generated it.

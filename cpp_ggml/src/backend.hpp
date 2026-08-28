@@ -20,7 +20,10 @@ struct BackendCtx {
     bool has_gpu() const { return gpu != nullptr; }
 };
 
-BackendCtx init_backend_ctx(int n_threads);
+// n_threads <= 0 keeps the hardware default. graph_nodes is the largest
+// ggml_cgraph the caller will build: the scheduler sizes its node hash set
+// once, at creation.
+BackendCtx init_backend_ctx(int n_threads, size_t graph_nodes);
 // Install the per-op profiling callback on the scheduler (GPU builds).
 // Every node is then dispatched and synced individually: the printed table
 // is useful for relative shares, not absolute latency.

@@ -5,7 +5,7 @@ index 35f0c44e..d8247368 100644
 @@ -2187,6 +2187,18 @@ extern "C" {
              int                   d0,  // dilation dimension 0
              int                   d1); // dilation dimension 1
-
+ 
 +    GGML_API struct ggml_tensor * ggml_conv_2d_direct_bias_silu(
 +            struct ggml_context * ctx,
 +            struct ggml_tensor  * a,
@@ -26,9 +26,9 @@ index 491316f7..22afa38d 100644
 --- a/src/ggml-cpu/ggml-cpu.c
 +++ b/src/ggml-cpu/ggml-cpu.c
 @@ -1299,17 +1299,87 @@ void ggml_compute_forward_mul_mat(
-
+ 
      const bool src1_cont = ggml_is_contiguous(src1);
-
+ 
 +    /* rfdetr.cpp patch: merge per-broadcast llamafile_sgemm calls when src0
 +     * is unbroadcasted along a dim and src1/dst pack that dim contiguously.
 +     *
@@ -168,7 +168,7 @@ index 491316f7..22afa38d 100644
 +                    goto UseGgmlGemm2;
 +            return;
 +        }
-
+ 
          for (int64_t i13 = 0; i13 < ne13; i13++)
              for (int64_t i12 = 0; i12 < ne12; i12++)
                  if (!llamafile_sgemm(params,
@@ -188,7 +188,7 @@ index 491316f7..22afa38d 100644
 @@ -3057,6 +3175,187 @@ static int ggml_cpu_try_fuse_ops(
      return 0;
  }
-
+ 
 +// ---------------------------------------------------------------------------
 +// Per-op-type profiling (enabled at runtime via env GGML_PROFILE_OPS=1).
 +// Profile is accumulated on thread 0 only, using wall-clock time around each
@@ -376,17 +376,17 @@ index 491316f7..22afa38d 100644
 @@ -3085,6 +3384,9 @@ static thread_ret_t ggml_graph_compute_thread(void * data) {
      GGML_PRINT_DEBUG("thread #%d compute-start cplan %p last-graph %d\n", state->ith, (const void *)cplan, state->last_graph);
  #endif
-
+ 
 +    const int prof_enabled = (state->ith == 0) && ggml_profile_ops_enabled();
 +    int64_t prof_node_start_us = 0;
 +
      for (int node_n = 0; node_n < cgraph->n_nodes && atomic_load_explicit(&tp->abort, memory_order_relaxed) != node_n; node_n++) {
          struct ggml_tensor * node = cgraph->nodes[node_n];
-
+ 
 @@ -3097,6 +3399,10 @@ static thread_ret_t ggml_graph_compute_thread(void * data) {
              continue;
          }
-
+ 
 +        if (prof_enabled) {
 +            prof_node_start_us = ggml_time_us();
 +        }
@@ -416,7 +416,7 @@ index 491316f7..22afa38d 100644
 +        g_ggml_profile.graph_idx++;
 +        ggml_prof_dump_and_reset();
      }
-
+ 
  #ifdef GGML_USE_OPENMP
 diff --git a/src/ggml-cpu/ops.cpp b/src/ggml-cpu/ops.cpp
 index 42ec809c..7545d272 100644
@@ -425,7 +425,7 @@ index 42ec809c..7545d272 100644
 @@ -6390,25 +6390,28 @@ static void ggml_compute_forward_im2col_f32(
      {
          float * const wdata = (float *) dst->data;
-
+ 
 -        for (int64_t in = 0; in < N; in++) {
 -            for (int64_t ioh = 0; ioh < OH; ioh++) { // 1
 -                for (int64_t iow = 0; iow < OW; iow++) {
@@ -473,7 +473,7 @@ index 42ec809c..7545d272 100644
 @@ -6418,11 +6421,6 @@ static void ggml_compute_forward_im2col_f32(
      }
  }
-
+ 
 -
 -// ggml_compute_forward_im2col_f16
 -// src0: kernel [OC, IC, KH, KW]
@@ -485,7 +485,7 @@ index 42ec809c..7545d272 100644
 @@ -6466,33 +6464,34 @@ static void ggml_compute_forward_im2col_f16(
      {
          ggml_fp16_t * const wdata = (ggml_fp16_t *) dst->data;
-
+ 
 -        for (int64_t in = 0; in < N; in++) {
 -            for (int64_t ioh = 0; ioh < OH; ioh++) { // 1
 -                for (int64_t iow = 0; iow < OW; iow++) {
@@ -550,7 +550,7 @@ index d3953eee..4dc0bb29 100644
 @@ -129,6 +129,22 @@ if (CUDAToolkit_FOUND)
                               ${GGML_SOURCES_CUDA}
                              )
-
+ 
 +    if (GGML_CUDA_CUDNN)
 +        find_path(CUDNN_INCLUDE_DIR cudnn.h
 +            HINTS $ENV{CUDNN_ROOT} /usr/local/cudnn
@@ -568,16 +568,16 @@ index d3953eee..4dc0bb29 100644
 +    endif()
 +
      add_compile_definitions(GGML_CUDA_PEER_MAX_BATCH_SIZE=${GGML_CUDA_PEER_MAX_BATCH_SIZE})
-
+ 
      if (GGML_CUDA_GRAPHS)
 diff --git a/src/ggml-cuda/binbcast.cu b/src/ggml-cuda/binbcast.cu
 index 2e38077b..cf6ad578 100644
 --- a/src/ggml-cuda/binbcast.cu
 +++ b/src/ggml-cuda/binbcast.cu
 @@ -415,7 +415,9 @@ static void ggml_cuda_op_bin_bcast(
-
+ 
      GGML_ASSERT(src1->type == GGML_TYPE_F32 || src1->type == GGML_TYPE_F16);
-
+ 
 -    if (src0->type == GGML_TYPE_F32 && dst->type == GGML_TYPE_F32) {
 +    if (src0->type == GGML_TYPE_F32 && src1->type == GGML_TYPE_F16 && dst->type == GGML_TYPE_F32) {
 +        op()(src0, src1, dst, (const float *)src0_dd, (const half *)src1_dd, (float *)dst_dd, stream);
@@ -588,7 +588,7 @@ index 2e38077b..cf6ad578 100644
 @@ -457,7 +459,11 @@ static void ggml_cuda_op_fused_binbcast_impl(ggml_backend_cuda_context & ctx, gg
      const ggml_tensor * src0 = dst->src[0];
      const ggml_tensor * src1 = dst->src[1];
-
+ 
 -    if (src0->type == GGML_TYPE_F32 && dst->type == GGML_TYPE_F32) {
 +    if (src0->type == GGML_TYPE_F32 && src1->type == GGML_TYPE_F16 && dst->type == GGML_TYPE_F32) {
 +        launch_bin_bcast_pack<op, float, half, float>(src0, src1, dst,
@@ -603,13 +603,13 @@ index d27d8acb..5a479d37 100644
 --- a/src/ggml-cuda/common.cuh
 +++ b/src/ggml-cuda/common.cuh
 @@ -1419,6 +1419,7 @@ struct ggml_backend_cuda_context {
-
+ 
      cudaStream_t streams[GGML_CUDA_MAX_DEVICES][GGML_CUDA_MAX_STREAMS] = { { nullptr } };
      cublasHandle_t cublas_handles[GGML_CUDA_MAX_DEVICES] = {nullptr};
 +    void * cudnn_context = nullptr;
-
+ 
      int curr_stream_no = 0;
-
+ 
 @@ -1499,7 +1500,11 @@ struct ggml_backend_cuda_context {
          if (cublas_handles[device] == nullptr) {
              ggml_cuda_set_device(device);
@@ -636,36 +636,36 @@ index 7583233b..53c6c664 100644
  #include "conv2d-dw.cuh"
 +#include "conv2d.cuh"
 +#include "convert.cuh"
-
+ 
  struct conv_params {
      int in_w, in_h;
 @@ -97,7 +99,7 @@ __global__ void conv2d_dw_kernel(const T * __restrict__ input, const T * __restr
      int batch_idx, channel_idx, out_y_idx, out_x_idx;
      Layout::unpack_indices(global_idx, params, batch_idx, channel_idx, out_y_idx, out_x_idx);
-
+ 
 -    T accumulator = 0;
 +    float accumulator = 0.0f;
      kernel_bounds bounds = calculate_kernel_bounds(out_x_idx, out_y_idx, params);
-
+ 
      for (int kern_y = bounds.y_min; kern_y < bounds.y_max; ++kern_y) {
 @@ -109,21 +111,24 @@ __global__ void conv2d_dw_kernel(const T * __restrict__ input, const T * __restr
              const T input_val  = input[Layout::input_index(batch_idx, channel_idx, in_y_idx, in_x_idx, params)];
              const T kernel_val = kernel[Layout::kernel_index(channel_idx, kern_y, kern_x, params)];
-
+ 
 -            accumulator += input_val * kernel_val;
 +            accumulator += ggml_cuda_cast<float>(input_val) * ggml_cuda_cast<float>(kernel_val);
          }
      }
-
+ 
 -    output[Layout::output_index(batch_idx, channel_idx, out_y_idx, out_x_idx, params)] = accumulator;
 +    output[Layout::output_index(batch_idx, channel_idx, out_y_idx, out_x_idx, params)] =
 +        ggml_cuda_cast<T>(accumulator);
  }
-
+ 
  void ggml_cuda_op_conv2d_dw(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
      const ggml_tensor * kernel = dst->src[0];
      const ggml_tensor * input  = dst->src[1];
-
+ 
 -    GGML_ASSERT(kernel->type == GGML_TYPE_F32 && input->type == GGML_TYPE_F32 && dst->type == GGML_TYPE_F32);
 -    const float * w_d = (const float *) kernel->data;
 -    const float * x_d = (const float *) input->data;
@@ -676,13 +676,13 @@ index 7583233b..53c6c664 100644
 +#ifdef GGML_CUDA_USE_CUDNN
 +    if (ggml_cuda_conv2d_cudnn(ctx, dst, true)) return;
 +#endif
-
+ 
      const int32_t * p          = (const int32_t *) dst->op_params;
      const int       stride_x   = p[0];
 @@ -147,14 +152,22 @@ void ggml_cuda_op_conv2d_dw(ggml_backend_cuda_context & ctx, ggml_tensor * dst)
      const int total  = batches * channels * out_h * out_w;
      const int blocks = (total + CUDA_CONV2D_DW_BLOCK_SIZE - 1) / CUDA_CONV2D_DW_BLOCK_SIZE;
-
+ 
 -    if (ggml_is_contiguous(input)) {
 +    if (f16 && ggml_is_contiguous(input)) {
 +        conv2d_dw_kernel<half, whcn_layout><<<blocks, CUDA_CONV2D_DW_BLOCK_SIZE, 0, st>>>(
@@ -715,7 +715,7 @@ index 6cbd6f87..98d841f1 100644
  #include "conv2d-transpose.cuh"
 +#include "conv2d.cuh"
  #include "convert.cuh"
-
+ 
 -template <typename kernel_t>
 -static __global__ void conv2d_transpose_kernel(const float * __restrict__ input,
 +#ifdef GGML_CUDA_USE_CUDNN
@@ -879,11 +879,11 @@ index 6cbd6f87..98d841f1 100644
 @@ -56,27 +207,144 @@ static __global__ void conv2d_transpose_kernel(const float * __restrict__ input,
                  const int kernel_idx =
                      (kernel_h * kernel_w * c_out) * c_in_idx + (kernel_h * kernel_w) * c_idx + (kernel_w) *kh + kw;
-
+ 
 -                float    input_val = input[input_idx];
 +                input_t  input_val  = input[input_idx];
                  kernel_t kern_val  = kernel[kernel_idx];
-
+ 
 -                accumulator += input_val * ggml_cuda_cast<float>(kern_val);
 +                accumulator += ggml_cuda_cast<float>(input_val) * ggml_cuda_cast<float>(kern_val);
 +            }
@@ -999,7 +999,7 @@ index 6cbd6f87..98d841f1 100644
 +        plan.disabled = !found_algorithm;
      }
 +    if (plan.disabled) return false;
-
+ 
 -    output[(out_w * out_h * c_out) * n_idx + (out_w * out_h) * c_idx + (out_w) *out_y_idx + out_x_idx] = accumulator;
 +    if (cudnnSetStream(plan.handle, ctx.stream()) != CUDNN_STATUS_SUCCESS) return false;
 +    const float alpha = 1.0f, beta = 0.0f;
@@ -1009,7 +1009,7 @@ index 6cbd6f87..98d841f1 100644
 +    plan.disabled = status != CUDNN_STATUS_SUCCESS;
 +    return !plan.disabled;
  }
-
+ 
 +} // namespace
 +#endif
 +
@@ -1017,7 +1017,7 @@ index 6cbd6f87..98d841f1 100644
  void ggml_cuda_conv_2d_transpose_p0(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
      const ggml_tensor * kernel = dst->src[0];
      const ggml_tensor * input  = dst->src[1];
-
+ 
      GGML_ASSERT(kernel->type == GGML_TYPE_F16 || kernel->type == GGML_TYPE_F32);
 -    GGML_ASSERT(input->type == GGML_TYPE_F32 && dst->type == GGML_TYPE_F32);
 -
@@ -1026,12 +1026,12 @@ index 6cbd6f87..98d841f1 100644
 +    GGML_ASSERT(input->type == dst->type);
 +    GGML_ASSERT(input->type == GGML_TYPE_F16 || input->type == GGML_TYPE_F32);
      const void *  kernel_data = kernel->data;
-
+ 
      const int input_w      = input->ne[0];
 @@ -99,17 +367,32 @@ void ggml_cuda_conv_2d_transpose_p0(ggml_backend_cuda_context & ctx, ggml_tensor
      GGML_ASSERT(ggml_is_contiguous(kernel));
      GGML_ASSERT(ggml_is_contiguous(dst));
-
+ 
 +    // The 2x2/stride-2 specialization owns every YOLO upsample conv_transpose;
 +    // anything else (odd shapes, mixed types) falls through to the paths below.
 +    if (conv2d_transpose_k2s2(ctx, dst)) return;
@@ -1042,7 +1042,7 @@ index 6cbd6f87..98d841f1 100644
 +
      const int total  = output_w * output_h * channels_out * batches;
      const int blocks = (total + CUDA_CONV2D_TRANSPOSE_BLOCK_SIZE - 1) / CUDA_CONV2D_TRANSPOSE_BLOCK_SIZE;
-
+ 
 -    if (kernel->type == GGML_TYPE_F16) {
 -        conv2d_transpose_kernel<half><<<blocks, CUDA_CONV2D_TRANSPOSE_BLOCK_SIZE, 0, st>>>(
 -            input_data, (const half *) kernel_data, output_data, input_w, input_h, output_w, output_h, kernel_w,
@@ -1070,13 +1070,13 @@ index 6cbd6f87..98d841f1 100644
      }
  }
 diff --git a/src/ggml-cuda/conv2d.cu b/src/ggml-cuda/conv2d.cu
-index 14774d4a..9bc3549f 100644
+index 14774d4a..d6669211 100644
 --- a/src/ggml-cuda/conv2d.cu
 +++ b/src/ggml-cuda/conv2d.cu
 @@ -1,6 +1,25 @@
  #include "conv2d.cuh"
  #include "convert.cuh"
-
+ 
 +#include <cinttypes>
 +#include <cstdlib>
 +#include <cstring>
@@ -1102,7 +1102,7 @@ index 14774d4a..9bc3549f 100644
 @@ -69,10 +88,10 @@ struct whcn_layout {
      }
  };
-
+ 
 -template <typename T, typename Layout>
 -static __global__ void conv2d_kernel(const float * __restrict__ input,
 -                                     const T * __restrict__ kernel,
@@ -1113,11 +1113,11 @@ index 14774d4a..9bc3549f 100644
 +                                     Y * __restrict__ output,
                                       const conv_params P) {
      const int64_t global_idx = blockIdx.x * blockDim.x + threadIdx.x;
-
-@@ -94,47 +113,1845 @@ static __global__ void conv2d_kernel(const float * __restrict__ input,
+ 
+@@ -94,47 +113,1849 @@ static __global__ void conv2d_kernel(const float * __restrict__ input,
              for (int64_t kx = bounds.x_min; kx < bounds.x_max; ++kx) {
                  const int64_t in_x = calculate_input_coord(out_x, kx, P.ST_X, P.DL_X, P.PD_X);
-
+ 
 -                const float input_val = input[Layout::input_index(n, c_in, in_y, in_x, P)];
 -                const T kernel_val = kernel[Layout::kernel_index(c_out, c_in, ky, kx, P)];
 -                acc += (input_val * ggml_cuda_cast<float>(kernel_val));
@@ -1127,12 +1127,12 @@ index 14774d4a..9bc3549f 100644
              }
          }
      }
-
+ 
      // [N, OC, OH, OW]
 -    output[Layout::output_index(n, c_out, out_y, out_x, P)] = acc;
 +    output[Layout::output_index(n, c_out, out_y, out_x, P)] = ggml_cuda_cast<Y>(acc);
  }
-
+ 
 -template <typename T>
 -static void conv2d_cuda(const float * X_D, const T * K_D, float * Y_D, const conv_params P, cudaStream_t st) {
 +template <typename X, typename K, typename Y>
@@ -1497,10 +1497,8 @@ index 14774d4a..9bc3549f 100644
 +        p[0], p[1], p[2], p[3], p[4], p[5], p[6], p[7],
 +        input->type, kernel->type, dst->type, depthwise, bias != nullptr, bias ? bias->type : -1,
 +    };
- }
-
--static void conv2d_cuda_f16(const float * X_D, const half * K_D, float * Y_D, const conv_params P, cudaStream_t st) {
--    conv2d_cuda<half>(X_D, K_D, Y_D, P, st);
++}
++
 +
 +struct cudnn_conv_context {
 +    cudnnHandle_t handle = nullptr;
@@ -1567,10 +1565,8 @@ index 14774d4a..9bc3549f 100644
 +            (const float *) dst->src[2]->data, (half *) plan.frontend_bias, dst->ne[2]);
 +    }
 +    return true;
- }
-
--static void conv2d_cuda_f32(const float * X_D, const float * K_D, float * Y_D, const conv_params P, cudaStream_t st) {
--    conv2d_cuda<float>(X_D, K_D, Y_D, P, st);
++}
++
 +static bool create_frontend_plan(cudnn_conv_context & cctx, const ggml_tensor * dst, cudnn_conv_plan & plan) {
 +    const ggml_tensor * kernel = dst->src[0];
 +    const ggml_tensor * input = dst->src[1];
@@ -2552,8 +2548,10 @@ index 14774d4a..9bc3549f 100644
 +    // Placeholder body for pre-Ampere compilation passes; the host side never
 +    // launches this kernel on devices below cc 8.0 (see conv2d_igemm).
 +#endif
-+}
-+
+ }
+ 
+-static void conv2d_cuda_f16(const float * X_D, const half * K_D, float * Y_D, const conv_params P, cudaStream_t st) {
+-    conv2d_cuda<half>(X_D, K_D, Y_D, P, st);
 +template <bool C8>
 +static void igemm_conv_dispatch_f32(const dim3 & grid, bool with_bias, bool with_silu,
 +                                    const float * in_p, const float * w_p, const float * b_p, float * out_p,
@@ -2569,8 +2567,10 @@ index 14774d4a..9bc3549f 100644
 +        igemm_conv_f32_kernel<false, false, C8><<<grid, 128, IGEMM_SMEM_F32, stream>>>
 +            (in_p, w_p, b_p, out_p, H, W, C, P, Q, K, R, S, p[1], p[0], p[3], p[2], p[5], p[4]);
 +    }
-+}
-+
+ }
+ 
+-static void conv2d_cuda_f32(const float * X_D, const float * K_D, float * Y_D, const conv_params P, cudaStream_t st) {
+-    conv2d_cuda<float>(X_D, K_D, Y_D, P, st);
 +struct igemm_conv_plan {
 +    void * nhwc_input  = nullptr;
 +    void * nhwc_output = nullptr;
@@ -2673,13 +2673,11 @@ index 14774d4a..9bc3549f 100644
 +    if (!use_f16 && !use_f32 && !use_q8) {
 +        return false;
 +    }
-+    // The F32 IGEMM kernel uses TF32 WMMA operands.  Its tensor-core
-+    // conversion truncates F32 mantissas before the F32 accumulator, so it
-+    // cannot satisfy the F32 inference contract.  The scalar F32 conv below
-+    // performs the prescribed left-to-right F32 accumulation instead.
-+    if (use_f32) {
-+        return false;
-+    }
++    // The F32 IGEMM kernel uses TF32 WMMA operands (10-bit mantissa products,
++    // F32 accumulate). This mirrors PyTorch's Ampere default, where cuDNN runs
++    // convolutions with allow_tf32=True, so the parity reference itself is a
++    // TF32 computation - an exact-F32 engine would be stricter than, not equal
++    // to, the reference, at ~3x the latency.
 +    // F16 epilogues vectorize 8-wide and need OC % 8 == 0; the scalar tail
 +    // path (below) writes the remainder, so quantized convs with any output
 +    // channel count (e.g. OC=4 end2end heads) are accepted.
@@ -2919,6 +2917,12 @@ index 14774d4a..9bc3549f 100644
 +
 +} // namespace
 +
++void ggml_cuda_free_conv2d() {
++    g_nhwc_copies.clear();
++    g_ct_k2s2_gemm_plans.clear();
++    g_igemm_plans.clear();
++}
++
 +static bool ggml_cuda_conv2d_igemm(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
 +    return conv2d_igemm(ctx, dst);
 +}
@@ -2937,25 +2941,25 @@ index 14774d4a..9bc3549f 100644
 +    return false;
 +#endif
  }
-
+ 
  void ggml_cuda_op_conv2d(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
      const ggml_tensor * kernel = dst->src[0];
      const ggml_tensor * input  = dst->src[1];
 -    float *             K_D    = (float *) kernel->data;
 -    const float *       X_D    = (const float *) input->data;
 -    float *             Y_D    = (float *) dst->data;
-
+ 
      GGML_ASSERT(ggml_is_contiguous(input));
      GGML_ASSERT(ggml_is_contiguous(kernel));
 -    GGML_ASSERT(kernel->type == GGML_TYPE_F16 || kernel->type == GGML_TYPE_F32);
 +    GGML_ASSERT(kernel->type == GGML_TYPE_F16 || kernel->type == GGML_TYPE_F32 ||
 +                kernel->type == GGML_TYPE_Q8_0);
-
+ 
      // same number of input channels
      GGML_ASSERT(input->ne[2] == kernel->ne[2]);
-
+ 
      cudaStream_t st = ctx.stream();
-
+ 
 +#ifdef GGML_CUDA_USE_CUDNN
 +    if (ggml_cuda_conv2d_cudnn(ctx, dst, false)) return;
 +#endif
@@ -2975,10 +2979,10 @@ index 14774d4a..9bc3549f 100644
      const int32_t * p    = (const int32_t *) dst->op_params;
      const int       ST_X = p[0];  // stride_x
      const int       ST_Y = p[1];  // stride_y
-@@ -159,9 +1976,13 @@ void ggml_cuda_op_conv2d(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
+@@ -159,9 +1980,13 @@ void ggml_cuda_op_conv2d(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
      const int64_t total  = B * OC * OH * OW;
      conv_params   params = { IW, IH, OW, OH, KW, KH, ST_X, ST_Y, PD_X, PD_Y, DL_X, DL_Y, IC, OC, B, total };
-
+ 
 -    if (kernel->type == GGML_TYPE_F16) {
 -        conv2d_cuda_f16(X_D, (half *) K_D, Y_D, params, st);
 +    if (input->type == GGML_TYPE_F16 && kernel->type == GGML_TYPE_F16 && dst->type == GGML_TYPE_F16) {
@@ -2993,11 +2997,11 @@ index 14774d4a..9bc3549f 100644
 +    bias_silu_cuda(dst, st);
  }
 diff --git a/src/ggml-cuda/conv2d.cuh b/src/ggml-cuda/conv2d.cuh
-index ce4802c7..8ac36e25 100644
+index ce4802c7..1b509da3 100644
 --- a/src/ggml-cuda/conv2d.cuh
 +++ b/src/ggml-cuda/conv2d.cuh
-@@ -3,3 +3,13 @@
-
+@@ -3,3 +3,14 @@
+ 
  #define CUDA_CONV2D_BLOCK_SIZE 256
  void ggml_cuda_op_conv2d(ggml_backend_cuda_context & ctx, ggml_tensor * dst);
 +
@@ -3005,19 +3009,22 @@ index ce4802c7..8ac36e25 100644
 +// a vectorized interleave (see conv2d.cu). Returns false when the shape or
 +// type is outside its domain, in which case the caller keeps its own kernel.
 +bool ggml_cuda_conv2d_transpose_k2s2_gemm(ggml_backend_cuda_context & ctx, ggml_tensor * dst);
++void ggml_cuda_free_conv2d();
 +
 +#ifdef GGML_CUDA_USE_CUDNN
 +bool ggml_cuda_conv2d_cudnn(ggml_backend_cuda_context & ctx, ggml_tensor * dst, bool depthwise);
 +void ggml_cuda_free_cudnn(ggml_backend_cuda_context & ctx);
 +#endif
 diff --git a/src/ggml-cuda/ggml-cuda.cu b/src/ggml-cuda/ggml-cuda.cu
-index 561ab7ac..76a70bca 100644
+index 561ab7ac..8e5d45af 100644
 --- a/src/ggml-cuda/ggml-cuda.cu
 +++ b/src/ggml-cuda/ggml-cuda.cu
-@@ -703,6 +703,10 @@ ggml_backend_cuda_context::~ggml_backend_cuda_context() {
+@@ -703,6 +703,12 @@ ggml_backend_cuda_context::~ggml_backend_cuda_context() {
      std::unique_lock<std::mutex> lock(ggml_cuda_lock);
      ggml_cuda_lock_cv.wait(lock, []{ return ggml_cuda_lock_counter.load(std::memory_order_relaxed) == 0; });
-
+ 
++    ggml_cuda_free_conv2d();
++
 +#ifdef GGML_CUDA_USE_CUDNN
 +    ggml_cuda_free_cudnn(*this);
 +#endif
@@ -3025,7 +3032,7 @@ index 561ab7ac..76a70bca 100644
      if (copy_event != nullptr) {
          CUDA_CHECK(cudaEventDestroy(copy_event));
      }
-@@ -5107,7 +5111,7 @@ static bool ggml_backend_cuda_device_supports_op(ggml_backend_dev_t dev, const g
+@@ -5107,7 +5113,7 @@ static bool ggml_backend_cuda_device_supports_op(ggml_backend_dev_t dev, const g
          case GGML_OP_CONV_2D:
              return (ggml_is_contiguous(op->src[0]) && ggml_is_contiguous(op->src[1]));
          case GGML_OP_CONV_2D_DW:
@@ -3039,7 +3046,7 @@ index 646a5899..27c45daf 100644
 --- a/src/ggml-cuda/mmf.cu
 +++ b/src/ggml-cuda/mmf.cu
 @@ -132,6 +132,13 @@ void ggml_cuda_mul_mat_f(ggml_backend_cuda_context & ctx, const ggml_tensor * sr
-
+ 
  bool ggml_cuda_should_use_mmf(enum ggml_type type, int cc, int warp_size, const int64_t * src0_ne,
          const size_t * src0_nb, const int src1_ncols, bool mul_mat_id) {
 +    // The Ampere F32 MMF implementation uses tf32.tf32.f32 MMA operands.
@@ -3059,7 +3066,7 @@ index c6d51e4d..1a75147e 100644
 @@ -1,22 +1,27 @@
  #include "pool2d.cuh"
 +#include "convert.cuh"
-
+ 
  template <typename Ti, typename To>
  static  __global__ void pool2d_nchw_kernel(
          const int ih, const int iw, const int oh, const int ow,
@@ -3073,7 +3080,7 @@ index c6d51e4d..1a75147e 100644
      if (idx >= parallel_elements) {
          return;
      }
-
+ 
 -    const int I_HW = ih * iw;
      const int O_HW = oh * ow;
      const int nc = idx / O_HW;
@@ -3094,7 +3101,7 @@ index c6d51e4d..1a75147e 100644
 -    To res = 0;
 +    const float scale = 1.0f / (kh * kw);
 +    float res = 0.0f;
-
+ 
      switch (op) {
          case GGML_OP_POOL_AVG: res = 0; break;
 @@ -36,40 +41,43 @@ static  __global__ void pool2d_nchw_kernel(
@@ -3119,7 +3126,7 @@ index c6d51e4d..1a75147e 100644
 -    o_ptr[cur_oh * ow + cur_ow] = res;
 +    o_ptr[cur_oh * ow + cur_ow] = ggml_cuda_cast<To>(res);
  }
-
+ 
 -static void pool2d_nchw_kernel_f32_f32_cuda(
 +template <typename T>
 +static void pool2d_nchw_cuda(
@@ -3131,7 +3138,7 @@ index c6d51e4d..1a75147e 100644
 +        const int64_t src_stride_c, const int64_t src_stride_n,
 +        const T * src, T * dst, const enum ggml_op_pool op,
          cudaStream_t stream) {
-
+ 
      const int num_blocks = (parallel_elements + CUDA_POOL2D_BLOCK_SIZE - 1) / CUDA_POOL2D_BLOCK_SIZE;
      dim3 block_nums(num_blocks);
 -    pool2d_nchw_kernel<<<block_nums, CUDA_POOL2D_BLOCK_SIZE, 0, stream>>>(ih, iw, oh, ow, kh, kw, sh, sw, ph, pw, parallel_elements, src, dst, op);
@@ -3139,24 +3146,24 @@ index c6d51e4d..1a75147e 100644
 +        ih, iw, oh, ow, kh, kw, sh, sw, ph, pw, parallel_elements, channels,
 +        src_stride_w, src_stride_h, src_stride_c, src_stride_n, src, dst, op);
  }
-
+ 
  void ggml_cuda_op_pool2d(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
      const ggml_tensor * src0 = dst->src[0];
 -    const float * src0_d = (const float *)src0->data;
 -    float * dst_d = (float *)dst->data;
      cudaStream_t stream = ctx.stream();
-
+ 
 -    GGML_ASSERT(src0->type == GGML_TYPE_F32);
 -    GGML_ASSERT( dst->type == GGML_TYPE_F32);
 +    GGML_ASSERT(src0->type == dst->type);
 +    GGML_ASSERT(src0->type == GGML_TYPE_F32 || src0->type == GGML_TYPE_F16);
-
+ 
      const int32_t * opts = (const int32_t *)dst->op_params;
      enum ggml_op_pool op = static_cast<ggml_op_pool>(opts[0]);
 @@ -88,7 +96,22 @@ void ggml_cuda_op_pool2d(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
      const int64_t OH = dst->ne[1];
      const int64_t OW = dst->ne[0];
-
+ 
 +    const size_t ts = ggml_type_size(src0->type);
 +    GGML_ASSERT(src0->nb[0] == ts);
 +    const int64_t src_stride_w = src0->nb[0] / ts;
@@ -3165,7 +3172,7 @@ index c6d51e4d..1a75147e 100644
 +    const int64_t src_stride_n = src0->nb[3] / ts;
 +
      const int parallel_elements = N * OC * OH * OW;
-
+ 
 -    pool2d_nchw_kernel_f32_f32_cuda(IH, IW, OH, OW, k1, k0, s1, s0, p1, p0, parallel_elements, src0_d, dst_d, op, stream);
 +    if (src0->type == GGML_TYPE_F16) {
 +        pool2d_nchw_cuda(IH, IW, OH, OW, k1, k0, s1, s0, p1, p0, parallel_elements, OC,
@@ -3184,23 +3191,23 @@ index 7b2e59a4..83a58482 100644
 @@ -1,37 +1,42 @@
  #include "scale.cuh"
 +#include "convert.cuh"
-
+ 
  #define MAX_GRIDDIM_X 0x7FFFFFFF
-
+ 
 -static __global__ void scale_f32(const float * x, float * dst, const float scale, const float bias, const int64_t nelements) {
 +template <typename T>
 +static __global__ void scale_kernel(const T * x, T * dst, const float scale, const float bias, const int64_t nelements) {
      ggml_cuda_pdl_lc();
      int64_t tid = (int64_t)blockIdx.x * (int64_t)blockDim.x + (int64_t)threadIdx.x;
      int64_t stride = (int64_t)blockDim.x * (int64_t)gridDim.x;
-
+ 
      ggml_cuda_pdl_sync();
      for (int64_t i = tid; i < nelements; i += stride) {
 -        dst[i] = scale * x[i] + bias;
 +        dst[i] = ggml_cuda_cast<T>(scale * ggml_cuda_cast<float>(x[i]) + bias);
      }
  }
-
+ 
 -static void scale_f32_cuda(const float * x, float * dst, const float scale, const float bias, const int64_t nelements, cudaStream_t stream) {
 +template <typename T>
 +static void scale_cuda(const T * x, T * dst, const float scale, const float bias, const int64_t nelements, cudaStream_t stream) {
@@ -3209,23 +3216,23 @@ index 7b2e59a4..83a58482 100644
 -    ggml_cuda_kernel_launch(scale_f32, launch_params, x, dst, scale, bias, nelements);
 +    ggml_cuda_kernel_launch(scale_kernel<T>, launch_params, x, dst, scale, bias, nelements);
  }
-
+ 
  void ggml_cuda_op_scale(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
      const ggml_tensor * src0 = dst->src[0];
 -    const float * src0_d = (const float *)src0->data;
 -    float * dst_d = (float *)dst->data;
      cudaStream_t stream = ctx.stream();
-
+ 
 -    GGML_ASSERT(src0->type == GGML_TYPE_F32);
 -    GGML_ASSERT( dst->type == GGML_TYPE_F32);
 +    GGML_ASSERT(src0->type == dst->type);
 +    GGML_ASSERT(src0->type == GGML_TYPE_F32 || src0->type == GGML_TYPE_F16);
-
+ 
      float scale;
      float bias;
      memcpy(&scale, (float *) dst->op_params + 0, sizeof(float));
      memcpy(&bias,  (float *) dst->op_params + 1, sizeof(float));
-
+ 
 -    scale_f32_cuda(src0_d, dst_d, scale, bias, ggml_nelements(src0), stream);
 +    if (src0->type == GGML_TYPE_F16) {
 +        scale_cuda((const half *) src0->data, (half *) dst->data, scale, bias, ggml_nelements(src0), stream);
@@ -3239,7 +3246,7 @@ index 6bdf3cd9..3b03e928 100644
 +++ b/src/ggml-cuda/upscale.cu
 @@ -1,6 +1,7 @@
  #include "upscale.cuh"
-
+ 
 -static __global__ void upscale_f32(const float * x, float * dst,
 +template <typename T>
 +static __global__ void upscale_nearest(const T * x, T * dst,
@@ -3249,16 +3256,16 @@ index 6bdf3cd9..3b03e928 100644
 @@ -19,7 +20,7 @@ static __global__ void upscale_f32(const float * x, float * dst,
      int i02 = i12 / sf2;
      int i03 = i13 / sf3;
-
+ 
 -    dst[index] = *( (const float *)((const char *)x + i03 * nb03 + i02 * nb02 + i01 * nb01 + i00 * nb00) );
 +    dst[index] = *( (const T *)((const char *)x + i03 * nb03 + i02 * nb02 + i01 * nb01 + i00 * nb00) );
  }
-
+ 
  static __global__ void upscale_f32_bilinear(const float * x, float * dst,
 @@ -215,7 +216,8 @@ static __global__ void upscale_f32_bicubic(const float * x, float * dst,
      dst[index] = result;
  }
-
+ 
 -static void upscale_f32_cuda(const float * x, float * dst,
 +template <typename T>
 +static void upscale_nearest_cuda(const T * x, T * dst,
@@ -3268,30 +3275,30 @@ index 6bdf3cd9..3b03e928 100644
 @@ -223,7 +225,7 @@ static void upscale_f32_cuda(const float * x, float * dst,
      const int64_t dst_size   = ne10 * ne11 * ne12 * ne13;
      const int64_t num_blocks = (dst_size + CUDA_UPSCALE_BLOCK_SIZE - 1) / CUDA_UPSCALE_BLOCK_SIZE;
-
+ 
 -    upscale_f32<<<num_blocks, CUDA_UPSCALE_BLOCK_SIZE,0,stream>>>(x, dst, nb00, nb01, nb02, nb03, ne10, ne11, ne12, ne13, sf0, sf1, sf2, sf3);
 +    upscale_nearest<<<num_blocks, CUDA_UPSCALE_BLOCK_SIZE,0,stream>>>(x, dst, nb00, nb01, nb02, nb03, ne10, ne11, ne12, ne13, sf0, sf1, sf2, sf3);
  }
-
+ 
  static void upscale_f32_bilinear_cuda(const float * x, float * dst,
 @@ -256,12 +258,10 @@ static void upscale_f32_bicubic_cuda(const float * x, float * dst,
-
+ 
  void ggml_cuda_op_upscale(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
      const ggml_tensor * src0 = dst->src[0];
 -    const float * src0_d = (const float *)src0->data;
 -    float * dst_d = (float *)dst->data;
      cudaStream_t stream = ctx.stream();
-
+ 
 -    GGML_ASSERT(src0->type == GGML_TYPE_F32);
 -    GGML_ASSERT( dst->type == GGML_TYPE_F32);
 +    GGML_ASSERT(src0->type == dst->type);
 +    GGML_ASSERT(src0->type == GGML_TYPE_F32 || src0->type == GGML_TYPE_F16);
-
+ 
      const int mode_flags = dst->op_params[0];
      const ggml_scale_mode mode = (ggml_scale_mode)(mode_flags & 0xFF);
 @@ -279,13 +279,27 @@ void ggml_cuda_op_upscale(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
      }
-
+ 
      if (mode == GGML_SCALE_MODE_NEAREST) {
 -        upscale_f32_cuda(src0_d, dst_d, src0->nb[0], src0->nb[1], src0->nb[2], src0->nb[3], dst->ne[0], dst->ne[1], dst->ne[2], dst->ne[3], sf0, sf1, sf2, sf3, stream);
 +        if (src0->type == GGML_TYPE_F16) {
@@ -3331,7 +3338,7 @@ index 510fb689..0a255592 100644
  #endif
 +#include <chrono>
 +#include <cstdlib>
-
+ 
  // See https://github.com/KhronosGroup/Vulkan-Hpp?tab=readme-ov-file#extensions--per-device-function-pointers-
  #define VULKAN_HPP_DISPATCH_LOADER_DYNAMIC 1
 @@ -795,6 +796,7 @@ struct vk_device_struct {
@@ -3339,11 +3346,11 @@ index 510fb689..0a255592 100644
      uint32_t partials_binding_alignment;
      uint32_t max_nodes_per_submit;
 +    uint32_t target_submits;
-
+ 
      bool shader_64b_indexing;
-
+ 
 @@ -912,7 +914,8 @@ struct vk_device_struct {
-
+ 
      vk_pipeline pipeline_concat_i8, pipeline_concat_i16, pipeline_concat_i32, pipeline_concat_i64;
      vk_pipeline pipeline_upscale_nearest_f32, pipeline_upscale_bilinear_f32, pipeline_upscale_bicubic_f32, pipeline_upscale_bilinear_antialias_f32;
 -    vk_pipeline pipeline_scale_f32;
@@ -3375,13 +3382,13 @@ index 510fb689..0a255592 100644
 -    vk_pipeline pipeline_conv2d_dw_cwhn_f32, pipeline_conv2d_dw_cwhn_f16_f32;
 +    vk_pipeline pipeline_conv2d_dw_whcn_f32, pipeline_conv2d_dw_whcn_f16_f32, pipeline_conv2d_dw_whcn_f16;
 +    vk_pipeline pipeline_conv2d_dw_cwhn_f32, pipeline_conv2d_dw_cwhn_f16_f32, pipeline_conv2d_dw_cwhn_f16;
-
+ 
      std::map<vk_fa_pipeline_state, vk_pipeline> pipeline_flash_attn_f32_f16;
-
+ 
 @@ -1796,6 +1801,8 @@ struct vk_op_conv2d_push_constants {
      uint32_t nb2;
      uint32_t nb3;
-
+ 
 +    uint32_t fuse_bias_silu;
 +
      // init_fastdiv_values constants for dividing by OW, OW*OH
@@ -3390,7 +3397,7 @@ index 510fb689..0a255592 100644
 @@ -2288,22 +2295,26 @@ static uint32_t get_misalign_bytes(const ggml_backend_vk_context * ctx, const gg
      return ((vk_tensor_offset(t) + t->view_offs) & (ctx->device->properties.limits.minStorageBufferOffsetAlignment - 1));;
  }
-
+ 
 -static uint32_t ggml_vk_concat_unit_size(ggml_type type) {
 -    const uint32_t type_size = ggml_type_size(type);
 -
@@ -3400,7 +3407,7 @@ index 510fb689..0a255592 100644
 +static uint32_t ggml_vk_concat_unit_size(const ggml_tensor * src0, const ggml_tensor * src1, const ggml_tensor * dst) {
 +    const uint32_t type_size  = ggml_type_size(dst->type);
 +    const uint32_t block_size = ggml_blck_size(dst->type);
-
+ 
 -    // Use the widest existing concat shader that evenly divides a quant block.
 -    if (type_size % 8 == 0) {
 -        return 8;
@@ -3432,7 +3439,7 @@ index 510fb689..0a255592 100644
 @@ -2313,13 +2324,9 @@ static bool ggml_vk_concat_supported(const ggml_tensor * src0, const ggml_tensor
          return false;
      }
-
+ 
 -    if (!ggml_is_quantized(src0->type)) {
 -        const size_t type_size = ggml_type_size(src0->type);
 -        return type_size == 1 || type_size == 2 || type_size == 4 || type_size == 8;
@@ -3444,7 +3451,7 @@ index 510fb689..0a255592 100644
 +    return (type_size == 1 || type_size == 2 || type_size == 4 || type_size == 8 || ggml_is_quantized(src0->type)) &&
 +        ggml_is_contiguous_rows(src0) && ggml_is_contiguous_rows(src1) && ggml_is_contiguous_rows(dst);
  }
-
+ 
  template <typename T> void init_pushconst_tensor_offsets(ggml_backend_vk_context * ctx, T &p, const ggml_tensor * src0, const ggml_tensor * src1, const ggml_tensor * src2, const ggml_tensor * src3, ggml_tensor * dst) {
 @@ -5450,8 +5457,13 @@ static void ggml_vk_load_shaders(vk_device& device, vk_pipeline requested) {
      ggml_vk_create_pipeline(device, device->pipeline_upscale_bilinear_f32, "upscale_f32", upscale_f32_len, upscale_f32_data, "main", 2, sizeof(vk_op_upscale_push_constants), {512, 1, 1}, {GGML_SCALE_MODE_BILINEAR}, 1);
@@ -3454,20 +3461,20 @@ index 510fb689..0a255592 100644
 +    ggml_vk_create_pipeline(device, device->pipeline_upscale_bilinear_f16, "upscale_f16", upscale_f16_len, upscale_f16_data, "main", 2, sizeof(vk_op_upscale_push_constants), {512, 1, 1}, {GGML_SCALE_MODE_BILINEAR}, 1);
 +    ggml_vk_create_pipeline(device, device->pipeline_upscale_bicubic_f16, "upscale_f16", upscale_f16_len, upscale_f16_data, "main", 2, sizeof(vk_op_upscale_push_constants), {512, 1, 1}, {GGML_SCALE_MODE_BICUBIC}, 1);
 +    ggml_vk_create_pipeline(device, device->pipeline_upscale_bilinear_antialias_f16, "upscale_f16", upscale_f16_len, upscale_f16_data, "main", 2, sizeof(vk_op_upscale_push_constants), {512, 1, 1}, {GGML_SCALE_MODE_BILINEAR | GGML_SCALE_FLAG_ANTIALIAS}, 1);
-
+ 
      ggml_vk_create_pipeline(device, device->pipeline_scale_f32, "scale_f32", scale_f32_len, scale_f32_data, "main", 2, sizeof(vk_op_unary_push_constants), {512, 1, 1}, {}, 1);
 +    ggml_vk_create_pipeline(device, device->pipeline_scale_f16, "scale_f16", scale_f16_len, scale_f16_data, "main", 2, sizeof(vk_op_unary_push_constants), {512, 1, 1}, {}, 1);
-
+ 
      ggml_vk_create_pipeline(device, device->pipeline_log[0], "log_f32", log_f32_len, log_f32_data, "main", 2, sizeof(vk_op_unary_push_constants), {512, 1, 1}, {}, 1);
      ggml_vk_create_pipeline(device, device->pipeline_log[1], "log_f16", log_f16_len, log_f16_data, "main", 2, sizeof(vk_op_unary_push_constants), {512, 1, 1}, {}, 1);
 @@ -5660,6 +5672,7 @@ static void ggml_vk_load_shaders(vk_device& device, vk_pipeline requested) {
-
+ 
      ggml_vk_create_pipeline(device, device->pipeline_pool1d_f32, "pool1d_f32", pool1d_f32_len, pool1d_f32_data, "main", 2, sizeof(vk_op_pool1d_push_constants), {512, 1, 1}, {}, 1);
      ggml_vk_create_pipeline(device, device->pipeline_pool2d_f32, "pool2d_f32", pool2d_f32_len, pool2d_f32_data, "main", 2, sizeof(vk_op_pool2d_push_constants), {512, 1, 1}, {}, 1);
 +    ggml_vk_create_pipeline(device, device->pipeline_pool2d_f16, "pool2d_f16", pool2d_f16_len, pool2d_f16_data, "main", 2, sizeof(vk_op_pool2d_push_constants), {512, 1, 1}, {}, 1);
-
+ 
      ggml_vk_create_pipeline(device, device->pipeline_rwkv_wkv6_f32, "rwkv_wkv6_f32", rwkv_wkv6_f32_len, rwkv_wkv6_f32_data, "main", 7, sizeof(vk_op_rwkv_wkv6_push_constants), {1, 1, 1}, {device->subgroup_size}, 1);
-
+ 
 @@ -5878,14 +5891,16 @@ static void ggml_vk_load_shaders(vk_device& device, vk_pipeline requested) {
              spec_constants_cpy.push_back(conv2d_WN); \
              ggml_vk_create_pipeline( \
@@ -3493,7 +3500,7 @@ index 510fb689..0a255592 100644
      ggml_vk_create_pipeline(device, device->pipeline_conv2d_dw_cwhn_f16_f32, "conv2d_dw_cwhn_f16_f32", conv2d_dw_cwhn_f16_f32_len, conv2d_dw_cwhn_f16_f32_data, "main", 3, sizeof(vk_op_conv2d_dw_push_constants), {512, 1, 1}, {}, 1);
 +    ggml_vk_create_pipeline(device, device->pipeline_conv2d_dw_whcn_f16, "conv2d_dw_whcn_f16", conv2d_dw_whcn_f16_len, conv2d_dw_whcn_f16_data, "main", 3, sizeof(vk_op_conv2d_dw_push_constants), {512, 1, 1}, {}, 1);
 +    ggml_vk_create_pipeline(device, device->pipeline_conv2d_dw_cwhn_f16, "conv2d_dw_cwhn_f16", conv2d_dw_cwhn_f16_len, conv2d_dw_cwhn_f16_data, "main", 3, sizeof(vk_op_conv2d_dw_push_constants), {512, 1, 1}, {}, 1);
-
+ 
      for (uint32_t use_push = 0; use_push < 2; ++use_push) {
          for (uint32_t i = 0; i < num_topk_moe_pipelines; ++i) {
 @@ -6265,6 +6282,13 @@ static vk_device ggml_vk_get_device(size_t idx) {
@@ -3507,18 +3514,18 @@ index 510fb689..0a255592 100644
 +        if (GGML_VK_TARGET_SUBMITS != nullptr) {
 +            device->target_submits = std::max(std::stoul(GGML_VK_TARGET_SUBMITS), 1ul);
 +        }
-
+ 
          const bool force_disable_f16 = getenv("GGML_VK_DISABLE_F16") != nullptr;
-
+ 
 @@ -7979,16 +8003,20 @@ static void ggml_vk_dispatch_pipeline(ggml_backend_vk_context* ctx, vk_context&
-
+ 
      vk::DescriptorSet& descriptor_set = ctx->descriptor_sets[ctx->descriptor_set_idx++];
      vk::WriteDescriptorSet write_descriptor_set{ descriptor_set, 0, 0, pipeline->parameter_count, vk::DescriptorType::eStorageBuffer, nullptr, descriptor_buffer_infos.begin() };
 -    ctx->device->device.updateDescriptorSets({ write_descriptor_set }, {});
 +    {
 +        ctx->device->device.updateDescriptorSets({ write_descriptor_set }, {});
 +    }
-
+ 
 -    subctx->s->buffer->buf.pushConstants(pipeline->layout, vk::ShaderStageFlagBits::eCompute, 0, push_constant_size(push_constants), push_constant_data(push_constants));
 -    subctx->s->buffer->buf.bindPipeline(vk::PipelineBindPoint::eCompute, pipeline->pipeline);
 -    subctx->s->buffer->buf.bindDescriptorSets(vk::PipelineBindPoint::eCompute,
@@ -3538,7 +3545,7 @@ index 510fb689..0a255592 100644
 +        subctx->s->buffer->buf.dispatch(wg0, wg1, wg2);
 +    }
  }
-
+ 
  static void ggml_vk_ctx_end(vk_context& ctx) {
 @@ -10978,7 +11006,7 @@ static vk_pipeline ggml_vk_op_get_pipeline(ggml_backend_vk_context * ctx, const
          if (!ggml_vk_concat_supported(src0, src1, dst)) {
@@ -3636,7 +3643,7 @@ index 510fb689..0a255592 100644
      case GGML_OP_CONV_3D:
 @@ -11676,7 +11716,7 @@ template <> void init_pushconst_tensor_offsets(ggml_backend_vk_context * ctx, vk
  }
-
+ 
  template <> void init_pushconst_tensor_offsets(ggml_backend_vk_context * ctx, vk_op_concat_push_constants &p, const ggml_tensor * src0, const ggml_tensor * src1, const ggml_tensor * src2, const ggml_tensor * src3, ggml_tensor * dst) {
 -    const uint32_t unit_size = ggml_vk_concat_unit_size(dst->type);
 +    const uint32_t unit_size = ggml_vk_concat_unit_size(src0, src1, dst);
@@ -3680,14 +3687,14 @@ index 510fb689..0a255592 100644
 @@ -12627,18 +12674,17 @@ static void ggml_vk_opt_step_sgd(ggml_backend_vk_context * ctx, vk_context& subc
  static void ggml_vk_concat(ggml_backend_vk_context * ctx, vk_context& subctx, const ggml_tensor * src0, const ggml_tensor * src1, ggml_tensor * dst) {
      int * op_params = (int *)dst->op_params;
-
+ 
 -    const uint32_t unit_size = ggml_vk_concat_unit_size(dst->type);
 -    const uint32_t units_per_block = ggml_type_size(dst->type) / unit_size;
 +    const uint32_t unit_size = ggml_vk_concat_unit_size(src0, src1, dst);
 +    const uint32_t type_size = ggml_type_size(dst->type);
      const uint32_t block_size = ggml_blck_size(dst->type);
 -    const bool quantized = ggml_is_quantized(dst->type);
-
+ 
      // Address dimension 0 in packed storage units; higher strides may be noncontiguous.
 -    const uint32_t ne00 = src0->ne[0] / block_size * units_per_block;
 -    const uint32_t ne10 = src1->ne[0] / block_size * units_per_block;
@@ -3701,12 +3708,12 @@ index 510fb689..0a255592 100644
 +    const uint32_t nb00 = 1;
 +    const uint32_t nb10 = 1;
 +    const uint32_t nb20 = 1;
-
+ 
      vk_op_concat_push_constants pc {{
          ne20 * (uint32_t)dst->ne[1] * (uint32_t)dst->ne[2] * (uint32_t)dst->ne[3],
 @@ -13889,15 +13935,15 @@ static void ggml_vk_pool_2d(ggml_backend_vk_context * ctx, vk_context& subctx, c
  }
-
+ 
  static void ggml_vk_conv_2d(ggml_backend_vk_context * ctx, vk_context & subctx, const ggml_tensor * src0,
 -                            const ggml_tensor * src1, ggml_tensor * dst) {
 +                            const ggml_tensor * src1, const ggml_tensor * src2, ggml_tensor * dst) {
@@ -3715,26 +3722,26 @@ index 510fb689..0a255592 100644
 -    GGML_ASSERT(dst->type == GGML_TYPE_F32);
 +    GGML_ASSERT(src1->type == dst->type);
 +    GGML_ASSERT(src1->type == GGML_TYPE_F32 || src1->type == GGML_TYPE_F16);
-
+ 
      GGML_TENSOR_BINARY_OP_LOCALS
      GGML_ASSERT(nb00 == sizeof(float) || nb00 == sizeof(ggml_fp16_t));
 -    GGML_ASSERT(nb10 == sizeof(float));
 -    GGML_ASSERT(nb0 == sizeof(float));
 +    GGML_ASSERT(nb10 == ggml_type_size(src1->type));
 +    GGML_ASSERT(nb0 == ggml_type_size(dst->type));
-
+ 
      bool transpose = dst->op == GGML_OP_CONV_TRANSPOSE_2D;
-
+ 
 @@ -13924,8 +13970,9 @@ static void ggml_vk_conv_2d(ggml_backend_vk_context * ctx, vk_context & subctx,
      p.nb1 = static_cast<uint32_t>(nb1 / nb0);
      p.nb2 = static_cast<uint32_t>(nb2 / nb0);
      p.nb3 = static_cast<uint32_t>(nb3 / nb0);
 +    p.fuse_bias_silu = src2 && ggml_get_op_params_i32(dst, 7) == 1;
-
+ 
 -    ggml_vk_op_f32(ctx, subctx, src0, src1, nullptr, nullptr, dst, dst->op, std::move(p));
 +    ggml_vk_op_f32(ctx, subctx, src0, src1, src2, nullptr, dst, dst->op, std::move(p));
  }
-
+ 
  static void ggml_vk_conv_3d(ggml_backend_vk_context * ctx, vk_context & subctx, const ggml_tensor * src0,
 @@ -15382,7 +15429,7 @@ static bool ggml_vk_build_graph(ggml_backend_vk_context * ctx, ggml_cgraph * cgr
          break;
@@ -3742,7 +3749,7 @@ index 510fb689..0a255592 100644
      case GGML_OP_CONV_TRANSPOSE_2D:
 -        ggml_vk_conv_2d(ctx, compute_ctx, src0, src1, node);
 +        ggml_vk_conv_2d(ctx, compute_ctx, src0, src1, src2, node);
-
+ 
          break;
      case GGML_OP_CONV_3D:
 @@ -16792,7 +16839,9 @@ static ggml_status ggml_backend_vk_graph_compute(ggml_backend_t backend, ggml_cg
@@ -3753,7 +3760,7 @@ index 510fb689..0a255592 100644
 +    const uint32_t target_submits = ctx->device->target_submits != 0 ? ctx->device->target_submits :
 +        (ctx->last_total_flops >= 150'000'000'000ULL ? 4u : 8u);
 +    uint64_t flops_per_submit = std::min(flops_cap, ctx->last_total_flops / target_submits);
-
+ 
      for (int i = 0; i < cgraph->n_nodes; i++) {
          if (first_node_in_batch) {
 @@ -18045,7 +18094,8 @@ static bool ggml_backend_vk_device_supports_op(ggml_backend_dev_t dev, const ggm
@@ -3797,7 +3804,7 @@ index 510fb689..0a255592 100644
              return true; // all inputs are contiguous, see ggml.c
 @@ -18198,10 +18252,17 @@ static bool ggml_backend_vk_device_supports_op(ggml_backend_dev_t dev, const ggm
                  const int64_t cin  = !transpose ? op->src[0]->ne[2] : op->src[0]->ne[3];
-
+ 
                  // Channel-contiguous format is not supported yet.
 +                const bool f32_io = op->src[1]->type == GGML_TYPE_F32 && op->type == GGML_TYPE_F32;
 +                const bool f16_io = op->src[0]->type == GGML_TYPE_F16 &&
@@ -3822,7 +3829,7 @@ index 99400098..cdf11b4f 100644
 @@ -33,6 +33,10 @@ layout(binding = 2) writeonly buffer D {
      D_TYPE dst_data[];
  };  // dst - result:    [OW, OH, Cout, N]
-
+ 
 +layout(binding = 3) readonly buffer Bias {
 +    float bias_data[];
 +};
@@ -3833,7 +3840,7 @@ index 99400098..cdf11b4f 100644
 @@ -58,6 +62,8 @@ layout(push_constant) uniform parameter {
      uint32_t nb2;
      uint32_t nb3;
-
+ 
 +    uint32_t fuse_bias_silu;
 +
      // fastdiv helper values
@@ -3842,7 +3849,7 @@ index 99400098..cdf11b4f 100644
 @@ -201,6 +207,14 @@ uint fastdiv(uint n, uint mp, uint L) {
      return (msbs + n) >> L;
  }
-
+ 
 +float apply_post_op(float value, uint channel) {
 +    if (p.fuse_bias_silu == 0) {
 +        return value;
@@ -3853,7 +3860,7 @@ index 99400098..cdf11b4f 100644
 +
  #ifdef COOPMAT2
  #define ACC_TYPE float16_t
-
+ 
 @@ -213,7 +227,7 @@ ACC_TYPE perElemOpStore(const in uint32_t r, const in uint32_t c, const in ACC_T
      uint32_t OW_idx  = NPQ_idx - N_idx * p.OH * p.OW - OH_idx * p.OW;
      uint32_t dst_idx = OW_idx + OH_idx * p.nb1 + K_idx * p.nb2 + N_idx * p.nb3;
@@ -3888,7 +3895,7 @@ index d9d7166e..3d064958 100644
 @@ -70,5 +70,5 @@ void main() {
          }
      }
-
+ 
 -    data_d[nc * O_HW + cur_oh * p.OW + cur_ow] = res;
 +    data_d[nc * O_HW + cur_oh * p.OW + cur_ow] = D_TYPE(res);
  }
@@ -3898,30 +3905,30 @@ index 0223d2e0..596932f4 100644
 +++ b/src/ggml-vulkan/vulkan-shaders/vulkan-shaders-gen.cpp
 @@ -887,6 +887,7 @@ void process_shaders() {
      string_to_spv("repeat_i16", "repeat.comp", {{"A_TYPE", "int16_t"}, {"D_TYPE", "int16_t"}});
-
+ 
      string_to_spv("scale_f32", "scale.comp", {{"A_TYPE", "float"}, {"D_TYPE", "float"}, {"FLOAT_TYPE", "float"}});
 +    string_to_spv("scale_f16", "scale.comp", {{"A_TYPE", "float16_t"}, {"D_TYPE", "float16_t"}, {"FLOAT_TYPE", "float"}});
-
+ 
      string_to_spv("pad_f32", "pad.comp", {{"A_TYPE", "float"}, {"D_TYPE", "float"}});
-
+ 
 @@ -896,6 +897,7 @@ void process_shaders() {
      string_to_spv("concat_i64", "concat.comp", {{"A_TYPE", "uvec2"}, {"B_TYPE", "uvec2"}, {"D_TYPE", "uvec2"}});
-
+ 
      string_to_spv("upscale_f32", "upscale.comp", {{"A_TYPE", "float"}, {"B_TYPE", "float"}, {"D_TYPE", "float"}});
 +    string_to_spv("upscale_f16", "upscale.comp", {{"A_TYPE", "float16_t"}, {"B_TYPE", "float16_t"}, {"D_TYPE", "float16_t"}});
-
+ 
      string_to_spv("exp_f16",        "unary.comp",       {{"A_TYPE", "float16_t"},   {"D_TYPE", "float16_t"}, {"OP", "op_exp"}});
      string_to_spv("exp_f32",        "unary.comp",       {{"A_TYPE", "float"},       {"D_TYPE", "float"},     {"OP", "op_exp"}});
 @@ -1054,6 +1056,7 @@ void process_shaders() {
-
+ 
      string_to_spv("pool1d_f32", "pool1d.comp", merge_maps(base_dict, {{"A_TYPE", "float"}, {"D_TYPE", "float"}}));
      string_to_spv("pool2d_f32", "pool2d.comp", merge_maps(base_dict, {{"A_TYPE", "float"}, {"D_TYPE", "float"}}));
 +    string_to_spv("pool2d_f16", "pool2d.comp", merge_maps(base_dict, {{"A_TYPE", "float16_t"}, {"D_TYPE", "float16_t"}}));
-
+ 
      string_to_spv("rwkv_wkv6_f32", "wkv6.comp", merge_maps(base_dict, {{"A_TYPE", "float"}}));
-
+ 
 @@ -1070,14 +1073,18 @@ void process_shaders() {
-
+ 
      for (auto transpose : {false, true}) {
          for (auto unroll : {false, true}) {
 -            for (auto a_f16 : {false, true}) {
@@ -3948,9 +3955,9 @@ index 0223d2e0..596932f4 100644
      string_to_spv("conv2d_dw_cwhn_f16_f32", "conv2d_dw.comp", merge_maps(base_dict, {{"A_TYPE", "float16_t"}, {"B_TYPE", "float"}, {"D_TYPE", "float"}, {"CWHN", "1"}}));
 +    string_to_spv("conv2d_dw_whcn_f16", "conv2d_dw.comp", merge_maps(base_dict, {{"A_TYPE", "float16_t"}, {"B_TYPE", "float16_t"}, {"D_TYPE", "float16_t"}, {"WHCN", "1"}}));
 +    string_to_spv("conv2d_dw_cwhn_f16", "conv2d_dw.comp", merge_maps(base_dict, {{"A_TYPE", "float16_t"}, {"B_TYPE", "float16_t"}, {"D_TYPE", "float16_t"}, {"CWHN", "1"}}));
-
+ 
      string_to_spv("roll_f32", "roll.comp", merge_maps(base_dict, {{"A_TYPE", "float"}, {"D_TYPE", "float"}}));
-
+ 
 diff --git a/src/ggml.c b/src/ggml.c
 index 59191c66..388b7b39 100644
 --- a/src/ggml.c
@@ -3963,7 +3970,7 @@ index 59191c66..388b7b39 100644
 +    const enum ggml_type im2col_type =
 +        a->type == GGML_TYPE_F32 || a->type == GGML_TYPE_BF16 ? GGML_TYPE_F32 : GGML_TYPE_F16;
 +    struct ggml_tensor * im2col = ggml_im2col(ctx, a, b, s0, s1, p0, p1, d0, d1, true, im2col_type); // [N, OH, OW, IC * KH * KW]
-
+ 
      struct ggml_tensor * result =
          ggml_mul_mat(ctx,
 @@ -4795,9 +4797,11 @@ struct ggml_tensor * ggml_conv_2d_dw(
@@ -3977,12 +3984,12 @@ index 59191c66..388b7b39 100644
 -                                        s0, s1, p0, p1, d0, d1, true, a->type == GGML_TYPE_BF16 ? GGML_TYPE_F32 : GGML_TYPE_F16); // [N * IC, OH, OW, KH * KW]
 +                                        s0, s1, p0, p1, d0, d1, true, im2col_type); // [N * IC, OH, OW, KH * KW]
      struct ggml_tensor * new_b = ggml_reshape_4d(ctx, im2col, im2col->ne[0], im2col->ne[2] * im2col->ne[1], b->ne[2], b->ne[3]); // [N * IC, OH, OW, KH * KW] => [N, IC, OH * OW, KH * KW]
-
+ 
      new_a = ggml_reshape_4d(ctx, new_a, (new_a->ne[0] * new_a->ne[1]), new_a->ne[2],  new_a->ne[3], 1);                       // [OC，1, KH, KW] => [1, OC, 1, KH * KW]
 @@ -4885,6 +4889,24 @@ struct ggml_tensor * ggml_conv_2d_direct(
      return result;
  }
-
+ 
 +struct ggml_tensor * ggml_conv_2d_direct_bias_silu(
 +        struct ggml_context * ctx,
 +        struct ggml_tensor  * a,
@@ -4002,24 +4009,24 @@ index 59191c66..388b7b39 100644
 +}
 +
  // ggml_conv_3d_direct
-
+ 
  struct ggml_tensor * ggml_conv_3d_direct(
 @@ -4954,7 +4976,7 @@ struct ggml_tensor * ggml_conv_transpose_2d_p0(
          a->ne[2], b->ne[3],
      };
-
+ 
 -    struct ggml_tensor* result = ggml_new_tensor(ctx, GGML_TYPE_F32, 4, ne);
 +    struct ggml_tensor* result = ggml_new_tensor(ctx, b->type, 4, ne);
-
+ 
      ggml_set_op_params_i32(result, 0, stride);
-
+ 
 @@ -5021,7 +5043,7 @@ struct ggml_tensor * ggml_pool_2d(
      GGML_ASSERT(ne[0] > 0);
      GGML_ASSERT(ne[1] > 0);
-
+ 
 -    result = ggml_new_tensor(ctx, GGML_TYPE_F32, 4, ne);
 +    result = ggml_new_tensor(ctx, a->type, 4, ne);
-
+ 
      int32_t params[] = { op, k0, k1, s0, s1, p0, p1 };
      ggml_set_op_params(result, params, sizeof(params));
 @@ -5069,7 +5091,7 @@ static struct ggml_tensor * ggml_interpolate_impl(
@@ -4028,6 +4035,6 @@ index 59191c66..388b7b39 100644
      GGML_ASSERT(!(mode & GGML_SCALE_FLAG_ANTIALIAS) || (mode & 0xFF) == GGML_SCALE_MODE_BILINEAR);
 -    GGML_ASSERT(a->type == GGML_TYPE_F32);
 +    GGML_ASSERT(a->type == GGML_TYPE_F32 || a->type == GGML_TYPE_F16);
-
+ 
      struct ggml_tensor * result = ggml_new_tensor_4d(ctx, a->type, ne0, ne1, ne2, ne3);
-
+ 

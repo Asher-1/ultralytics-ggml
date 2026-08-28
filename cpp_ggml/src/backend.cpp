@@ -112,7 +112,7 @@ static ggml_backend_t try_init_gpu_backend() {
 #endif
 }
 
-BackendCtx init_backend_ctx(int n_threads) {
+BackendCtx init_backend_ctx(int n_threads, size_t graph_nodes) {
     ggml_log_set(forward_ggml_log, nullptr);
     BackendCtx ctx{};
     if (n_threads <= 0) {
@@ -155,7 +155,7 @@ BackendCtx init_backend_ctx(int n_threads) {
         };
         ctx.sched = ggml_backend_sched_new(
             backends.data(), bufts.data(), (int)backends.size(),
-            /*graph_size*/ 8192, /*parallel*/ false, /*op_offload*/ true);
+            /*graph_size*/ graph_nodes, /*parallel*/ false, /*op_offload*/ true);
         if (!ctx.sched) {
             YOLO_LOG_WARN("ggml_backend_sched_new failed; CPU-only");
             ggml_backend_free(ctx.gpu);

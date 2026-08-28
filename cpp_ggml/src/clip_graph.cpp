@@ -13,7 +13,6 @@
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
-#include <fstream>
 #include <thread>
 #include <vector>
 
@@ -39,61 +38,6 @@ static ggml_tensor* find_tensor(ggml_context* ctx, const char* name) {
 struct weight_resolver {
     ggml_context* wctx;
 };
-
-// GGUF exposes tensor metadata separately from its byte payload. Keep weights
-// in the selected backend's buffer so both CPU gallocr and GPU scheduling have
-// explicit tensor ownership.
-static bool upload_weights(ClipSession* s, const gguf_context* g, const std::string& path) {
-    s->wbuf = ggml_backend_alloc_ctx_tensors_from_buft(s->wctx, yolo::backend_weight_buft(s->backend));
-    if (!s->wbuf) {
-        fprintf(stderr, "clip: weight allocation failed\n");
-        return false;
-    }
-
-    std::ifstream input(path, std::ios::binary);
-    if (!input) {
-        fprintf(stderr, "clip: failed to reopen GGUF weights: %s\n", path.c_str());
-        return false;
-    }
-
-    const size_t data_offset = gguf_get_data_offset(g);
-    std::vector<char> chunk(8u * 1024u * 1024u);
-    for (int64_t i = 0; i < gguf_get_n_tensors(g); ++i) {
-        ggml_tensor* tensor = ggml_get_tensor(s->wctx, gguf_get_tensor_name(g, i));
-        if (!tensor) {
-            fprintf(stderr, "clip: missing GGUF tensor during upload\n");
-            return false;
-        }
-        input.seekg(static_cast<std::streamoff>(data_offset + gguf_get_tensor_offset(g, i)));
-        for (size_t offset = 0, bytes = ggml_nbytes(tensor); offset < bytes;) {
-            const size_t n = std::min(chunk.size(), bytes - offset);
-            input.read(chunk.data(), static_cast<std::streamsize>(n));
-            if (input.gcount() != static_cast<std::streamsize>(n)) {
-                fprintf(stderr, "clip: truncated GGUF tensor '%s'\n", tensor->name);
-                return false;
-            }
-            ggml_backend_tensor_set(tensor, chunk.data(), offset, n);
-            offset += n;
-        }
-    }
-    return true;
-}
-
-static bool prepare_gpu_graph(ClipSession* s, ggml_cgraph* graph,
-                              ggml_tensor* input, ggml_tensor* output,
-                              ggml_tensor* extra_input = nullptr) {
-    if (!s->backend.sched) return true;
-    // A scheduler owns allocations for one graph at a time. Text and image
-    // graphs share the backend and weights, so reset before assigning the
-    // graph about to run rather than retaining two incompatible allocations.
-    ggml_backend_sched_reset(s->backend.sched);
-    ggml_backend_sched_set_tensor_backend(s->backend.sched, input, s->backend.gpu);
-    if (extra_input) {
-        ggml_backend_sched_set_tensor_backend(s->backend.sched, extra_input, s->backend.gpu);
-    }
-    ggml_backend_sched_set_tensor_backend(s->backend.sched, output, s->backend.gpu);
-    return yolo::backend_graph_alloc(s->backend, graph);
-}
 
 // Resolve a text block's weights
 static bool resolve_text_block(weight_resolver& r, ClipSession::TextBlock& blk,
@@ -146,7 +90,7 @@ static bool resolve_visual_block(weight_resolver& r, ClipSession::VisualBlock& b
 // ---------------------------------------------------------------------------
 
 // L2-normalise the last dimension of `x` in-place.
-static ggml_tensor* l2_norm(ggml_context* ctx, ggml_tensor* x) {
+ggml_tensor* clip_l2_norm(ggml_context* ctx, ggml_tensor* x) {
     // sum = sum(x^2, dim=-1)  -->  uses ggml_sum_rows if 2D
     ggml_tensor* sq = ggml_sqr(ctx, x);
     ggml_tensor* sum = ggml_sum_rows(ctx, sq);  // [D] or [N, D] -> [1] or [N, 1]
@@ -156,8 +100,8 @@ static ggml_tensor* l2_norm(ggml_context* ctx, ggml_tensor* x) {
 }
 
 // LayerNorm: y = (x - mean) / sqrt(var + eps) * weight + bias
-static ggml_tensor* layer_norm(ggml_context* ctx, ggml_tensor* x,
-                                ggml_tensor* weight, ggml_tensor* bias) {
+ggml_tensor* clip_layer_norm(ggml_context* ctx, ggml_tensor* x,
+                             ggml_tensor* weight, ggml_tensor* bias) {
     // ggml_norm: y = (x - mean) / sqrt(var + eps), where mean/var computed
     // over the last dimension. eps is hardcoded to 1e-5 in ggml.
     ggml_tensor* y = ggml_norm(ctx, x, 1e-5f);
@@ -171,10 +115,10 @@ static ggml_tensor* layer_norm(ggml_context* ctx, ggml_tensor* x,
 // Returns: [D, S]
 // `causal` enables the GPT-style lower-triangular mask used by the CLIP text
 // encoder (visual encoder attention is bidirectional).
-static ggml_tensor* self_attention(ggml_context* ctx, ggml_tensor* x,
-                                    ggml_tensor* in_proj_w, ggml_tensor* in_proj_b,
-                                    ggml_tensor* out_proj_w, ggml_tensor* out_proj_b,
-                                    int n_heads, int d_head, bool causal) {
+ggml_tensor* clip_self_attention(ggml_context* ctx, ggml_tensor* x,
+                                 ggml_tensor* in_proj_w, ggml_tensor* in_proj_b,
+                                 ggml_tensor* out_proj_w, ggml_tensor* out_proj_b,
+                                 int n_heads, int d_head, bool causal) {
     // Cast F16 weights to F32 for computation
     if (in_proj_w->type != GGML_TYPE_F32)
         in_proj_w = ggml_cast(ctx, in_proj_w, GGML_TYPE_F32);
@@ -207,13 +151,12 @@ static ggml_tensor* self_attention(ggml_context* ctx, ggml_tensor* x,
     // Make contiguous so view splitting works
     qkv = ggml_cont(ctx, qkv);
 
-    // Split q, k, v: each [D, S] (views into the [3D, S] qkv buffer; the
-    // per-position stride is 3D elements so they are NOT contiguous).
+    // Split q, k, v as 4D views [d_h, n_h, S, 1] into the [3D, S] qkv buffer
+    // (no copy): the per-position stride is 3D elements, the per-head stride
+    // d_h elements.
     const size_t ts = ggml_type_size(qkv->type);
     const size_t row_bytes = (size_t)3 * D * ts;   // position stride in qkv
     const size_t head_bytes = (size_t)d_h * ts;    // head stride within a q/k/v block
-    // 4D views [d_h, n_h, S, 1] (no copy; reshape_4d would assert on the
-    // strided views above).
     ggml_tensor* q4 = ggml_view_4d(ctx, qkv, d_h, n_h, S, 1, head_bytes, row_bytes, qkv->nb[3], 0);
     ggml_tensor* k4 = ggml_view_4d(ctx, qkv, d_h, n_h, S, 1, head_bytes, row_bytes, qkv->nb[3], D * ts);
     ggml_tensor* v4 = ggml_view_4d(ctx, qkv, d_h, n_h, S, 1, head_bytes, row_bytes, qkv->nb[3], 2 * D * ts);
@@ -263,10 +206,12 @@ static ggml_tensor* self_attention(ggml_context* ctx, ggml_tensor* x,
     return result;
 }
 
-// MLP block (same for text and visual, just different dims)
-static ggml_tensor* mlp_block(ggml_context* ctx, ggml_tensor* x,
-                               ggml_tensor* fc_w, ggml_tensor* fc_b,
-                               ggml_tensor* proj_w, ggml_tensor* proj_b) {
+// MLP block (same for text and visual, just different dims); exact_gelu
+// selects erf-GELU (MobileCLIP) over QuickGELU (CLIP).
+ggml_tensor* clip_mlp_block(ggml_context* ctx, ggml_tensor* x,
+                            ggml_tensor* fc_w, ggml_tensor* fc_b,
+                            ggml_tensor* proj_w, ggml_tensor* proj_b,
+                            bool exact_gelu) {
     if (fc_w->type != GGML_TYPE_F32)
         fc_w = ggml_cast(ctx, fc_w, GGML_TYPE_F32);
     if (fc_b && fc_b->type != GGML_TYPE_F32)
@@ -278,7 +223,8 @@ static ggml_tensor* mlp_block(ggml_context* ctx, ggml_tensor* x,
 
     ggml_tensor* h = ggml_mul_mat(ctx, fc_w, x);  // [4*D, N]
     if (fc_b) h = ggml_add(ctx, h, ggml_reshape_2d(ctx, fc_b, fc_b->ne[0], 1));
-    h = ggml_gelu_quick(ctx, h);  // QuickGELU: x * sigmoid(1.702x) (CLIP activation)
+    h = exact_gelu ? ggml_gelu_erf(ctx, h)        // exact GELU (MobileCLIP)
+                   : ggml_gelu_quick(ctx, h);     // QuickGELU: x * sigmoid(1.702x) (CLIP)
     h = ggml_mul_mat(ctx, proj_w, h);  // [D, N]
     if (proj_b) h = ggml_add(ctx, h, ggml_reshape_2d(ctx, proj_b, proj_b->ne[0], 1));
     return h;
@@ -295,15 +241,15 @@ static ggml_tensor* transformer_block(ggml_context* ctx, ggml_tensor* x,
                                        int n_heads, int d_head, bool causal) {
     // Attention sub-block
     ggml_tensor* residual = x;
-    x = layer_norm(ctx, x, ln1_w, ln1_b);
-    x = self_attention(ctx, x, attn_in_w, attn_in_b, attn_out_w, attn_out_b,
-                       n_heads, d_head, causal);
+    x = clip_layer_norm(ctx, x, ln1_w, ln1_b);
+    x = clip_self_attention(ctx, x, attn_in_w, attn_in_b, attn_out_w, attn_out_b,
+                            n_heads, d_head, causal);
     x = ggml_add(ctx, residual, x);  // residual 1
 
     // MLP sub-block
     residual = x;
-    x = layer_norm(ctx, x, ln2_w, ln2_b);
-    x = mlp_block(ctx, x, mlp_fc_w, mlp_fc_b, mlp_proj_w, mlp_proj_b);
+    x = clip_layer_norm(ctx, x, ln2_w, ln2_b);
+    x = clip_mlp_block(ctx, x, mlp_fc_w, mlp_fc_b, mlp_proj_w, mlp_proj_b, /*exact_gelu*/ false);
     x = ggml_add(ctx, residual, x);  // residual 2
     return x;
 }
@@ -312,36 +258,37 @@ static ggml_tensor* transformer_block(ggml_context* ctx, ggml_tensor* x,
 // clip_create_session
 // ---------------------------------------------------------------------------
 
-// Load the BPE vocab + merges written by scripts/convert_clip_to_gguf.py and
-// rebuild the encoder map (token -> id) exactly like the Python
-// SimpleTokenizer: vocab is already ordered by id.
-static bool load_tokenizer(ClipSession* s, const gguf_context* g) {
-    const int64_t vid = gguf_find_key(g, "clip.vocab");
-    const int64_t mid = gguf_find_key(g, "clip.merges");
+// Load the BPE vocab + merges written by the converters and rebuild the
+// encoder map (token -> id) exactly like the Python SimpleTokenizer: vocab is
+// already ordered by id.
+bool clip_bpe_load(ClipBpe& bpe, const gguf_context* g,
+                   const char* vocab_key, const char* merges_key, int expect_vocab) {
+    const int64_t vid = gguf_find_key(g, vocab_key);
+    const int64_t mid = gguf_find_key(g, merges_key);
     if (vid < 0 || mid < 0) {
-        fprintf(stderr, "clip: GGUF has no clip.vocab / clip.merges (re-run convert_clip_to_gguf.py)\n");
+        fprintf(stderr, "bpe: GGUF has no %s / %s\n", vocab_key, merges_key);
         return false;
     }
     const size_t nv = gguf_get_arr_n(g, vid);
     const size_t nm = gguf_get_arr_n(g, mid);
-    if (nv != (size_t)VOCAB_SIZE) {
-        fprintf(stderr, "clip: unexpected vocab size %zu (expected %d)\n", nv, VOCAB_SIZE);
+    if (nv != (size_t)expect_vocab) {
+        fprintf(stderr, "bpe: unexpected vocab size %zu (expected %d)\n", nv, expect_vocab);
         return false;
     }
-    s->vocab.resize(nv);
+    bpe.vocab.resize(nv);
     for (size_t i = 0; i < nv; i++) {
-        s->vocab[i] = gguf_get_arr_str(g, vid, i);
-        s->encoder[s->vocab[i]] = (int)i;
+        bpe.vocab[i] = gguf_get_arr_str(g, vid, i);
+        bpe.encoder[bpe.vocab[i]] = (int)i;
     }
-    s->merges.reserve(nm);
+    bpe.merges.reserve(nm);
     for (size_t i = 0; i < nm; i++) {
         std::string pair = gguf_get_arr_str(g, mid, i);
         const size_t sp = pair.find(' ');
         if (sp == std::string::npos) {
-            fprintf(stderr, "clip: bad merge entry %zu: '%s'\n", i, pair.c_str());
+            fprintf(stderr, "bpe: bad merge entry %zu: '%s'\n", i, pair.c_str());
             return false;
         }
-        s->merges.emplace_back(pair.substr(0, sp), pair.substr(sp + 1));
+        bpe.merges.emplace_back(pair.substr(0, sp), pair.substr(sp + 1));
     }
     return true;
 }
@@ -350,7 +297,7 @@ ClipSession* clip_create_session(const std::string& gguf_path, const ClipSession
     // Load GGUF file
     ggml_context* weight_ctx = nullptr;
     gguf_init_params ip{};
-    ip.no_alloc = true;
+    ip.no_alloc = false;
     ip.ctx = &weight_ctx;
 
     gguf_context* g = gguf_init_from_file(gguf_path.c_str(), ip);
@@ -372,7 +319,7 @@ ClipSession* clip_create_session(const std::string& gguf_path, const ClipSession
         // Standalone CLIP process (yolo-similarity): build the full backend
         // context so supported ops run on the GPU and anything the GPU lacks
         // (e.g. QuickGELU on Vulkan) falls back to CPU through the scheduler.
-        s->backend = yolo::init_backend_ctx(opts.threads);
+        s->backend = yolo::init_backend_ctx(opts.threads, 4096);  // image graph node cap
         if (!s->backend.cpu) {
             clip_free_session(s);
             gguf_free(g);
@@ -447,17 +394,15 @@ ClipSession* clip_create_session(const std::string& gguf_path, const ClipSession
         }
     }
 
-    if (!load_tokenizer(s, g)) {
+    if (!clip_bpe_load(s->bpe, g, "clip.vocab", "clip.merges", VOCAB_SIZE)) {
         clip_free_session(s);
         gguf_free(g);
         return nullptr;
     }
 
-    if (!upload_weights(s, g, gguf_path)) {
-        clip_free_session(s);
-        gguf_free(g);
-        return nullptr;
-    }
+    // Weights: gguf_init loaded them into host memory (no_alloc = false).
+    // CLIP is only called once per session (text encoding), so keep weights
+    // on CPU even when a GPU backend is available — no performance impact.
 
     // Build the text encoder graph
     {
@@ -498,7 +443,7 @@ ClipSession* clip_create_session(const std::string& gguf_path, const ClipSession
         }
 
         // Final layer norm
-        h = layer_norm(gctx, h, s->text_ln_final_w, s->text_ln_final_b);
+        h = clip_layer_norm(gctx, h, s->text_ln_final_w, s->text_ln_final_b);
 
         // Take the EOT token embedding at the sequence position given by the
         // runtime input (CLIP: x[arange(batch), text.argmax(-1)]).  Positions
@@ -517,7 +462,7 @@ ClipSession* clip_create_session(const std::string& gguf_path, const ClipSession
         h = ggml_mul_mat(gctx, proj_T, ggml_reshape_2d(gctx, h, EMBED_DIM, 1));  // [EMBED_DIM, 1]
 
         // L2 normalize
-        h = l2_norm(gctx, ggml_reshape_1d(gctx, h, EMBED_DIM));
+        h = clip_l2_norm(gctx, ggml_reshape_1d(gctx, h, EMBED_DIM));
         h = ggml_reshape_1d(gctx, h, EMBED_DIM);
 
         ggml_set_output(h);
@@ -529,9 +474,8 @@ ClipSession* clip_create_session(const std::string& gguf_path, const ClipSession
         ggml_build_forward_expand(s->text_graph, h);
         s->text_output_embed = h;
 
-        // CPU graph storage is persistent. GPU scheduler storage is prepared
-        // immediately before each text/image execution (one graph at a time).
-        if (!s->backend.sched && !yolo::backend_graph_alloc(s->backend, s->text_graph)) {
+        // Allocate graph
+        if (!yolo::backend_graph_alloc(s->backend, s->text_graph)) {
             fprintf(stderr, "clip: text graph alloc failed\n");
             clip_free_session(s);
             gguf_free(g);
@@ -592,7 +536,7 @@ ClipSession* clip_create_session(const std::string& gguf_path, const ClipSession
         ggml_tensor* h = ggml_add(gctx, tokens, pos_f32);
 
         // Pre layer norm
-        h = layer_norm(gctx, h, s->visual_ln_pre_w, s->visual_ln_pre_b);
+        h = clip_layer_norm(gctx, h, s->visual_ln_pre_w, s->visual_ln_pre_b);
 
         // 12 visual transformer blocks (bidirectional attention)
         const int d_head_visual = VISUAL_EMBED / VISUAL_N_HEADS;  // 64
@@ -613,7 +557,7 @@ ClipSession* clip_create_session(const std::string& gguf_path, const ClipSession
         h = ggml_view_1d(gctx, h, VISUAL_EMBED, 0);
 
         // Post layer norm
-        h = layer_norm(gctx, h, s->visual_ln_post_w, s->visual_ln_post_b);
+        h = clip_layer_norm(gctx, h, s->visual_ln_post_w, s->visual_ln_post_b);
 
         // Visual projection: [768] -> mul_mat(proj_T, [768, 1]) -> [512, 1] -> [512]
         ggml_tensor* proj_f32 = ggml_cast(gctx, s->visual_proj, GGML_TYPE_F32);
@@ -624,7 +568,7 @@ ClipSession* clip_create_session(const std::string& gguf_path, const ClipSession
         h = ggml_reshape_1d(gctx, h, EMBED_DIM);
 
         // L2 normalize
-        h = l2_norm(gctx, h);
+        h = clip_l2_norm(gctx, h);
         h = ggml_reshape_1d(gctx, h, EMBED_DIM);
 
         ggml_set_output(h);
@@ -636,7 +580,8 @@ ClipSession* clip_create_session(const std::string& gguf_path, const ClipSession
         ggml_build_forward_expand(s->image_graph, h);
         s->image_output_embed = h;
 
-        if (!s->backend.sched && !yolo::backend_graph_alloc(s->backend, s->image_graph)) {
+        // Allocate graph
+        if (!yolo::backend_graph_alloc(s->backend, s->image_graph)) {
             fprintf(stderr, "clip: image graph alloc failed\n");
             clip_free_session(s);
             gguf_free(g);
@@ -816,9 +761,9 @@ static std::string byte_encode(const std::string& tok) {
 }
 
 // GPT-2 BPE merge of a single byte-encoded token (SimpleTokenizer.bpe).
-static std::string bpe_merge(ClipSession* s, const std::string& token) {
-    auto it = s->bpe_cache.find(token);
-    if (it != s->bpe_cache.end()) return it->second;
+static std::string bpe_merge(ClipBpe& bpe, const std::string& token) {
+    auto it = bpe.bpe_cache.find(token);
+    if (it != bpe.bpe_cache.end()) return it->second;
     // word = tuple(token[:-1]) + (token[-1] + '</w>',)
     std::vector<std::string> word;
     for (size_t i = 0; i + 1 < token.size(); i++) word.push_back(token.substr(i, 1));
@@ -829,8 +774,8 @@ static std::string bpe_merge(ClipSession* s, const std::string& token) {
         return ps;
     };
     auto ranks = [&](const std::string& a, const std::string& b) {
-        for (size_t i = 0; i < s->merges.size(); i++) {
-            if (s->merges[i].first == a && s->merges[i].second == b) return (int)i;
+        for (size_t i = 0; i < bpe.merges.size(); i++) {
+            if (bpe.merges[i].first == a && bpe.merges[i].second == b) return (int)i;
         }
         return INT_MAX;
     };
@@ -859,12 +804,12 @@ static std::string bpe_merge(ClipSession* s, const std::string& token) {
     }
     std::string joined;
     for (size_t i = 0; i < word.size(); i++) { if (i) joined += ' '; joined += word[i]; }
-    s->bpe_cache[token] = joined;
+    bpe.bpe_cache[token] = joined;
     return joined;
 }
 
-int clip_tokenize_text(ClipSession* s, const char* text, int32_t* tokens) {
-    if (!s || !text || !tokens) return 0;
+int clip_bpe_tokenize(ClipBpe& bpe, const char* text, int ctx_len, int32_t* tokens) {
+    if (!text || !tokens || ctx_len <= 0) return 0;
     std::string t = text;
     std::transform(t.begin(), t.end(), t.begin(), [](unsigned char c) { return (char)std::tolower(c); });
     t = whitespace_clean(basic_clean(t));
@@ -873,13 +818,13 @@ int clip_tokenize_text(ClipSession* s, const char* text, int32_t* tokens) {
     ids.push_back(49406);  // <|startoftext|>
     for (const std::string& tok : regex_split(t)) {
         const std::string enc = byte_encode(tok);
-        const std::string merged = bpe_merge(s, enc);
+        const std::string merged = bpe_merge(bpe, enc);
         size_t pos = 0;
         while (pos <= merged.size()) {
             const size_t sp = merged.find(' ', pos);
             const std::string sub = sp == std::string::npos ? merged.substr(pos) : merged.substr(pos, sp - pos);
-            auto it = s->encoder.find(sub);
-            if (it == s->encoder.end()) {
+            auto it = bpe.encoder.find(sub);
+            if (it == bpe.encoder.end()) {
                 // Unknown subword: fall back to the raw byte-encoded token's
                 // first char (CLIP would produce <unk>-like behaviour); skip to
                 // keep the reference alignment for common prompts.
@@ -892,12 +837,17 @@ int clip_tokenize_text(ClipSession* s, const char* text, int32_t* tokens) {
         }
     }
     ids.push_back(49407);  // <|endoftext|>
-    if ((int)ids.size() > TEXT_CTX) {
-        ids.resize(TEXT_CTX);
+    if ((int)ids.size() > ctx_len) {
+        ids.resize(ctx_len);
         ids.back() = 49407;
     }
-    for (int i = 0; i < TEXT_CTX; i++) tokens[i] = i < (int)ids.size() ? ids[i] : 0;
+    for (int i = 0; i < ctx_len; i++) tokens[i] = i < (int)ids.size() ? ids[i] : 0;
     return (int)ids.size();
+}
+
+int clip_tokenize_text(ClipSession* s, const char* text, int32_t* tokens) {
+    if (!s) return 0;
+    return clip_bpe_tokenize(s->bpe, text, TEXT_CTX, tokens);
 }
 
 bool clip_encode_string(ClipSession* s, const char* text, float* embed) {
@@ -913,12 +863,6 @@ bool clip_encode_string(ClipSession* s, const char* text, float* embed) {
 
 bool clip_encode_text(ClipSession* s, const int32_t* tokens, float* embed) {
     if (!s || !s->text_graph) return false;
-
-    if (!prepare_gpu_graph(s, s->text_graph, s->text_input_tokens,
-                           s->text_output_embed, s->text_eot_idx)) {
-        fprintf(stderr, "clip: text graph alloc failed\n");
-        return false;
-    }
 
     // Copy token IDs to the input tensor
     ggml_backend_tensor_set(s->text_input_tokens, tokens, 0, TEXT_CTX * sizeof(int32_t));
@@ -947,11 +891,6 @@ bool clip_encode_text(ClipSession* s, const int32_t* tokens, float* embed) {
 
 bool clip_encode_image(ClipSession* s, const float* image, float* embed) {
     if (!s || !s->image_graph) return false;
-
-    if (!prepare_gpu_graph(s, s->image_graph, s->image_input, s->image_output_embed)) {
-        fprintf(stderr, "clip: image graph alloc failed\n");
-        return false;
-    }
 
     // Copy image data to the input tensor
     const size_t nbytes = (size_t)IMAGE_SIZE * IMAGE_SIZE * 3 * sizeof(float);

@@ -312,7 +312,7 @@ def main():
     args = ap.parse_args()
 
     GGUF_MODELS.mkdir(parents=True, exist_ok=True)
-    default_name = f"clip-{args.model.replace('/', '-')}.gguf" if args.dtype == "f16" else f"clip-{args.model.replace('/', '-')}-{args.dtype}.gguf"
+    default_name = f"clip-{args.model.replace('/', '-')}-{args.dtype}.gguf"
     output = args.output or GGUF_MODELS / default_name
     convert(args.model, str(output), args.dtype)
 

@@ -7,7 +7,9 @@ Modes:
   raw    <pt> <in.bin> <out.bin> [ytxt]
                                      run the fused model on a dumped input and
                                      dump the raw head output (YRAW0001).  For
-                                     YOLOE, ytxt is its post-reprta YTXT0001.
+                                     YOLOE, ytxt must be the post-reprta text
+                                     feature the torch head consumes (apply
+                                     head.get_tpe to a YTXT0002 blob first).
   diff   <torch.bin> <cpp.bin> [rm]  compare two YRAW0001 dumps
   depth <pt> <img> <out.bin> [dev]  dump official metric depth (YDEP0001)
   ddiff <torch.bin> <cpp.bin>        compare two metric-depth maps
@@ -60,10 +62,11 @@ def write_bin(path: str, magic: bytes, dims, data: np.ndarray):
 
 
 def read_ytxt(path: str) -> torch.Tensor:
-    """Read the [class, embedding] YTXT0001 tensor emitted by the text tools."""
+    """Read the [class, embedding] YTXT tensor (YTXT0001/YTXT0002 share the layout)."""
     with open(path, "rb") as f:
-        if f.read(8) != b"YTXT0001":
-            raise ValueError(f"{path} is not a YTXT0001 file")
+        magic = f.read(8)
+        if magic not in (b"YTXT0001", b"YTXT0002"):
+            raise ValueError(f"{path} is not a YTXT file")
         nc, embed = struct.unpack("<ii", f.read(8))
         values = np.fromfile(f, dtype=np.float32)
     if values.size != nc * embed:
@@ -129,7 +132,9 @@ def main():
         a, b = a.reshape(d1), b.reshape(d2)
         diff = np.abs(a - b)
         idx = np.unravel_index(np.argmax(diff), diff.shape)
+        rel = diff / np.maximum(np.abs(a), 1e-3)
         print(f"shape={a.shape} max={diff.max():.6f} mean={diff.mean():.8f}")
+        print(f"abs_p99={np.quantile(diff, 0.99):.6f} rel_mean={rel.mean():.6f} rel_p99={np.quantile(rel, 0.99):.6f}")
         print(f"argmax(ch,a)={idx} torch={a[idx]:.6f} cpp={b[idx]:.6f}")
         # Top-5 anchors by torch cls max: are they preserved? (optional argv[4]=reg_max)
         rm = int(sys.argv[4]) if len(sys.argv) > 4 else 16

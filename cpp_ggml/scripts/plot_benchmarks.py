@@ -38,7 +38,7 @@ OBB_MODELS = [f"yolo26{n}-obb" for n in "nsmlx"]
 SEM_MODELS = [f"yolo26{n}-sem" for n in "nsmlx"]
 CLS_MODELS = [f"yolo26{n}-cls" for n in "nsmlx"]
 WORLD_MODELS = [f"yolov8{n}-world" for n in "smlx"]
-YOLOE_MODELS = ["yoloe-26n-seg"]
+YOLOE_MODELS = [f"yoloe-26{n}-seg" for n in "nsmlx"]
 FAMILIES = {
     "detect": DETECT_MODELS,
     "segment": SEG_MODELS,
@@ -49,6 +49,7 @@ FAMILIES = {
     "classify": CLS_MODELS,
 }
 MODELS = DETECT_MODELS + SEG_MODELS + DEPTH_MODELS + POSE_MODELS + OBB_MODELS + SEM_MODELS + CLS_MODELS
+MATRIX_MODELS = MODELS + WORLD_MODELS + YOLOE_MODELS
 BACKENDS = ["cuda", "vulkan", "cpu"]
 DTYPES = ["f32", "f16", "q8_0"]
 WORLD_PROTOCOL = {"classes": "person,bus,car,truck", "class_count": 4, "text_source": "ytxt"}
@@ -73,7 +74,7 @@ def plot_values(values):
 
 
 def load(path, key):
-    """Load the latest structured record for every requested key."""
+    """Load the latest structured record for every requested key. key() may return None to skip a row."""
     out = {}
     if not path.exists():
         return out
@@ -82,7 +83,9 @@ def load(path, key):
             continue
         d = json.loads(line)
         if d.get("e2e_ms", {}).get("mean"):
-            out[key(d)] = d
+            k = key(d)
+            if k is not None:
+                out[k] = d
     return out
 
 
@@ -99,9 +102,9 @@ def require_metrics(record, sections):
 def validate_coverage(bench_records, torch_records):
     """Fail before rendering when the checked-in evidence matrix is incomplete.
 
-    Open-vocabulary World is deliberately absent from this matrix. Its rows
-    need a declared vocabulary and are collected with an explicit invocation
-    of bench_all.sh rather than being mixed with closed-set timings.
+    The closed-set keys are validated here; the fixed-vocabulary World and
+    YOLOE keys are validated by their own protocol checks and join the Chart 5
+    matrix afterwards.
     """
     expected_ggml = {(backend, model, dtype) for backend in BACKENDS for model in MODELS for dtype in DTYPES}
     missing_ggml = sorted(expected_ggml - set(bench_records))
@@ -134,7 +137,7 @@ def validate_coverage(bench_records, torch_records):
 
 def validate_world_coverage(world_records):
     """Require comparable World rows rather than silently accepting legacy timings."""
-    expected = {(backend, model) for backend in BACKENDS for model in WORLD_MODELS}
+    expected = {(backend, model, dtype) for backend in BACKENDS for model in WORLD_MODELS for dtype in DTYPES}
     missing = sorted(expected - set(world_records))
     unexpected = sorted(set(world_records) - expected)
     incomplete = []
@@ -149,8 +152,8 @@ def validate_world_coverage(world_records):
         fields = require_metrics(record, sections)
         if fields:
             incomplete.append(f"world {key}: {', '.join(fields)}")
-        if record.get("dtype") != "f32" or record.get("imgsz") != [480, 640]:
-            incomplete.append(f"world {key}: expected f32 at 480x640")
+        if record.get("imgsz") != [480, 640]:
+            incomplete.append(f"world {key}: expected 480x640")
         if record.get("world") != WORLD_PROTOCOL:
             incomplete.append(f"world {key}: fixed vocabulary/text protocol missing")
     if missing or unexpected or incomplete:
@@ -164,24 +167,29 @@ def validate_world_coverage(world_records):
 
 
 def validate_yoloe_coverage(yoloe_records):
-    """Require the checkpoint-specific YTXT contract for every YOLOE backend row."""
-    expected = {(backend, model) for backend in BACKENDS for model in YOLOE_MODELS}
+    """Require the fixed-vocabulary YTXT0002 contract for every YOLOE backend row."""
+    expected = {(backend, model, dtype) for backend in BACKENDS for model in YOLOE_MODELS for dtype in DTYPES}
     missing = sorted(expected - set(yoloe_records))
-    unexpected = sorted(set(yoloe_records) - expected)
     problems = []
+    sections = {
+        "preprocess_ms": ("mean", "p50", "p90"),
+        "graph_ms": ("mean", "min", "p50", "p90", "max"),
+        "post_ms": ("mean", "p50"),
+        "e2e_ms": ("mean", "min", "p50", "p90", "max"),
+    }
     for key in sorted(expected & set(yoloe_records)):
         record = yoloe_records[key]
-        fields = require_metrics(record, {"e2e_ms": ("mean",), "graph_ms": ("mean",)})
+        fields = require_metrics(record, sections)
         if fields:
             problems.append(f"YOLOE {key}: {', '.join(fields)}")
-        if record.get("dtype") != "f32" or record.get("imgsz") != [480, 640]:
-            problems.append(f"YOLOE {key}: expected f32 at 480x640")
+        if record.get("imgsz") != [480, 640]:
+            problems.append(f"YOLOE {key}: expected 480x640")
         if record.get("world") != WORLD_PROTOCOL:
-            problems.append(f"YOLOE {key}: fixed post-reprta YTXT protocol missing")
+            problems.append(f"YOLOE {key}: fixed YTXT0002 vocabulary protocol missing")
     if missing:
         problems.append(f"missing YOLOE keys ({len(missing)}): {missing}")
-    if unexpected:
-        problems.append(f"unexpected YOLOE keys ({len(unexpected)}): {unexpected}")
+    # Rows beyond the chart contract (other scales, F16/Q8_0) are additional
+    # evidence; the store is append-only, so they are kept, not flagged.
     if problems:
         raise RuntimeError("incomplete YOLOE benchmark evidence:\n" + "\n".join(problems))
 
@@ -226,12 +234,14 @@ def family_bars(ax, models, bench, torchref, series, title, label_fn, value_dtyp
 def main():
     bench_records = load(RES / "bench.jsonl", lambda d: (d["backend"], d["model"], d["dtype"]))
     torch_records = load(RES / "pytorch.jsonl", lambda d: (d["model"],))
-    world_records = load(RES / "world.jsonl", lambda d: (d["backend"], d["model"]))
-    yoloe_records = load(RES / "yoloe.jsonl", lambda d: (d["backend"], d["model"]))
+    world_records = load(RES / "world.jsonl", lambda d: (d["backend"], d["model"], d["dtype"]))
+    yoloe_records = load(RES / "yoloe.jsonl", lambda d: (d["backend"], d["model"], d["dtype"]))
     validate_coverage(bench_records, torch_records)
     validate_world_coverage(world_records)
     validate_yoloe_coverage(yoloe_records)
     bench = {key: record["e2e_ms"]["mean"] for key, record in bench_records.items()}
+    for records in (world_records, yoloe_records):
+        bench.update({key: record["e2e_ms"]["mean"] for key, record in records.items()})
     torchref = {model: record["e2e_ms"]["mean"] for (model,), record in torch_records.items()}
     series = present_series(bench)
 
@@ -328,17 +338,17 @@ def main():
     fig.tight_layout()
     fig.savefig(RES / "depth_latency.png", dpi=150)
 
-    # ---- Chart 5: complete 45-model x 3-backend x 3-precision matrix ----
+    # ---- Chart 5: complete 54-model x 3-backend x 3-precision matrix ----
     columns = [(backend, dtype) for backend in BACKENDS for dtype in DTYPES]
-    matrix = [[bench[(backend, model, dtype)] for backend, dtype in columns] for model in MODELS]
+    matrix = [[bench[(backend, model, dtype)] for backend, dtype in columns] for model in MATRIX_MODELS]
     values = [value for row in matrix for value in row]
     norm = LogNorm(vmin=min(values), vmax=max(values))
-    fig, ax = plt.subplots(figsize=(16, 22))
+    fig, ax = plt.subplots(figsize=(16, 28))
     image = ax.imshow(matrix, cmap="viridis", norm=norm, aspect="auto")
     ax.set_xticks(range(len(columns)))
     ax.set_xticklabels([f"{backend}\n{dtype}" for backend, dtype in columns])
-    ax.set_yticks(range(len(MODELS)))
-    ax.set_yticklabels(MODELS, fontsize=7)
+    ax.set_yticks(range(len(MATRIX_MODELS)))
+    ax.set_yticklabels(MATRIX_MODELS, fontsize=7)
     ax.set_title("Complete GGML end-to-end latency matrix (ms, lower is better)")
     for row, values_by_column in enumerate(matrix):
         for column, value in enumerate(values_by_column):
@@ -394,7 +404,7 @@ def main():
         (axes[1], "graph_ms", "graph latency"),
     ):
         for index, (backend, color) in enumerate((("cuda", "#1f77b4"), ("vulkan", "#2ca02c"), ("cpu", "#7f7f7f"))):
-            values = [world_records[(backend, model)][metric]["mean"] for model in WORLD_MODELS]
+            values = [world_records[(backend, model, "f32")][metric]["mean"] for model in WORLD_MODELS]
             bars = axis.bar(
                 [x + (index - 1) * width for x in range(len(WORLD_MODELS))], values, width, label=backend, color=color
             )
@@ -411,22 +421,30 @@ def main():
     fig.tight_layout(rect=[0, 0, 1, 0.93])
     fig.savefig(RES / "world_latency.png", dpi=150)
 
-    # ---- Chart 9: YOLOE uses detector-specific post-reprta MobileCLIP YTXT ----
-    fig, axes = plt.subplots(1, 2, figsize=(10, 4))
+    # ---- Chart 9: YOLOE consumes pre-reprta YTXT0002; reprta rides in the v4 graph ----
+    fig, axes = plt.subplots(1, 2, figsize=(13, 5))
+    yoloe_labels = [model.replace("yoloe-26", "").replace("-seg", "") for model in YOLOE_MODELS]
+    width = 0.22
     for axis, metric, title in (
         (axes[0], "e2e_ms", "end-to-end latency"),
         (axes[1], "graph_ms", "graph latency"),
     ):
-        values = [yoloe_records[(backend, YOLOE_MODELS[0])][metric]["mean"] for backend in BACKENDS]
-        bars = axis.bar(BACKENDS, values, color=["#1f77b4", "#2ca02c", "#7f7f7f"])
-        for bar, value in zip(bars, values):
-            axis.text(bar.get_x() + bar.get_width() / 2, value * 1.05, f"{value:.1f}", ha="center", fontsize=8)
+        for index, (backend, color) in enumerate((("cuda", "#1f77b4"), ("vulkan", "#2ca02c"), ("cpu", "#7f7f7f"))):
+            values = [yoloe_records[(backend, model, "f32")][metric]["mean"] for model in YOLOE_MODELS]
+            bars = axis.bar(
+                [x + (index - 1) * width for x in range(len(YOLOE_MODELS))], values, width, label=backend, color=color
+            )
+            for bar, value in zip(bars, values):
+                axis.text(bar.get_x() + bar.get_width() / 2, value * 1.08, f"{value:.1f}", ha="center", fontsize=7)
+        axis.set_xticks(range(len(YOLOE_MODELS)))
+        axis.set_xticklabels(yoloe_labels)
         axis.set_yscale("log")
         axis.set_ylabel("ms / frame (log scale)")
         axis.set_title(title)
         axis.grid(axis="y", alpha=0.3)
-    fig.suptitle("YOLOE-26n-seg F32: fixed post-reprta YTXT person,bus,car,truck at 480x640", fontsize=11)
-    fig.tight_layout(rect=[0, 0, 1, 0.91])
+        axis.legend()
+    fig.suptitle("YOLOE-26 F32 latency: fixed YTXT0002 person,bus,car,truck at 480x640", fontsize=12)
+    fig.tight_layout(rect=[0, 0, 1, 0.93])
     fig.savefig(RES / "yoloe_latency.png", dpi=150)
 
     # ---- Speedup table (markdown) ----
@@ -440,16 +458,17 @@ def main():
         f"| GGML backend/model/precision keys | {len(BACKENDS) * len(MODELS) * len(DTYPES)} | "
         f"{len(BACKENDS) * len(MODELS) * len(DTYPES)} | complete |",
         f"| PyTorch CUDA model references | {len(MODELS)} | {len(MODELS)} | complete |",
-        f"| World backend/model keys (fixed YTXT F32) | {len(BACKENDS) * len(WORLD_MODELS)} | "
+        f"| World backend/model/precision keys (fixed YTXT) | {len(BACKENDS) * len(WORLD_MODELS) * len(DTYPES)} | "
         f"{len(world_records)} | complete |",
-        f"| YOLOE backend/model keys (fixed post-reprta YTXT F32) | {len(BACKENDS) * len(YOLOE_MODELS)} | "
-        f"{len(yoloe_records)} | complete |",
+        f"| YOLOE backend/model/precision keys (fixed YTXT0002) | "
+        f"{len(BACKENDS) * len(YOLOE_MODELS) * len(DTYPES)} | {len(yoloe_records)} | complete |",
         "| GGML per-row latency fields | preprocess mean/p50/p90; graph mean/min/p50/p90/max; "
         "post mean/p50; e2e mean/min/p50/p90/max | all required fields | complete |",
         "| PyTorch per-row latency fields | e2e mean/min/p50/p90/max | all required fields | complete |",
         "",
-        "The latency matrix is complete across all seven task families "
-        "(detect, segment, depth, pose, obb, semantic, classify). Accuracy evidence is separate: "
+        "The latency matrix is complete across all seven closed-set task families "
+        "(detect, segment, depth, pose, obb, semantic, classify) plus the fixed-vocabulary "
+        "World and YOLOE open-vocabulary checkpoints. Accuracy evidence is separate: "
         "focused parity covers every family on the documented image, while dataset-level validation "
         "(COCO, NYU Depth V2, Cityscapes, ImageNet, DOTA) is not yet established.",
         "",

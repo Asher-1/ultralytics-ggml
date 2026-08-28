@@ -36,13 +36,13 @@ All commands below start at the repository root unless a section explicitly runs
 Every build needs Git, a C++17 compiler, CMake 3.14 or newer, and a build tool supported by CMake. Model conversion and
 report generation additionally need Python 3.8 or newer and the Python dependencies declared by this repository.
 
-| Target         | Additional requirement                                                                        |
-| -------------- | --------------------------------------------------------------------------------------------- |
-| CPU            | No accelerator SDK; OpenMP is used when CMake finds it                                        |
-| CUDA           | NVIDIA driver, CUDA toolkit, and a Volta (cc 7.0) or newer GPU for the implicit-GEMM conv path |
-| CUDA + cuDNN   | Additionally cuDNN 8.5 or newer when `YOLO_GGML_CUDNN=ON` is requested                        |
-| Vulkan         | Vulkan loader, headers, shader compiler, and a Vulkan 1.2-capable driver                      |
-| CLIP (optional)| `YOLO_GGML_CLIP=ON` (default) enables the CLIP ViT-B/32 text+image encoder. Python `clip` package needed for GGUF conversion only. |
+| Target          | Additional requirement                                                                                                             |
+| --------------- | ---------------------------------------------------------------------------------------------------------------------------------- |
+| CPU             | No accelerator SDK; OpenMP is used when CMake finds it                                                                             |
+| CUDA            | NVIDIA driver, CUDA toolkit, and a Volta (cc 7.0) or newer GPU for the implicit-GEMM conv path                                     |
+| CUDA + cuDNN    | Additionally cuDNN 8.5 or newer when `YOLO_GGML_CUDNN=ON` is requested                                                             |
+| Vulkan          | Vulkan loader, headers, shader compiler, and a Vulkan 1.2-capable driver                                                           |
+| CLIP (optional) | `YOLO_GGML_CLIP=ON` (default) enables the CLIP ViT-B/32 text+image encoder. Python `clip` package needed for GGUF conversion only. |
 
 Check the tools before configuring:
 
@@ -176,13 +176,13 @@ backend implements this as a native implicit-GEMM kernel using only the WMMA ten
 CUDA toolkit:
 
 - The im2col operand is never materialized; the A tile is formed on the fly in shared memory while loading from
-    the NHWC input, bias and SiLU are fused into the epilogue, and a whole fused conv is one kernel launch.
+  the NHWC input, bias and SiLU are fused into the epilogue, and a whole fused conv is one kernel launch.
 - No cuDNN, CUTLASS, or other third-party headers or runtime libraries are involved; `ldd` shows only
-    `libcudart`, `libcublas`, and `libcublasLt`.
+  `libcudart`, `libcublas`, and `libcublasLt`.
 - Unaligned channel counts (e.g. the RGB first layer) use a scalar staging path, so every YOLO convolution runs
-    on tensor cores instead of falling back to the naive kernel.
+  on tensor cores instead of falling back to the naive kernel.
 - On cc 7.0+ devices it beats the previous CUTLASS-based implementation on yolo26n (−32%), yolov8n (−17%), and
-    yolov8s (parity), trailing only on yolov8m (+9%) at a fraction of the code size.
+  yolov8s (parity), trailing only on yolov8m (+9%) at a fraction of the code size.
 
 The checked-in CUDA results are measured with this native path. Set `GGML_CUDA_DISABLE_IGEMM=1` to compare
 against the naive reference implementation.
@@ -192,6 +192,20 @@ against the naive reference implementation.
 The only supported source checkpoint directory is `cpp_ggml/models/pytorch/`; generated runtime files go to
 `cpp_ggml/models/gguf/`. Old model copies under `cpp_ggml/` or the repository root are not read. Supported missing
 release checkpoints are downloaded into the canonical PyTorch directory by Ultralytics when conversion starts.
+
+### Download prebuilt GGUF (skip local conversion)
+
+Every runtime GGUF in this integration is published prebuilt at
+[huggingface.co/Asher-1/yolo-gguf](https://huggingface.co/Asher-1/yolo-gguf) — the 135 closed-set checkpoints, the 13
+YOLO-World files, all 30 YOLOE-26 (incl. `-pf`) variants, and the CLIP/MobileCLIP text towers with their `.ref.npz`
+parity references (187 files total). Download them straight into the canonical GGUF directory:
+
+```bash
+pip install -U "huggingface_hub[cli]"
+huggingface-cli download Asher-1/yolo-gguf --local-dir cpp_ggml/models/gguf
+```
+
+Local conversion below remains the reproducible path from the PyTorch checkpoints.
 
 Convert all 45 supported checkpoints (YOLOv8/YOLO26 detect, segment, depth, pose, obb, semantic, classify) to F32,
 F16, and Q8_0, producing 135 GGUF files:
@@ -348,6 +362,11 @@ cpp_ggml/build-cuda/bin/yolo-cli semantic \
 Prints the per-class pixel histogram on the canvas/8 grid; `--out` blends the Cityscapes-19 class map over the source
 image. All five YOLO26 semantic scales are supported.
 
+This is not the `-seg` models above. Those run through `detect` and return one mask, box, and confidence per detected
+object, leaving the rest of the frame unlabeled; a semantic model has no object concept at all and labels every pixel,
+including road and sky, with no NMS and no boxes. See
+[reading the montage](benchmarks/README.md#reading-instance-seg-against-semantic-seg) for both on the same `bus.jpg`.
+
 ### Classification
 
 ```bash
@@ -385,7 +404,7 @@ Requires `YOLO_GGML_CLIP=ON` (default). After converting a CLIP GGUF model, sear
 ```bash
 mkdir -p cpp_ggml/results
 cpp_ggml/build-cpu/bin/yolo-similarity \
-    --model cpp_ggml/models/gguf/clip-ViT-B-32.gguf \
+    --model cpp_ggml/models/gguf/clip-ViT-B-32-f16.gguf \
     --text "a red car" \
     --image_dir ultralytics/assets/ \
     --topk 10
@@ -395,7 +414,7 @@ Text-only encoding (useful for integration):
 
 ```bash
 cpp_ggml/build-cpu/bin/yolo-similarity \
-    --model cpp_ggml/models/gguf/clip-ViT-B-32.gguf \
+    --model cpp_ggml/models/gguf/clip-ViT-B-32-f16.gguf \
     --text "a cat sitting on a chair" \
     --dump_embed
 ```
@@ -486,10 +505,12 @@ largest model, depth, alternate image sizes, and the narrowest performance-margi
 
 ## 7. Reproduce the complete benchmark comparison
 
-The complete closed-set GGML matrix contains 405 unique keys:
+The complete GGML evidence store contains 486 unique keys:
 
 ```text
-45 models x 3 backends (CUDA, Vulkan, CPU) x 3 precisions (F32, F16, Q8_0)
+45 closed-set models x 3 backends (CUDA, Vulkan, CPU) x 3 precisions (F32, F16, Q8_0)
++ 4 YOLOv8-World scales x 3 backends x 3 precisions (fixed person,bus,car,truck YTXT)
++ 5 YOLOE-26-seg scales x 3 backends x 3 precisions (fixed YTXT0002 MobileCLIP vocabulary)
 ```
 
 The PyTorch reference contains one CUDA row for each of the same 45 models. `bench_all.sh` appends records so an
@@ -524,11 +545,10 @@ python3 scripts/bench_pytorch.py > benchmarks/pytorch.json.tmp
 mv benchmarks/bench.json.tmp benchmarks/bench.jsonl
 mv benchmarks/pytorch.json.tmp benchmarks/pytorch.jsonl
 
-# World is a separate 12-key F32 matrix: 4 model scales x 3 backends. Its
-# per-frame timings use the same fixed YTXT and exclude one-time text setup.
+# World is a separate 36-key matrix: 4 model scales x 3 backends x 3 precisions.
+# Its per-frame timings use the same fixed YTXT and exclude one-time text setup.
 : > benchmarks/world.json.tmp
 for backend in cuda vulkan cpu; do
-    YOLO_BENCH_DTYPES=f32 \
     YOLO_BENCH_WORLD_OUT=benchmarks/world.json.tmp \
     YOLO_BENCH_WORLD_CLASSES='person,bus,car,truck' \
     YOLO_BENCH_WORLD_TEXT_EMBED=path/to/person-bus-car-truck.ytxt \
@@ -536,6 +556,18 @@ for backend in cuda vulkan cpu; do
             yolov8s-world yolov8m-world yolov8l-world yolov8x-world
 done
 mv benchmarks/world.json.tmp benchmarks/world.jsonl
+
+# YOLOE is a separate 45-key matrix: 5 model scales x 3 backends x 3 precisions.
+# Each scale reuses the same checkpoint-agnostic YTXT0002 blob (encode_mobileclip_text.py).
+: > benchmarks/yoloe.json.tmp
+for backend in cuda vulkan cpu; do
+    YOLO_BENCH_YOLOE_OUT=benchmarks/yoloe.json.tmp \
+    YOLO_BENCH_YOLOE_CLASSES='person,bus,car,truck' \
+    YOLO_BENCH_YOLOE_TEXT_EMBED_DIR=benchmarks/ytxt \
+        bash scripts/bench_all.sh "build-$backend" "$backend" \
+            yoloe-26n-seg yoloe-26s-seg yoloe-26m-seg yoloe-26l-seg yoloe-26x-seg
+done
+mv benchmarks/yoloe.json.tmp benchmarks/yoloe.jsonl
 
 # Validate coverage and regenerate all latency charts and the comparison table.
 python3 scripts/plot_benchmarks.py
@@ -558,7 +590,8 @@ YOLO_BENCH_WORLD_TEXT_EMBED=path/to/person-bus-car-truck.ytxt \
 
 The full run is intentionally sequential: concurrent compiler or inference jobs distort clocks, thermals, available
 memory, and latency. Do not run it while another GPU workload is active. `plot_benchmarks.py` stops with a concrete
-error if any of the 405 GGML keys (45 checkpoints x 3 backends x 3 precisions), the 45 PyTorch rows, or required
+error if any of the 486 GGML keys (45 closed-set checkpoints plus 4 World and 5 YOLOE scales, each x 3 backends x 3
+precisions), the 45 PyTorch rows, or required
 latency statistics are missing.
 
 To collect a quick subset without overwriting the checked-in full matrix:
@@ -580,37 +613,38 @@ coverage.
 
 ### Generated benchmark artifacts
 
-| Artifact                                  | Meaning                                                                   |
-| ----------------------------------------- | ------------------------------------------------------------------------- |
-| `benchmarks/bench.jsonl`                  | Append-only closed-set timing records resolving to 405 model/backend/precision keys |
-| `benchmarks/pytorch.jsonl`                | Official PyTorch CUDA reference for all 45 checkpoints                    |
-| `benchmarks/world.jsonl`                  | 12 fixed-YTXT F32 World records: s/m/l/x across CUDA, Vulkan, and CPU    |
-| `benchmarks/yoloe.jsonl`                  | Fixed post-reprta YTXT F32 YOLOE-26n-seg records across CUDA, Vulkan, and CPU |
-| `benchmarks/speed_by_model.png`           | Detect-family latency and scale comparison                                |
-| `benchmarks/latency_by_backend.png`       | F16 detection latency by backend                                          |
-| `benchmarks/speed_by_dtype.png`           | Precision comparison for n/s deployment models                            |
-| `benchmarks/depth_latency.png`            | YOLO26 depth-family backend and precision latency (768 input)             |
-| `benchmarks/latency_matrix.png`           | All 45 models, three GGML backends, and three precisions                  |
-| `benchmarks/seg_latency.png`              | Segmentation latency by model family versus PyTorch                       |
+| Artifact                                  | Meaning                                                                                                 |
+| ----------------------------------------- | ------------------------------------------------------------------------------------------------------- |
+| `benchmarks/bench.jsonl`                  | Append-only closed-set timing records resolving to 405 model/backend/precision keys                     |
+| `benchmarks/pytorch.jsonl`                | Official PyTorch CUDA reference for all 45 checkpoints                                                  |
+| `benchmarks/world.jsonl`                  | 36 fixed-YTXT World records: s/m/l/x across CUDA, Vulkan, and CPU in F32/F16/Q8_0                       |
+| `benchmarks/yoloe.jsonl`                  | 45 fixed YTXT0002 YOLOE records: n/s/m/l/x across CUDA, Vulkan, and CPU in F32/F16/Q8_0                 |
+| `benchmarks/speed_by_model.png`           | Detect-family latency and scale comparison                                                              |
+| `benchmarks/latency_by_backend.png`       | F16 detection latency by backend                                                                        |
+| `benchmarks/speed_by_dtype.png`           | Precision comparison for n/s deployment models                                                          |
+| `benchmarks/depth_latency.png`            | YOLO26 depth-family backend and precision latency (768 input)                                           |
+| `benchmarks/latency_matrix.png`           | All 54 models (45 closed-set plus World and YOLOE), three GGML backends, and three precisions           |
+| `benchmarks/seg_latency.png`              | Segmentation latency by model family versus PyTorch                                                     |
 | `benchmarks/task_latency.png`             | Seven closed-set task families (detect/segment/depth/pose/obb/semantic/classify) latency versus PyTorch |
-| `benchmarks/world_latency.png`            | Fixed-vocabulary YOLO-World s/m/l/x F32 latency across CUDA, Vulkan, and CPU |
-| `benchmarks/yoloe_latency.png`            | Fixed-vocabulary YOLOE-26n-seg F32 latency across CUDA, Vulkan, and CPU |
-| `benchmarks/speedup_table.md`             | Complete latency and PyTorch speedup table for all seven task families    |
-| `benchmarks/parity_grid_{bus,zidane}.png` | PyTorch/CUDA/Vulkan/CPU detection visual comparison                       |
-| `benchmarks/depth_parity_bus.png`         | PyTorch/CUDA/Vulkan/CPU restored metric-depth visual comparison           |
-| `benchmarks/world_parity_bus_zidane.png`  | YOLOv8s-World open-vocabulary detection, PyTorch vs ggml CPU (bus + zidane) |
-| `benchmarks/clip_validation.png`          | CLIP ViT-B/32 full C++ vs PyTorch embedding cosine + first-200-dims overlay |
-| `benchmarks/clip_architecture.png`        | CLIP ViT-B/32 GGML graph architecture table (text + image encoders)        |
-| `benchmarks/model_family_overview.png`    | Visual inference results across all model families (detect/world/depth/pose/obb/sem/seg/cls) |
-| `benchmarks/cpu_q8_optimization.png`      | CPU Q8_0 direct-kernel speedup analysis                                    |
+| `benchmarks/world_latency.png`            | Fixed-vocabulary YOLO-World s/m/l/x F32 latency across CUDA, Vulkan, and CPU                            |
+| `benchmarks/yoloe_latency.png`            | Fixed-vocabulary YOLOE-26 n/s/m/l/x F32 latency across CUDA, Vulkan, and CPU                            |
+| `benchmarks/speedup_table.md`             | Complete latency and PyTorch speedup table for all seven task families                                  |
+| `benchmarks/parity_grid_{bus,zidane}.png` | PyTorch/CUDA/Vulkan/CPU detection visual comparison                                                     |
+| `benchmarks/depth_parity_bus.png`         | PyTorch/CUDA/Vulkan/CPU restored metric-depth visual comparison                                         |
+| `benchmarks/world_parity_bus_zidane.png`  | YOLOv8s-World open-vocabulary detection, PyTorch vs ggml CPU (bus + zidane)                             |
+| `benchmarks/clip_validation.png`          | CLIP ViT-B/32 full C++ vs PyTorch embedding cosine + first-200-dims overlay                             |
+| `benchmarks/clip_architecture.png`        | CLIP ViT-B/32 GGML graph architecture table (text + image encoders)                                     |
+| `benchmarks/model_family_overview.png`    | Visual inference results across all model families (detect/world/depth/pose/obb/sem/seg/cls)            |
+| `benchmarks/cpu_q8_optimization.png`      | CPU Q8_0 direct-kernel speedup analysis                                                                 |
 
 If build directories have nondefault names, set `YOLO_CUDA_BUILD`, `YOLO_VULKAN_BUILD`, and `YOLO_CPU_BUILD` before
 running `render_parity.py`.
 
 ## 8. Interpret the checked-in result
 
-On the measured RTX 3060 the full 45-checkpoint matrix (seven task families x n/s/m/l/x where applicable, plus the
-YOLOv8 detect/segment families) runs end to end on CPU, CUDA, and Vulkan in F32, F16, and Q8_0 — 405/405 keys pass.
+On the measured RTX 3060 the full 54-checkpoint matrix (seven closed-set task families x n/s/m/l/x where applicable,
+plus the YOLOv8 detect/segment families and the 4 World / 5 YOLOE open-vocabulary checkpoints) runs end to end on
+CPU, CUDA, and Vulkan in F32, F16, and Q8_0 — 486/486 keys pass.
 Best per-family speedups over the PyTorch CUDA reference are x2.42 (detect), x1.58 (segment), x1.52 (depth),
 x2.07 (pose), x2.40 (obb), x2.19 (semantic), and x1.07 (classify); pose and classify land closest to parity because
 their decode/preprocessing paths (RLE head, 224-input antialiased resize) are the newest additions. GPU graph time
@@ -627,7 +661,9 @@ chart alone.
 
 YOLO-World (YOLOv8s/m/l/x-World, F32/F16/Q8_0 conversion) is an open-vocabulary detector: the
 class vocabulary is supplied at runtime via `--classes "a,b,c"` (encoded on the fly by the built-in CLIP ViT-B/32
-text encoder) or a pre-encoded `--text-embed` blob. Full CLIP ViT-B/32 (BPE tokenizer + text encoder + image encoder)
+text encoder) or a pre-encoded `--text-embed` blob. With neither the engine detects the vocabulary its
+checkpoint shipped with, carried by the GGUF as `yolo.vocab_txt` (see `docs/world.md` section 6 for its parity
+evidence). Full CLIP ViT-B/32 (BPE tokenizer + text encoder + image encoder)
 is implemented in C++ on pure GGML ops, verified against PyTorch: text cosine = 1.0000000, image cosine = 0.99994 on
 bus.jpg with the documented preprocessing (see `benchmarks/clip_validation.png`). World latency and parity must be
 reported with the exact vocabulary, encoder/embedding blob, image, and dtype. CUDA F32 uses pedantic F32 math with
@@ -637,6 +673,15 @@ its F32 graph mean is 16.289 ms over 30 iterations on RTX 3060 with
 strict raw-head CUDA gate passes with score error mean `1.284e-5`, p99 `6.676e-5`,
 and max `2.956e-4`; see `docs/world.md` for the fixed input/YTXT protocol and
 the separate CPU near-parity result.
+YOLOE-26 (n/s/m/l/x-seg) is the second open-vocabulary family. Its text conditioning is a raw MobileCLIP feature;
+each checkpoint's `reprta` block runs inside the op-graph v4 GGUF, so one checkpoint-agnostic YTXT0002 blob under
+`benchmarks/ytxt/` (regenerated by `scripts/encode_mobileclip_text.py`) serves every scale, and `--classes` alone
+encodes plaintext through the native MobileCLIP tower. Its 45-key matrix and latency chart follow
+the same fixed-vocabulary protocol and are not comparable to the ViT-B/32 World timings.
+YOLOE-26 also publishes prompt-free `-seg-pf` checkpoints whose 4585-row vocabulary is baked into
+the head instead of arriving as a text tensor; they convert to the plain `segment` op, so they need
+no YTXT or `--classes` at the cost of a dense 4585-wide classifier on every anchor. Their measured
+matrix is in `benchmarks/README.md`.
 See `docs/world.md` for the open-vocabulary workflow, application guide, and calibration
 (标定) integration notes.
 
@@ -670,7 +715,7 @@ copies of GGML; update the source patch and replay it from the pinned clean subm
 | Vulkan configure cannot find its SDK               | Load the SDK environment or set `CMAKE_PREFIX_PATH`; verify with `vulkaninfo --summary`            |
 | `models/gguf/<name>.gguf` is missing               | Activate the Python environment and run the converter from the canonical model layout              |
 | Benchmark reports an unexpected backend            | Do not accept the row; verify the driver/build directory because the script rejects CPU fallback   |
-| Plot generation reports missing keys               | Finish all 99 GGML entries and all 11 PyTorch entries; a subset is intentionally insufficient      |
+| Plot generation reports missing keys               | Finish all 486 GGML entries and all 45 PyTorch entries; a subset is intentionally insufficient     |
 
 Do not clean a dirty GGML submodule blindly: it may contain an in-progress patch investigation. A new Git worktree is
 the safest way to obtain an independent clean submodule checkout.

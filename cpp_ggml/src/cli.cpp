@@ -7,6 +7,7 @@
 
 #if defined(YOLO_GGML_CLIP) && YOLO_GGML_CLIP
 #include "clip_graph.hpp"
+#include "mobileclip_graph.hpp"
 #endif
 
 #include <algorithm>
@@ -32,7 +33,11 @@ void usage() {
             "  yolo-cli detect --model M.gguf --source IMG [--out OUT.png] [--conf 0.25] [--iou 0.7]\n"
             "                 [--max-det 300] [--threads N] [--input-f32 IN.bin] [--dump-raw OUT.bin]\n"
             "                 [--dump-input OUT.bin] [--profile ops|gaps]\n"
-            "                 [--classes \"person,car\" --clip-model clip-ViT-B-32.gguf] (YOLO-World)\n"
+            "                 [--classes \"person,car\" --clip-model clip-ViT-B-32-f16.gguf] (YOLO-World;\n"
+            "                 YOLOE takes the same --classes with --text-model mobileclip2_b-f16.gguf;\n"
+            "                 without --classes the vocabulary stored in the GGUF is used;\n"
+            "                 an empty trailing field is the background class row\n"
+            "                 [--dets-json OUT.json] writes the detections verbatim for tools\n"
             "                 (segment models run here too: boxes + instance masks, --out blends them)\n"
             "  yolo-cli pose   --model M.gguf --source IMG [--out OUT.png] [--conf 0.25] [--iou 0.7]\n"
             "                 [--max-det 300] [--threads N] [--dump-input OUT.bin] [--profile ops|gaps]\n"
@@ -44,7 +49,7 @@ void usage() {
             "                 [--threads N] [--dump-input OUT.bin] [--profile ops|gaps]\n"
             "  yolo-cli bench  --model M.gguf --source IMG [--warmup 20] [--iters 100] [--threads N]\n"
             "                 [--profile ops|gaps] [--classes \"person,car\" --clip-model clip.gguf]\n"
-            "                 [--text-embed vocabulary.ytxt] (YOLO-World)\n"
+            "                 [--text-embed vocabulary.ytxt] (YOLO-World/YOLOE)\n"
             "  --profile ops:   per-op wall-time table on exit (adds per-node sync; GPU builds)\n"
             "  --profile gaps:  per-stage (upload/compute/readback) traces on stderr\n"
             "\n"
@@ -89,15 +94,19 @@ int arg_i(const Args& a, const char* k, int def) {
     return it == a.end() ? def : atoi(it->second.c_str());
 }
 
+// Comma-separated open-vocabulary class list. Spaces around a name are padding, but an
+// empty field is a real class row named "" -- the background prompt the YOLO-World docs
+// add with set_classes(["person","bus",""]) -- so it must survive the split. Only a
+// blank or absent argument means "no list given", i.e. use the stored vocabulary.
 std::vector<std::string> parse_class_list(const std::string& text) {
+    if (text.find_first_not_of(' ') == std::string::npos) return {};
     std::vector<std::string> classes;
     size_t pos = 0;
-    while (pos <= text.size()) {
+    while (true) {
         const size_t comma = text.find(',', pos);
         std::string name = text.substr(pos, comma == std::string::npos ? std::string::npos : comma - pos);
-        while (!name.empty() && name.front() == ' ') name.erase(name.begin());
-        while (!name.empty() && name.back() == ' ') name.pop_back();
-        if (!name.empty()) classes.push_back(std::move(name));
+        const size_t begin = name.find_first_not_of(' '), end = name.find_last_not_of(' ');
+        classes.push_back(begin == std::string::npos ? std::string() : name.substr(begin, end - begin + 1));
         if (comma == std::string::npos) break;
         pos = comma + 1;
     }
@@ -108,7 +117,7 @@ bool read_ytxt_shape(const std::string& path, int& nc) {
     FILE* f = fopen(path.c_str(), "rb");
     char magic[8];
     int32_t dims[2] = {};
-    const bool ok = f && fread(magic, 1, sizeof(magic), f) == sizeof(magic) && !memcmp(magic, "YTXT0001", 8) &&
+    const bool ok = f && fread(magic, 1, sizeof(magic), f) == sizeof(magic) && !memcmp(magic, "YTXT0002", 8) &&
                     fread(dims, sizeof(int32_t), 2, f) == 2 && dims[0] > 0 && dims[1] == clip::EMBED_DIM;
     if (f) fclose(f);
     if (ok) nc = dims[0];
@@ -224,6 +233,8 @@ int cmd_info(const Args& args) {
     for (const auto& kv : hist) printf(" %s=%d", kv.first.c_str(), kv.second);
     printf("\n");
 
+    if (m.has_text_input)
+        printf("vocab      : %d class embeddings stored in the GGUF\n", (int)model->vocab_txt.size() / 512);
     printf("classes    : %d [", (int)m.class_names.size());
     for (size_t i = 0; i < m.class_names.size() && i < 5; i++) printf("%s,", m.class_names[i].c_str());
     if (m.class_names.size() > 5) printf("...");
@@ -285,13 +296,13 @@ int cmd_detect(const Args& args) {
     sopts.profile_ops = arg_s(args, "profile") == "ops";
     sopts.profile_gaps = arg_s(args, "profile") == "gaps";
     // YOLO-World class count: --classes wins; otherwise peek the --text-embed
-    // blob header (dump_f32 layout: YTXT0001 magic + dims, no ndim field) so
+    // blob header (dump_f32 layout: YTXT0002 magic + dims, no ndim field) so
     // the graph is built with the right nc instead of the COCO (80) default.
     int te_nc = 0;
     const std::string te_path = arg_s(args, "text-embed");
     if (!te_path.empty()) {
         if (!read_ytxt_shape(te_path, te_nc)) {
-            fprintf(stderr, "--text-embed must be a [nc, 512] YTXT0001 f32 blob\n");
+            fprintf(stderr, "--text-embed must be a [nc, 512] YTXT0002 f32 blob\n");
             return 1;
         }
     }
@@ -300,7 +311,10 @@ int cmd_detect(const Args& args) {
                 world_classes.size(), te_nc);
         return 1;
     }
-    sopts.world_nc = (int)world_classes.size() ? (int)world_classes.size() : te_nc;
+    // Neither knob means "use the vocabulary the checkpoint shipped with", which
+    // the session loads itself; only an explicit list has to be encoded here.
+    const bool supply_text = !world_classes.empty() || te_nc > 0;
+    sopts.world_nc = supply_text ? ((int)world_classes.size() ? (int)world_classes.size() : te_nc) : 0;
     SessionPtr session(yolo::create_session(model_path, sopts), yolo::free_session);
     yolo::Session* s = session.get();
     if (!s) return 1;
@@ -312,47 +326,58 @@ int cmd_detect(const Args& args) {
         return 1;
     }
 
-    if (s->text_input) {
-        // YOLO-World text embedding input. Prefer a precomputed [nc, 512]
-        // row-major f32 blob (--text-embed), else encode --classes through the
-        // CLIP text encoder (--clip-model, default models/gguf/clip-ViT-B-32.gguf).
+    if (supply_text) {
+        // Text-conditioned head input. Prefer a precomputed [nc, 512] row-major
+        // f32 blob (--text-embed), else encode --classes through the matching text
+        // tower: MobileCLIP (--text-model) for YOLOE, CLIP (--clip-model) for World.
         std::vector<float> text_embed((size_t)s->world_nc * clip::EMBED_DIM, 0.0f);
         const std::string te_file = arg_s(args, "text-embed");
         if (!te_file.empty()) {
             std::vector<int32_t> dims = {s->world_nc, clip::EMBED_DIM};
-            if (!read_f32(te_file.c_str(), "YTXT0001", dims, text_embed) ||
+            if (!read_f32(te_file.c_str(), "YTXT0002", dims, text_embed) ||
                 dims[0] != s->world_nc || dims[1] != clip::EMBED_DIM) {
-                fprintf(stderr, "--text-embed must be [nc=%d, 512] YTXT0001 f32 blob\n", s->world_nc);
+                fprintf(stderr, "--text-embed must be [nc=%d, 512] YTXT0002 f32 blob\n", s->world_nc);
                 return 1;
             }
         } else {
-            if (!s->model.meta.text_model.empty()) {
-                fprintf(stderr,
-                        "YOLOE model (%s) requires a post-reprta MobileCLIP YTXT file; "
-                        "generate it with scripts/encode_mobileclip_text.py --detector <yoloe.pt>\n",
-                        s->model.meta.text_model.c_str());
-                return 1;
-            }
 #if defined(YOLO_GGML_CLIP) && YOLO_GGML_CLIP
             if (world_classes.empty()) {
-                fprintf(stderr, "world model: pass --classes \"a,b,c\" or --text-embed file\n");
+                fprintf(stderr, "--classes is empty but --text-embed has %d rows\n", te_nc);
                 return 1;
             }
-            std::string clip_model = arg_s(args, "clip-model", "models/gguf/clip-ViT-B-32.gguf");
-            // Keep CLIP's graph allocator separate from the YOLO allocator. The
-            // two sessions may use the same physical device, but a gallocr or
-            // scheduler is not a process-wide shared workspace.
-            clip::ClipSession* cs = clip::clip_create_session(clip_model);
-            if (!cs) return 1;
-            for (int i = 0; i < s->world_nc; i++) {
-                if (!clip::clip_encode_string(cs, world_classes[i].c_str(),
-                                              text_embed.data() + (size_t)i * clip::EMBED_DIM)) {
-                    fprintf(stderr, "failed to encode class '%s'\n", world_classes[i].c_str());
-                    clip::clip_free_session(cs);
-                    return 1;
+            // Keep the text encoder's graph allocator separate from the YOLO
+            // allocator. The two sessions may use the same physical device, but a
+            // gallocr or scheduler is not a process-wide shared workspace.
+            if (!s->model.meta.text_model.empty()) {
+                // YOLOE: encode --classes with its MobileCLIP tower. The detector
+                // graph applies the checkpoint's reprta itself (v4), so the raw
+                // normalised MobileCLIP feature is exactly the graph text input.
+                std::string tm = arg_s(args, "text-model", "models/gguf/mobileclip2_b-f16.gguf");
+                mobileclip::MobileclipSession* ms = mobileclip::mobileclip_create_session(tm);
+                if (!ms) return 1;
+                for (int i = 0; i < s->world_nc; i++) {
+                    if (!mobileclip::mobileclip_encode_string(ms, world_classes[i].c_str(),
+                                                              text_embed.data() + (size_t)i * clip::EMBED_DIM)) {
+                        fprintf(stderr, "failed to encode class '%s'\n", world_classes[i].c_str());
+                        mobileclip::mobileclip_free_session(ms);
+                        return 1;
+                    }
                 }
+                mobileclip::mobileclip_free_session(ms);
+            } else {
+                std::string clip_model = arg_s(args, "clip-model", "models/gguf/clip-ViT-B-32-f16.gguf");
+                clip::ClipSession* cs = clip::clip_create_session(clip_model);
+                if (!cs) return 1;
+                for (int i = 0; i < s->world_nc; i++) {
+                    if (!clip::clip_encode_string(cs, world_classes[i].c_str(),
+                                                  text_embed.data() + (size_t)i * clip::EMBED_DIM)) {
+                        fprintf(stderr, "failed to encode class '%s'\n", world_classes[i].c_str());
+                        clip::clip_free_session(cs);
+                        return 1;
+                    }
+                }
+                clip::clip_free_session(cs);
             }
-            clip::clip_free_session(cs);
 #else
             fprintf(stderr, "world model requires --text-embed file (built without CLIP)\n");
             return 1;
@@ -412,6 +437,32 @@ int cmd_detect(const Args& args) {
             printf("  mask=%zu", bits);
         }
         printf("\n");
+    }
+
+    // Machine-readable detections for tooling (scripts/val_map.py). The table above is
+    // not a contract: it rounds scores to 2 decimals, which would flatten a precision-
+    // recall curve, and a class name may contain spaces.
+    const std::string dets_json = arg_s(args, "dets-json");
+    if (!dets_json.empty()) {
+        FILE* f = fopen(dets_json.c_str(), "wb");
+        if (!f) {
+            fprintf(stderr, "failed to write --dets-json %s\n", dets_json.c_str());
+            return 1;
+        }
+        // The vocabulary is part of the result: an open-vocabulary run maps class ids
+        // to dataset categories by name, so re-deriving the list here would be a second
+        // source of truth for --classes semantics.
+        fputs("{\"vocabulary\":[", f);
+        for (size_t i = 0; i < names.size(); i++)
+            fprintf(f, "%s\"%s\"", i ? "," : "", json_escape(names[i]).c_str());
+        fputs("],\"detections\":[", f);
+        for (size_t i = 0; i < dets.size(); i++) {
+            const auto& d = dets[i];
+            fprintf(f, "%s{\"cls\":%d,\"conf\":%.6f,\"xyxy\":[%.3f,%.3f,%.3f,%.3f]}", i ? "," : "",
+                    d.class_id, d.score, d.x1, d.y1, d.x2, d.y2);
+        }
+        fputs("]}\n", f);
+        fclose(f);
     }
 
     const std::string out = arg_s(args, "out");
@@ -789,18 +840,15 @@ int cmd_bench(const Args& args) {
     const std::vector<std::string> wc = parse_class_list(world_classes_arg);
     int text_nc = 0;
     if (meta.has_text_input && !world_text_embed.empty() && !read_ytxt_shape(world_text_embed, text_nc)) {
-        fprintf(stderr, "--text-embed must be a [nc, 512] YTXT0001 f32 blob\n");
+        fprintf(stderr, "--text-embed must be a [nc, 512] YTXT0002 f32 blob\n");
         return 1;
     }
     if (meta.has_text_input && !wc.empty() && text_nc && (int)wc.size() != text_nc) {
         fprintf(stderr, "--classes (%zu classes) and --text-embed nc (%d) disagree\n", wc.size(), text_nc);
         return 1;
     }
-    sopts.world_nc = meta.has_text_input ? (wc.empty() ? text_nc : (int)wc.size()) : 0;
-    if (meta.has_text_input && sopts.world_nc <= 0) {
-        fprintf(stderr, "world bench: pass --classes or --text-embed\n");
-        return 1;
-    }
+    const bool supply_text = meta.has_text_input && (!wc.empty() || text_nc > 0);
+    sopts.world_nc = supply_text ? (wc.empty() ? text_nc : (int)wc.size()) : 0;
     SessionPtr session(yolo::create_session(model_path, sopts), yolo::free_session);
     yolo::Session* s = session.get();
     if (!s) return 1;
@@ -808,36 +856,49 @@ int cmd_bench(const Args& args) {
     std::string world_text_source;
     // Text setup is outside the timed per-frame loop: the vocabulary is set
     // once per session and remains constant for every measured frame.
-    if (s->text_input) {
+    if (!supply_text) {
+        world_text_source = "builtin";
+    } else {
         std::vector<float> text_embed((size_t)s->world_nc * clip::EMBED_DIM, 0.0f);
         if (!world_text_embed.empty()) {
             std::vector<int32_t> dims = {s->world_nc, clip::EMBED_DIM};
-            if (!read_f32(world_text_embed.c_str(), "YTXT0001", dims, text_embed) ||
+            if (!read_f32(world_text_embed.c_str(), "YTXT0002", dims, text_embed) ||
                 dims[0] != s->world_nc || dims[1] != clip::EMBED_DIM) {
-                fprintf(stderr, "--text-embed must be [nc=%d, 512] YTXT0001 f32 blob\n", s->world_nc);
+                fprintf(stderr, "--text-embed must be [nc=%d, 512] YTXT0002 f32 blob\n", s->world_nc);
                 return 1;
             }
             world_text_source = "ytxt";
         } else {
-            if (!s->model.meta.text_model.empty()) {
-                fprintf(stderr,
-                        "YOLOE bench requires a post-reprta MobileCLIP YTXT file; "
-                        "generate it with scripts/encode_mobileclip_text.py --detector <yoloe.pt>\n");
-                return 1;
-            }
 #if defined(YOLO_GGML_CLIP) && YOLO_GGML_CLIP
-        std::string clip_model = arg_s(args, "clip-model", "models/gguf/clip-ViT-B-32.gguf");
-        clip::ClipSession* cs = clip::clip_create_session(clip_model);
-        if (!cs) return 1;
-        for (int i = 0; i < s->world_nc; i++) {
-            if (!clip::clip_encode_string(cs, wc[i].c_str(),
-                                          text_embed.data() + (size_t)i * clip::EMBED_DIM)) {
-                clip::clip_free_session(cs);
-                return 1;
+        if (!s->model.meta.text_model.empty()) {
+            // YOLOE: MobileCLIP tower encodes --classes; reprta runs inside the
+            // detector graph (v4), so the raw feature is the graph text input.
+            std::string tm = arg_s(args, "text-model", "models/gguf/mobileclip2_b-f16.gguf");
+            mobileclip::MobileclipSession* ms = mobileclip::mobileclip_create_session(tm);
+            if (!ms) return 1;
+            for (int i = 0; i < s->world_nc; i++) {
+                if (!mobileclip::mobileclip_encode_string(ms, wc[i].c_str(),
+                                                          text_embed.data() + (size_t)i * clip::EMBED_DIM)) {
+                    mobileclip::mobileclip_free_session(ms);
+                    return 1;
+                }
             }
+            mobileclip::mobileclip_free_session(ms);
+            world_text_source = "mobileclip";
+        } else {
+            std::string clip_model = arg_s(args, "clip-model", "models/gguf/clip-ViT-B-32-f16.gguf");
+            clip::ClipSession* cs = clip::clip_create_session(clip_model);
+            if (!cs) return 1;
+            for (int i = 0; i < s->world_nc; i++) {
+                if (!clip::clip_encode_string(cs, wc[i].c_str(),
+                                              text_embed.data() + (size_t)i * clip::EMBED_DIM)) {
+                    clip::clip_free_session(cs);
+                    return 1;
+                }
+            }
+            clip::clip_free_session(cs);
+            world_text_source = "clip";
         }
-        clip::clip_free_session(cs);
-        world_text_source = "clip";
 #else
         (void)wc;
         fprintf(stderr, "world bench requires YOLO_GGML_CLIP\n");

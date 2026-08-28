@@ -163,7 +163,7 @@ set(YOLOGGML_SOURCES
 )
 
 if(YOLO_GGML_CLIP)
-    list(APPEND YOLOGGML_SOURCES src/clip_graph.cpp)
+    list(APPEND YOLOGGML_SOURCES src/clip_graph.cpp src/mobileclip_graph.cpp)
 endif()
 
 if(YOLO_GGML_SHARED)

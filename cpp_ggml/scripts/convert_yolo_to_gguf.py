@@ -20,6 +20,11 @@ Every op is stored as GGUF metadata keys `op.{i}.*` with weights stored as
 tensors named `op.{i}.w` / `op.{i}.b` etc., so the C++ side is fully
 metadata-driven — no per-architecture hardcoding.
 
+YOLOE heads additionally embed their checkpoint-specific ``reprta`` SwiGLU
+residual (``reprta_w12_*`` / ``reprta_w3_*`` tensors on the world op): the
+runtime text input is the L2-normalised pre-reprta MobileCLIP feature, and the
+graph applies reprta + L2 itself before scoring (v4).
+
 Quantization rules (q8_0): a conv / dwconv weight [out, in*kh*kw] is quantized
 to Q8_0 only when (in*kh*kw) % 32 == 0; everything else stays F16. Biases and
 the DFL projection stay F32 in all modes.
@@ -48,7 +53,8 @@ if (REPO_ROOT / "ultralytics").is_dir():
 
 from ultralytics import YOLO
 
-OP_GRAPH_VERSION = 3  # v3 adds text-conditioned World/YOLOE task heads.
+OP_GRAPH_VERSION = 4  # v4: YOLOE text input is pre-reprta; the head applies reprta itself.
+EMBED_DIM = 512  # CLIP ViT-B/32 text width; YOLO-World offline vocabulary row size
 CPP_ROOT = Path(__file__).resolve().parent.parent
 PYTORCH_MODELS = CPP_ROOT / "models" / "pytorch"
 GGUF_MODELS = CPP_ROOT / "models" / "gguf"
@@ -72,6 +78,7 @@ class GraphBuilder:
 
     def __init__(self):
         self.ops: list[Op] = []
+        self.reprta_tensors: dict = {}  # YOLOE reprta weights, merged into the world head op
 
     def add(self, op: Op) -> int:
         self.ops.append(op)
@@ -272,7 +279,9 @@ class GraphBuilder:
         op.tensors["proj_b"] = m.proj.bias.detach().cpu().float().numpy()
         return self.add(op)
 
-    def emit_world_detect(self, m: nn.Module, layer_outputs: list[int], text_in: int, op_type: str = "world_detect") -> int:
+    def emit_world_detect(
+        self, m: nn.Module, layer_outputs: list[int], text_in: int, op_type: str = "world_detect"
+    ) -> int:
         """WorldDetect: box stacks (cv2) + embedding stacks (cv3) + ContrastiveHead (cv4).
 
         Each level contributes [box, embed] op inputs; the C++ side computes
@@ -290,8 +299,15 @@ class GraphBuilder:
         uses_bn_contrastive = all(hasattr(cv4, "norm") for cv4 in cv4_list)
         if not uses_bn_contrastive and any(hasattr(cv4, "norm") for cv4 in cv4_list):
             raise TypeError("mixed BN and L2 contrastive heads are not supported")
-        op = Op(op_type, feats, text_in=text_in, reg_max=m.reg_max, bn_contrastive=int(uses_bn_contrastive),
-                end2end=int(m.end2end), max_det=getattr(m, "max_det", 300))
+        op = Op(
+            op_type,
+            feats,
+            text_in=text_in,
+            reg_max=m.reg_max,
+            bn_contrastive=int(uses_bn_contrastive),
+            end2end=int(m.end2end),
+            max_det=getattr(m, "max_det", 300),
+        )
         if m.reg_max > 1:
             op.tensors["dfl_w"] = m.dfl.conv.weight.detach().cpu().float().numpy()
         for i, cv4 in enumerate(cv4_list):
@@ -322,6 +338,71 @@ class GraphBuilder:
         op_def.inputs = feats + [proto]
         op_def.params.update(nm=int(m.nm), has_masks=1)
         return op_index
+
+    def emit_prompt_free_classifier(self, head: nn.Module, idx: int) -> int:
+        """Emit an LRPC ``loc``/``vocab`` layer as a ``linear`` (matmul) op.
+
+        set_vocab() moved the final box and vocabulary rows out of the cv2/cv3 stacks
+        into ``lrpc[i]``, so the surviving stacks stop short and these layers supply the
+        trailing 4*reg_max box or nc vocabulary channels. ``vocab`` is a Linear on the
+        gated levels and stays a 1x1 Conv2d on the last level; both are 1x1 pointwise
+        maps, i.e. matmuls over channels, so they lower to one shared ``linear`` op
+        instead of a convolution. That matters at nc=4585: ggml-cuda's IGEMM conv path
+        refuses output channels that are not 8-aligned and reserves extra per-plan
+        buffers, while ``mul_mat`` is the fast path for a wide classifier.
+        """
+        if isinstance(head, nn.Linear):
+            w = head.weight.detach().cpu().float().numpy()  # [out, in]
+            b = None if head.bias is None else head.bias.detach().cpu().float().numpy()
+            out_features = int(w.shape[0])
+        else:
+            assert isinstance(head, nn.Conv2d) and head.kernel_size == (1, 1) and head.groups == 1
+            w = head.weight.detach().cpu().float().numpy().reshape(head.out_channels, head.in_channels)
+            b = None if head.bias is None else head.bias.detach().cpu().float().numpy()
+            out_features = int(head.out_channels)
+        op = Op("linear", [idx], out=out_features)
+        op.tensors["w"] = np.ascontiguousarray(w)
+        if b is not None:
+            op.tensors["b"] = b
+        return self.add(op)
+
+    def emit_pf_segment(self, m: nn.Module, layer_outputs: list[int]) -> int:
+        """Prompt-free YOLOE: a fixed-vocabulary segment head that needs no text input.
+
+        The checkpoint bakes its vocabulary into ``lrpc[i].vocab`` (nc rows) instead of
+        scoring embeddings against a runtime text tensor, so this lowers to the standard
+        ``segment`` op the engine already decodes and the model becomes self-contained.
+        LRPC's proposal filter only drops anchors under 0.001 objectness, which is far
+        looser than any deployment conf, so decoding every anchor reproduces the same
+        boxes while costing the full nc-wide classifier read.
+        """
+        # Mirror YOLOESegment.forward_lrpc's branch choice: it prefers the one-to-one
+        # stacks whenever the head is end-to-end. Only cv2/cv3/cv4 are nulled by fuse(),
+        # so cv5 stays alive on both branches and a None check alone would grab the wrong
+        # one here.
+        cv2_list = m.one2one_cv2 if m.end2end or m.cv2 is None else m.cv2
+        cv3_list = m.one2one_cv3 if m.end2end or m.cv3 is None else m.cv3
+        cv5_list = m.one2one_cv5 if m.end2end or m.cv5 is None else m.cv5
+        nc = int(m.lrpc[0].vocab.weight.shape[0])
+        feats = []
+        for i, src in enumerate(layer_outputs):
+            box = self.emit_prompt_free_classifier(m.lrpc[i].loc, self.emit_sequential(cv2_list[i], src))
+            cls = self.emit_prompt_free_classifier(m.lrpc[i].vocab, self.emit_sequential(cv3_list[i], src))
+            mc = self.emit_sequential(cv5_list[i], src)
+            feats.append(self.add(Op("concat", [box, cls, mc])))
+        proto = self.emit_proto(m.proto, layer_outputs)
+        op = Op(
+            "segment",
+            feats + [proto],
+            reg_max=m.reg_max,
+            nc=nc,
+            nm=int(m.nm),
+            end2end=int(m.end2end),
+            max_det=getattr(m, "max_det", 300),
+        )
+        if m.reg_max > 1:
+            op.tensors["dfl_w"] = m.dfl.conv.weight.detach().cpu().float().numpy()
+        return self.add(op)
 
     def emit_c2psa(self, m: nn.Module, idx: int) -> int:
         h = self.emit_conv_module(m.cv1, idx)
@@ -381,8 +462,15 @@ class GraphBuilder:
             mc = self.emit_sequential(cv4_list[i], src)
             feats.append(self.add(Op("concat", [box, cls, mc])))
         proto = self.emit_proto(m.proto, layer_outputs)
-        op = Op("segment", feats + [proto], reg_max=m.reg_max, nc=m.nc, nm=m.nm,
-                end2end=int(m.end2end), max_det=getattr(m, "max_det", 300))
+        op = Op(
+            "segment",
+            feats + [proto],
+            reg_max=m.reg_max,
+            nc=m.nc,
+            nm=m.nm,
+            end2end=int(m.end2end),
+            max_det=getattr(m, "max_det", 300),
+        )
         if m.reg_max > 1:
             op.tensors["dfl_w"] = m.dfl.conv.weight.detach().cpu().float().numpy()  # [1, reg_max, 1, 1]
         return self.add(op)
@@ -418,8 +506,16 @@ class GraphBuilder:
             cls = self.emit_sequential(cv3_list[i], src)
             kpt = self.emit_conv2d(kpts_list[i], self.emit_sequential(cv4_list[i], src), "none")
             feats.append(self.add(Op("concat", [box, cls, kpt])))
-        op = Op("pose", feats, reg_max=m.reg_max, nc=m.nc, nk=m.nk, kpt_ndim=m.kpt_shape[1],
-                end2end=int(m.end2end), max_det=getattr(m, "max_det", 300))
+        op = Op(
+            "pose",
+            feats,
+            reg_max=m.reg_max,
+            nc=m.nc,
+            nk=m.nk,
+            kpt_ndim=m.kpt_shape[1],
+            end2end=int(m.end2end),
+            max_det=getattr(m, "max_det", 300),
+        )
         if m.reg_max > 1:
             op.tensors["dfl_w"] = m.dfl.conv.weight.detach().cpu().float().numpy()
         return self.add(op)
@@ -435,8 +531,15 @@ class GraphBuilder:
             cls = self.emit_sequential(cv3_list[i], src)
             ang = self.emit_sequential(cv4_list[i], src)
             feats.append(self.add(Op("concat", [box, cls, ang])))
-        op = Op("obb", feats, reg_max=m.reg_max, nc=m.nc, ne=m.ne,
-                end2end=int(m.end2end), max_det=getattr(m, "max_det", 300))
+        op = Op(
+            "obb",
+            feats,
+            reg_max=m.reg_max,
+            nc=m.nc,
+            ne=m.ne,
+            end2end=int(m.end2end),
+            max_det=getattr(m, "max_det", 300),
+        )
         if m.reg_max > 1:
             op.tensors["dfl_w"] = m.dfl.conv.weight.detach().cpu().float().numpy()
         return self.add(op)
@@ -466,8 +569,17 @@ class GraphBuilder:
         from ultralytics.nn.modules import C2PSA, SPPF, C2f, C3k2, Concat
         from ultralytics.nn.modules.block import C2fAttn, ImagePoolingAttn
         from ultralytics.nn.modules.head import (
-            Classify, Depth, Detect, OBB26, Pose26, Segment, SemanticSegment, WorldDetect, YOLOEDetect, YOLOESegment,
-            YOLOESegment26
+            OBB26,
+            Classify,
+            Depth,
+            Detect,
+            Pose26,
+            Segment,
+            SemanticSegment,
+            WorldDetect,
+            YOLOEDetect,
+            YOLOESegment,
+            YOLOESegment26,
         )
 
         seq = model.model  # nn.Sequential of layers
@@ -478,12 +590,17 @@ class GraphBuilder:
             i = len(save_idx)
             f = layer.f  # from: -1 = previous layer, int index, or list (Detect)
             src = -1 if i == 0 else (save_idx[i - 1] if f == -1 else (None if isinstance(f, list) else save_idx[f]))
-            if isinstance(layer, WorldDetect) or isinstance(layer, YOLOEDetect):
+            if isinstance(layer, YOLOEDetect) and hasattr(layer, "lrpc"):
+                # Prompt-free YOLOE carries its own vocabulary, so it is a segment head.
+                idx = self.emit_pf_segment(layer, [save_idx[j] for j in f])
+            elif isinstance(layer, (WorldDetect, YOLOEDetect)):
                 # torch: WorldDetect always sees the pre-attention (ori) text.
                 if isinstance(layer, (YOLOESegment, YOLOESegment26)):
                     idx = self.emit_world_segment(layer, [save_idx[j] for j in f], -1)
                 else:
                     idx = self.emit_world_detect(layer, [save_idx[j] for j in f], -1)
+                if self.reprta_tensors:
+                    self.ops[idx].tensors.update(self.reprta_tensors)
             elif isinstance(layer, Segment):
                 idx = self.emit_segment(layer, [save_idx[j] for j in f])
             elif isinstance(layer, Pose26):
@@ -559,6 +676,11 @@ def write_gguf(path: str, name: str, builder: GraphBuilder, meta: dict, dtype: s
     writer.add_uint32("yolo.world", int(meta.get("world", 0)))
     if meta.get("text_model"):
         writer.add_string("yolo.text_model", str(meta["text_model"]))
+    if meta.get("vocab_txt") is not None:
+        # YOLO-World offline vocabulary: flattened [nc, EMBED_DIM] row-major f32,
+        # the same layout as a YTXT0001/YTXT0002 blob. Lets the runtime detect with no text
+        # encoder, as the Python API does before set_classes is ever called.
+        writer.add_array("yolo.vocab_txt", meta["vocab_txt"].tolist())
 
     writer.add_uint32("yolo.op.count", len(builder.ops))
     for i, op in enumerate(builder.ops):
@@ -626,6 +748,9 @@ def convert(model_path: str, dtype: str, output: str, opmap: str | None = None) 
 
     is_world = isinstance(model, WorldModel)
     is_yoloe = isinstance(model, YOLOEModel)
+    # A prompt-free YOLOE head scores against a checkpoint-baked vocabulary table, so it
+    # takes no text input at all; it is only "world" in name.
+    is_yoloe_pf = is_yoloe and hasattr(model.model[-1], "lrpc")
 
     # One dummy forward so Detect.stride / .names settle (lazy init on load).
     with torch.no_grad():
@@ -639,6 +764,18 @@ def convert(model_path: str, dtype: str, output: str, opmap: str | None = None) 
     )
 
     builder = GraphBuilder()
+    rt = getattr(head, "reprta", None)
+    if is_yoloe and not is_yoloe_pf and hasattr(rt, "m"):
+        # reprta = Residual(SwiGLUFFN) survives fuse() (only fuse(txt_feats) deletes
+        # it), so embed its checkpoint-specific weights on the world head op: the
+        # graph text input becomes the normalised pre-reprta MobileCLIP feature.
+        ffn = rt.m
+        builder.reprta_tensors = {
+            "reprta_w12_w": np.ascontiguousarray(ffn.w12.weight.detach().cpu().float().numpy()),
+            "reprta_w12_b": ffn.w12.bias.detach().cpu().float().numpy(),
+            "reprta_w3_w": np.ascontiguousarray(ffn.w3.weight.detach().cpu().float().numpy()),
+            "reprta_w3_b": ffn.w3.bias.detach().cpu().float().numpy(),
+        }
     builder.build(model)
 
     if task == "classify":
@@ -659,9 +796,15 @@ def convert(model_path: str, dtype: str, output: str, opmap: str | None = None) 
         "imgsz": imgsz,
         "strides": [float(s) for s in stride.tolist()],
         "names": yolo.names if hasattr(yolo, "names") else model.names,
-        "world": 1 if is_world or is_yoloe else 0,
-        "text_model": getattr(model, "text_model", "") if is_yoloe else "",
+        "world": 1 if is_world or (is_yoloe and not is_yoloe_pf) else 0,
+        "text_model": getattr(model, "text_model", "") if is_yoloe and not is_yoloe_pf else "",
     }
+    if is_world:
+        # WorldModel.txt_feats is exactly what ultralytics feeds the head when
+        # set_classes was never called, so copy the checkpoint values verbatim.
+        txt = getattr(model, "txt_feats", None)
+        if txt is not None and tuple(txt.shape[1:]) == (nc, EMBED_DIM):
+            meta["vocab_txt"] = txt.detach().cpu().float().reshape(-1).numpy()
     Path(output).parent.mkdir(parents=True, exist_ok=True)
     write_gguf(output, Path(model_path).stem, builder, meta, dtype)
     if opmap:

@@ -91,7 +91,7 @@ std::unique_ptr<ModelDef> load_gguf(const std::string& path) {
     // ---- metadata ----
     parse_meta(g, model->meta);
     const int64_t graph_version = key_or(g, "yolo.op_graph_version", 0);
-    if (graph_version < 1 || graph_version > 3) {
+    if (graph_version < 1 || graph_version > 4) {
         YOLO_LOG_ERROR("unsupported yolo.op_graph_version: %lld", (long long)graph_version);
         gguf_free(g);
         ggml_free(weight_ctx);
@@ -240,6 +240,12 @@ std::unique_ptr<ModelDef> load_gguf(const std::string& path) {
         ht.data.resize(ggml_nbytes(cur));
         memcpy(ht.data.data(), cur->data, ggml_nbytes(cur));
         model->tensors[name] = std::move(ht);
+    }
+
+    if (int64_t id = gguf_find_key(g, "yolo.vocab_txt"); id >= 0) {
+        const size_t n = gguf_get_arr_n(g, id);
+        const float* p = (const float*)gguf_get_arr_data(g, id);
+        model->vocab_txt.assign(p, p + n);
     }
 
     YOLO_LOG_INFO("loaded %s: %lld ops, %lld tensors, dtype=%s, task=%s, nc=%d, nm=%d, nk=%d, ne=%d, end2end=%d",

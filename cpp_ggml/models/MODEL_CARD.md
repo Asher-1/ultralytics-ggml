@@ -1,7 +1,15 @@
 # YOLO ggml model card
 
 This directory is the single model store for the C++ integration. PyTorch checkpoints are conversion inputs; GGUF
-files are runtime artifacts. Both are ignored by Git and can be regenerated.
+files are runtime artifacts. Both are ignored by Git and can be regenerated — or downloaded prebuilt: every runtime
+GGUF (187 files: the 135 closed-set checkpoints, 13 YOLO-World, 30 YOLOE-26 incl. `-pf`, and the CLIP/MobileCLIP text
+towers with `.ref.npz` parity references) is published at
+[huggingface.co/Asher-1/yolo-gguf](https://huggingface.co/Asher-1/yolo-gguf):
+
+```bash
+pip install -U "huggingface_hub[cli]"
+huggingface-cli download Asher-1/yolo-gguf --local-dir models/gguf
+```
 
 ```text
 models/
@@ -30,7 +38,8 @@ models/
     ├── yolo26{n,s,m,l,x}-obb-{f32,f16,q8_0}.gguf
     ├── yolo26{n,s,m,l,x}-sem-{f32,f16,q8_0}.gguf
     ├── yolo26{n,s,m,l,x}-cls-{f32,f16,q8_0}.gguf
-    └── clip-ViT-B-32.gguf
+    ├── clip-ViT-B-32-{f32,f16,q8_0}.gguf
+    └── mobileclip2_b-{f32,f16,q8_0}.gguf
 ```
 
 Do not put checkpoints in `cpp_ggml/` or the repository root. The converter resolves model aliases against
@@ -53,34 +62,34 @@ All conversion, benchmark, parity, and rendering scripts resolve this canonical 
 
 ## Supported models
 
-| Model         | Task           | Default input | Recommended use                                      |
-| ------------- | -------------- | ------------: | ---------------------------------------------------- |
-| YOLOv8n       | detect         |           640 | Lowest detection latency and memory use              |
-| YOLOv8s       | detect         |           640 | Small edge deployments needing more capacity than n  |
-| YOLOv8m       | detect         |           640 | Balanced accuracy and compute                        |
-| YOLOv8l       | detect         |           640 | Accuracy-oriented GPU deployment                     |
-| YOLOv8x       | detect         |           640 | Highest-capacity YOLOv8 integration target           |
-| YOLO26n       | detect         |           640 | Lowest-latency end-to-end YOLO26 detector            |
-| YOLO26s       | detect         |           640 | Compact end-to-end detector                          |
-| YOLO26m       | detect         |           640 | Balanced end-to-end detector                         |
-| YOLO26l       | detect         |           640 | Accuracy-oriented end-to-end detector                |
-| YOLO26x       | detect         |           640 | Highest-capacity YOLO26 detection target             |
-| YOLOv8s-world .. YOLOv8x-world | detect (open-vocabulary) |          640 | Open-vocabulary detection with CLIP text embeddings (--classes, --text-embed) |
-| YOLOE-v8/11 s..l and YOLOE-26 n..x, `-seg` | open-vocabulary instance segment | 640 | MobileCLIP YTXT prepared for the exact YOLOE checkpoint |
-| YOLOv8n-seg .. YOLOv8x-seg | instance segment |   640 | YOLOv8 boxes + on-device instance masks        |
-| YOLO26n-seg .. YOLO26x-seg   | instance segment |   640 | YOLO26 boxes + on-device instance masks         |
-| YOLO26n-depth .. YOLO26x-depth | absolute depth |        768 | Monocular metric-depth preview and spatial reasoning |
-| YOLO26n-pose .. YOLO26x-pose    | keypoints      |          640 | COCO-17 person pose (RLE head), boxes + 17 keypoints |
-| YOLO26n-obb .. YOLO26x-obb      | oriented boxes |          640 | DOTA-15 rotated boxes (raw angle, no sigmoid)       |
-| YOLO26n-sem .. YOLO26x-sem      | semantic seg   |          640 | Cityscapes-19 dense per-pixel class map             |
-| YOLO26n-cls .. YOLO26x-cls      | classification |          224 | ImageNet-1000 logits (checkpoint-baked transforms)  |
-| CLIP ViT-B/32       | text + image encoder | 224x224 / 77 tokens | 512-d L2-normalised embeddings for semantic similarity search |
+| Model                                      | Task                             |       Default input | Recommended use                                                               |
+| ------------------------------------------ | -------------------------------- | ------------------: | ----------------------------------------------------------------------------- |
+| YOLOv8n                                    | detect                           |                 640 | Lowest detection latency and memory use                                       |
+| YOLOv8s                                    | detect                           |                 640 | Small edge deployments needing more capacity than n                           |
+| YOLOv8m                                    | detect                           |                 640 | Balanced accuracy and compute                                                 |
+| YOLOv8l                                    | detect                           |                 640 | Accuracy-oriented GPU deployment                                              |
+| YOLOv8x                                    | detect                           |                 640 | Highest-capacity YOLOv8 integration target                                    |
+| YOLO26n                                    | detect                           |                 640 | Lowest-latency end-to-end YOLO26 detector                                     |
+| YOLO26s                                    | detect                           |                 640 | Compact end-to-end detector                                                   |
+| YOLO26m                                    | detect                           |                 640 | Balanced end-to-end detector                                                  |
+| YOLO26l                                    | detect                           |                 640 | Accuracy-oriented end-to-end detector                                         |
+| YOLO26x                                    | detect                           |                 640 | Highest-capacity YOLO26 detection target                                      |
+| YOLOv8s-world .. YOLOv8x-world             | detect (open-vocabulary)         |                 640 | Open-vocabulary detection with CLIP text embeddings (--classes, --text-embed) |
+| YOLOE-v8/11 s..l and YOLOE-26 n..x, `-seg` | open-vocabulary instance segment |                 640 | Plaintext --classes via native MobileCLIP GGUF, or a YTXT0002 blob            |
+| YOLOv8n-seg .. YOLOv8x-seg                 | instance segment                 |                 640 | YOLOv8 boxes + on-device instance masks                                       |
+| YOLO26n-seg .. YOLO26x-seg                 | instance segment                 |                 640 | YOLO26 boxes + on-device instance masks                                       |
+| YOLO26n-depth .. YOLO26x-depth             | absolute depth                   |                 768 | Monocular metric-depth preview and spatial reasoning                          |
+| YOLO26n-pose .. YOLO26x-pose               | keypoints                        |                 640 | COCO-17 person pose (RLE head), boxes + 17 keypoints                          |
+| YOLO26n-obb .. YOLO26x-obb                 | oriented boxes                   |                 640 | DOTA-15 rotated boxes (raw angle, no sigmoid)                                 |
+| YOLO26n-sem .. YOLO26x-sem                 | semantic seg                     |                 640 | Cityscapes-19 dense per-pixel class map                                       |
+| YOLO26n-cls .. YOLO26x-cls                 | classification                   |                 224 | ImageNet-1000 logits (checkpoint-baked transforms)                            |
+| CLIP ViT-B/32                              | text + image encoder             | 224x224 / 77 tokens | 512-d L2-normalised embeddings for semantic similarity search                 |
 
 Detection models use COCO's 80 classes. YOLO26 detection checkpoints use the end-to-end head exported by the local
 Ultralytics checkout. YOLO-World detection models are open-vocabulary: they accept a class list at runtime
-(--classes) or a precomputed text embedding blob (--text-embed). The CLIP model (clip-ViT-B-32.gguf) is
+(--classes) or a precomputed text embedding blob (--text-embed). The CLIP model (clip-ViT-B-32-f16.gguf by default) is
 used to encode class text when --classes is provided without --text-embed; it can also be used independently
-for image/text similarity via the similarity subcommand (--model clip-ViT-B-32.gguf --source img.jpg).
+for image/text similarity via the similarity subcommand (--model clip-ViT-B-32-f16.gguf --source img.jpg).
 Segmentation models additionally emit 32 mask prototypes at one-quarter resolution and compose
 instance masks on device. Depth models produce one floating-point distance in meters per source pixel. Pose models
 emit one box plus 17 COCO keypoints (x, y, visibility) per person; OBB models emit rotated boxes in the DOTA-15 class
@@ -88,11 +97,11 @@ set; semantic models emit an argmax class map on the Cityscapes-19 class set; cl
 softmax probabilities. The five YOLO26 scales (n/s/m/l/x) share one graph per task; scale changes tensor shapes, not
 the public CLI or GGUF contract.
 
-YOLOE models use MobileCLIP plus the detector checkpoint's `reprta` block before
-the `[nc, 512]` text tensor is consumed. Generate this detector-specific YTXT
-with `scripts/encode_mobileclip_text.py --detector models/pytorch/yoloe-26n-seg.pt`;
-the runtime rejects `--classes` without `--text-embed` for YOLOE so it cannot
-mistake a ViT-B/32 CLIP vector for a MobileCLIP vector.
+YOLOE models consume the raw L2-normalised MobileCLIP feature: the checkpoint's
+`reprta` block is embedded in the GGUF graph (op-graph v4). Pass `--classes` and
+the runtime encodes plaintext end to end with the native MobileCLIP GGUF tower
+(`mobileclip2_b-{f32,f16,q8_0}.gguf`, `--text-model`); or precompute a checkpoint-agnostic
+`YTXT0002` blob with `scripts/encode_mobileclip_text.py` and pass `--text-embed`.
 
 ### YOLOv8 detector family
 
@@ -109,12 +118,12 @@ contract.
 
 **YOLOv8{s,m,l,x}-world** extend YOLOv8 detection with a CLIP text-embedding branch, enabling open-vocabulary
 detection at runtime. Use --classes "person,bus,car" to set the class list; the CLI loads the CLIP text encoder
-(clip-ViT-B-32.gguf) and encodes each class name into a 512-d L2-normalised embedding. The text tensors are fed
+(clip-ViT-B-32-f16.gguf) and encodes each class name into a 512-d L2-normalised embedding. The text tensors are fed
 through C2fAttn and ImagePoolingAttn layers that attend image features to the class labels, then a ContrastiveHead
 produces per-anchor class scores on the (L2-normalised) similarity between text and image embeddings.
 
 For batch inference or to reuse precomputed embeddings, pass --text-embed file.bin with a [nc, 512] row-major F32
-blob (YTXT0001 format). When both --classes and --text-embed are provided, the class counts must agree.
+blob (YTXT0002 format). When both --classes and --text-embed are provided, the class counts must agree.
 
 Example:
 
@@ -141,19 +150,20 @@ rather than inferring dataset accuracy from the qualitative grid.
 
 ### CLIP text+image encoder
 
-**CLIP ViT-B/32** (clip-ViT-B-32.gguf) provides 512-d L2-normalised text and image embeddings. The text encoder
+**CLIP ViT-B/32** (clip-ViT-B-32-{f32,f16,q8_0}.gguf) provides 512-d L2-normalised text and image embeddings. The text encoder
 accepts up to 77 BPE-tokenised class/phrase inputs; the image encoder processes 224×224 RGB images through a
 12-layer ViT. The model is used internally by YOLO-World for on-the-fly text encoding, or standalone for semantic
 similarity tasks.
 
 Integration parity:
-- Text encoding cosine similarity against PyTorch: **1.0000000** ("a photo of a bus", ref in clip-ViT-B-32.ref.npz)
+
+- Text encoding cosine similarity against PyTorch: **1.0000000** ("a photo of a bus", ref in clip-ViT-B-32-f16.ref.npz)
 - Image encoding cosine similarity against PyTorch: **0.99994** (bus.jpg, same bilinear preprocessing as C++)
 
 Use with the similarity subcommand:
 
 ```bash
-yolo-cli similarity --model models/gguf/clip-ViT-B-32.gguf --source image.jpg --text "a bus on the street"
+yolo-cli similarity --model models/gguf/clip-ViT-B-32-f16.gguf --source image.jpg --text "a bus on the street"
 ```
 
 ![CLIP Validation](../benchmarks/clip_validation.png)
@@ -228,10 +238,10 @@ dataset before production deployment.
 
 ## Runtime support
 
-| Backend | F32 | F16 | Q8_0 | Status                                                               |
-| ------- | --- | --- | ---- | -------------------------------------------------------------------- |
-| CPU     | yes | yes | yes  | Closed-set 405-key matrix measured; World is vocabulary-dependent |
-| CUDA    | yes | yes | yes  | Closed-set matrix measured; fixed-YTXT World CUDA F32 raw parity passes |
+| Backend | F32 | F16 | Q8_0 | Status                                                                        |
+| ------- | --- | --- | ---- | ----------------------------------------------------------------------------- |
+| CPU     | yes | yes | yes  | Closed-set 405-key matrix measured; World is vocabulary-dependent             |
+| CUDA    | yes | yes | yes  | Closed-set matrix measured; fixed-YTXT World CUDA F32 raw parity passes       |
 | Vulkan  | yes | yes | yes  | Closed-set matrix measured; World requires its own declared-vocabulary report |
 
 The [benchmark and parity report](../benchmarks/README.md) covers the 45 closed-set checkpoints
@@ -245,19 +255,19 @@ precisions; validate dataset accuracy on the target dataset before production de
 
 Measured on the documented machine (RTX 3060 + CPU, bus.jpg; see `benchmarks/README.md` for the exact protocol):
 
-| Chart | What it shows |
-| ----- | ------------- |
-| [speed_by_model.png](../benchmarks/speed_by_model.png) | Detect-family end-to-end latency: YOLOv8 + YOLO26, all scales, PyTorch vs ggml CUDA/Vulkan/CPU |
-| [latency_by_backend.png](../benchmarks/latency_by_backend.png) | F16 detection latency grouped by backend |
-| [latency_matrix.png](../benchmarks/latency_matrix.png) | Full heat matrix: all 45 checkpoints x 3 backends x 3 precisions |
-| [task_latency.png](../benchmarks/task_latency.png) | Seven closed-set task families (detect/segment/depth/pose/obb/semantic/classify) vs PyTorch |
-| [depth_latency.png](../benchmarks/depth_latency.png) | YOLO26 depth family by backend and precision (768 input) |
-| [seg_latency.png](../benchmarks/seg_latency.png) | Segmentation families by scale vs PyTorch |
-| [speedup_table.md](../benchmarks/speedup_table.md) | Per-model speedup over the PyTorch CUDA reference |
-| [world_parity_bus_zidane.png](../benchmarks/world_parity_bus_zidane.png) | YOLOv8s-World open-vocabulary detection, PyTorch vs ggml CPU |
-| [clip_validation.png](../benchmarks/clip_validation.png) | CLIP ViT-B/32 C++ vs PyTorch embedding cosine + per-dim overlay |
-| [clip_architecture.png](../benchmarks/clip_architecture.png) | CLIP text/image encoder architecture in pure GGML ops |
-| [model_family_overview.png](../benchmarks/model_family_overview.png) | Visual inference results across all model families |
+| Chart                                                                    | What it shows                                                                                  |
+| ------------------------------------------------------------------------ | ---------------------------------------------------------------------------------------------- |
+| [speed_by_model.png](../benchmarks/speed_by_model.png)                   | Detect-family end-to-end latency: YOLOv8 + YOLO26, all scales, PyTorch vs ggml CUDA/Vulkan/CPU |
+| [latency_by_backend.png](../benchmarks/latency_by_backend.png)           | F16 detection latency grouped by backend                                                       |
+| [latency_matrix.png](../benchmarks/latency_matrix.png)                   | Full heat matrix: all 45 checkpoints x 3 backends x 3 precisions                               |
+| [task_latency.png](../benchmarks/task_latency.png)                       | Seven closed-set task families (detect/segment/depth/pose/obb/semantic/classify) vs PyTorch    |
+| [depth_latency.png](../benchmarks/depth_latency.png)                     | YOLO26 depth family by backend and precision (768 input)                                       |
+| [seg_latency.png](../benchmarks/seg_latency.png)                         | Segmentation families by scale vs PyTorch                                                      |
+| [speedup_table.md](../benchmarks/speedup_table.md)                       | Per-model speedup over the PyTorch CUDA reference                                              |
+| [world_parity_bus_zidane.png](../benchmarks/world_parity_bus_zidane.png) | YOLOv8s-World open-vocabulary detection, PyTorch vs ggml CPU                                   |
+| [clip_validation.png](../benchmarks/clip_validation.png)                 | CLIP ViT-B/32 C++ vs PyTorch embedding cosine + per-dim overlay                                |
+| [clip_architecture.png](../benchmarks/clip_architecture.png)             | CLIP text/image encoder architecture in pure GGML ops                                          |
+| [model_family_overview.png](../benchmarks/model_family_overview.png)     | Visual inference results across all model families                                             |
 
 World timing is not included in this table until all rows name the exact vocabulary and text-embedding source. Its
 CPU attention path remains slower than GPU paths; treat existing legacy numbers as diagnostic only.

@@ -1,4 +1,4 @@
-"""Regenerate clip-ViT-B-32.ref.npz.
+"""Regenerate clip-ViT-B-32-f16.ref.npz.
 
 The image tensor is preprocessed with EXACTLY the same bilinear short-edge
 resize + center-crop pipeline as the C++ side (clip_preprocess_image in
@@ -10,7 +10,7 @@ Usage:
     python scripts/gen_clip_ref.py [--image PATH] [--out PATH] [--text TEXT]
 
 Paths default to repo-relative locations: the ultralytics assets bus.jpg and
-cpp_ggml/models/gguf/clip-ViT-B-32.ref.npz, discovered from this script's
+cpp_ggml/models/gguf/clip-ViT-B-32-f16.ref.npz, discovered from this script's
 location (works from any cwd).
 """
 import argparse
@@ -19,9 +19,9 @@ import numpy as np, torch, sys, cv2
 
 REPO_ROOT = Path(__file__).resolve().parents[2]
 DEFAULT_IMAGE = REPO_ROOT / "ultralytics" / "assets" / "bus.jpg"
-DEFAULT_OUT = Path(__file__).resolve().parent.parent / "models" / "gguf" / "clip-ViT-B-32.ref.npz"
+DEFAULT_OUT = Path(__file__).resolve().parent.parent / "models" / "gguf" / "clip-ViT-B-32-f16.ref.npz"
 
-ap = argparse.ArgumentParser(description="Regenerate clip-ViT-B-32.ref.npz")
+ap = argparse.ArgumentParser(description="Regenerate clip-ViT-B-32-f16.ref.npz")
 ap.add_argument("--image", default=str(DEFAULT_IMAGE), help="source image (default: ultralytics/assets/bus.jpg)")
 ap.add_argument("--out", default=str(DEFAULT_OUT), help="output .npz path")
 ap.add_argument("--text", default="a photo of a bus", help="reference text prompt")

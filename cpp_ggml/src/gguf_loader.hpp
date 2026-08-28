@@ -53,6 +53,9 @@ struct ModelDef {
     // YOLO-World: the graph consumes a runtime text-embedding input ([512, nc])
     // alongside the image. nc is fixed at session creation (set_classes).
     bool has_text_input = false;
+    // YOLO-World offline vocabulary carried by the checkpoint: row-major
+    // [nc, 512] f32, used as the text input when the caller sets none.
+    std::vector<float> vocab_txt;
 };
 
 // Read only the metadata header (cheap: no tensor data).

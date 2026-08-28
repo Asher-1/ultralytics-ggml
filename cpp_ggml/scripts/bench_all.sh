@@ -10,8 +10,9 @@
 # The default sweep covers the 45 closed-set checkpoints (detect, segment,
 # depth, pose, obb, semantic, classify x n/s/m/l/x, plus yolov8 detect/seg).
 # Open-vocabulary World must be requested explicitly with a fixed vocabulary.
-# YOLOE requires a different, detector-specific post-reprta YTXT for each
-# checkpoint and is therefore also explicit.
+# YOLOE takes a checkpoint-agnostic YTXT0002 blob (pre-reprta MobileCLIP
+# output; reprta runs inside the v4 graph) or plaintext --classes through the
+# native MobileCLIP tower, and is therefore also explicit.
 #
 # Usage: scripts/bench_all.sh BUILD_DIR [BACKEND_TAG] [models...]
 #   scripts/bench_all.sh build-cuda cuda
@@ -62,8 +63,10 @@ mkdir -p benchmarks
 OUT="${YOLO_BENCH_OUT:-benchmarks/bench.jsonl}"
 WORLD_OUT="${YOLO_BENCH_WORLD_OUT:-benchmarks/world.jsonl}"
 YOLOE_OUT="${YOLO_BENCH_YOLOE_OUT:-benchmarks/yoloe.jsonl}"
+YOLOE_PF_OUT="${YOLO_BENCH_YOLOE_PF_OUT:-benchmarks/yoloe_pf.jsonl}"
 WORLD_COUNT=0
 YOLOE_COUNT=0
+YOLOE_PF_COUNT=0
 echo "collecting ${#MODELS[@]} models x ${#DTYPES[@]} dtypes on $TAG -> $OUT"
 
 for m in "${MODELS[@]}"; do
@@ -80,9 +83,13 @@ for m in "${MODELS[@]}"; do
             if [[ -n "${YOLO_BENCH_WORLD_TEXT_EMBED:-}" ]]; then
                 args+=(--text-embed "$YOLO_BENCH_WORLD_TEXT_EMBED")
             fi
+        elif [[ "$m" == *-pf ]]; then
+            # Prompt-free YOLOE bakes its vocabulary into the checkpoint, so the bench
+            # takes no --classes/--text-embed and pays no text setup at all.
+            :
         elif [[ "$m" == yoloe-* ]]; then
             : "${YOLO_BENCH_YOLOE_CLASSES:?set a fixed comma-separated YOLOE vocabulary}"
-            : "${YOLO_BENCH_YOLOE_TEXT_EMBED_DIR:?set the directory holding per-model post-reprta YTXT files}"
+            : "${YOLO_BENCH_YOLOE_TEXT_EMBED_DIR:?set the directory holding per-model YTXT0002 files}"
             ytxt="$YOLO_BENCH_YOLOE_TEXT_EMBED_DIR/$m.ytxt"
             [[ -f "$ytxt" ]] || { echo "[fail] missing YOLOE YTXT: $ytxt" >&2; exit 1; }
             args+=(--classes "$YOLO_BENCH_YOLOE_CLASSES" --text-embed "$ytxt")
@@ -103,6 +110,9 @@ d['backend']=tag; print(json.dumps(d))" "$line" "$TAG")
         if [[ "$m" == *-world ]]; then
             echo "$line" >> "$WORLD_OUT"
             ((WORLD_COUNT += 1))
+        elif [[ "$m" == *-pf ]]; then
+            echo "$line" >> "$YOLOE_PF_OUT"
+            ((YOLOE_PF_COUNT += 1))
         elif [[ "$m" == yoloe-* ]]; then
             echo "$line" >> "$YOLOE_OUT"
             ((YOLOE_COUNT += 1))
@@ -120,4 +130,7 @@ if (( WORLD_COUNT )); then
 fi
 if (( YOLOE_COUNT )); then
     echo "      $(wc -l < "$YOLOE_OUT") YOLOE entries in $YOLOE_OUT"
+fi
+if (( YOLOE_PF_COUNT )); then
+    echo "      $(wc -l < "$YOLOE_PF_OUT") prompt-free YOLOE entries in $YOLOE_PF_OUT"
 fi

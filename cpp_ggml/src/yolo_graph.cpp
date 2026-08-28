@@ -105,11 +105,10 @@ struct GraphBuilder {
         } else
 #elif defined(YOLO_USE_CUDA)
         // CUDA has direct kernels for matching F32 and F16 tensors. Q8_0
-        // joins via the plan-time direct path below.
-        // The F32 direct kernel uses Ampere TF32 WMMA internally.  Keep the
-        // tensor-core path for F16, but route F32 through the standard ggml
-        // convolution/GEMM implementation to preserve the F32 reference.
-        const bool cuda_direct_types = direct_types && wT->type != GGML_TYPE_F32;
+        // joins via the plan-time direct path below. The F32 kernel runs
+        // Ampere TF32 WMMA (10-bit mantissa, F32 accumulate) - the same
+        // precision class as PyTorch's default cuDNN TF32 convolutions.
+        const bool cuda_direct_types = direct_types;
         if (!depthwise && cuda_direct_types && bias && silu) {
             return ggml_conv_2d_direct_bias_silu(gctx, wT, x, bias,
                                                  (int)op.ai("s", 0), (int)op.ai("s", 1),
@@ -515,6 +514,33 @@ struct GraphBuilder {
         }
         return out;  // [A, 4*rm + nc]
     }
+
+    // YOLOE v4: graph text input is the normalised pre-reprta MobileCLIP feature;
+    // apply the checkpoint's reprta residual (Residual(SwiGLUFFN)) so the head sees
+    // what torch's get_tpe produces. The trailing L2 normalise of get_tpe is free:
+    // world_detect L2-normalises its text input regardless.
+    ggml_tensor* reprta(const std::string& prefix, ggml_tensor* x) {
+        ggml_tensor* w12 = w(prefix, "reprta_w12_w");
+        ggml_tensor* b12 = w(prefix, "reprta_w12_b");
+        ggml_tensor* w3 = w(prefix, "reprta_w3_w");
+        ggml_tensor* b3 = w(prefix, "reprta_w3_b");
+        GGML_ASSERT(w12 && b12 && w3 && b3 && "YOLOE reprta tensors incomplete");
+        if (w12->type != GGML_TYPE_F32) w12 = ggml_cast(gctx, w12, GGML_TYPE_F32);
+        if (w3->type != GGML_TYPE_F32) w3 = ggml_cast(gctx, w3, GGML_TYPE_F32);
+        ggml_tensor* x12 = ggml_mul_mat(gctx, w12, x);  // [2*hidden, nc]
+        x12 = ggml_add(gctx, x12, ggml_reshape_2d(gctx, b12, b12->ne[0], 1));
+        const int64_t hh = x12->ne[0] / 2;
+        ggml_tensor* x1 = ggml_view_2d(gctx, x12, hh, x12->ne[1], x12->nb[1], 0);
+        ggml_tensor* x2 = ggml_view_2d(gctx, x12, hh, x12->ne[1], x12->nb[1], (size_t)hh * x12->nb[0]);
+        // ggml-cuda kernels reject strided views, so both SwiGLU halves must be made
+        // contiguous or the text tower falls back to CPU and syncs the graph every frame.
+        x1 = ggml_cont(gctx, x1);
+        x2 = ggml_cont(gctx, x2);
+        ggml_tensor* hidden = ggml_mul(gctx, ggml_silu(gctx, x1), x2);
+        ggml_tensor* y = ggml_mul_mat(gctx, w3, hidden);  // [512, nc]
+        y = ggml_add(gctx, y, ggml_reshape_2d(gctx, b3, b3->ne[0], 1));
+        return ggml_add(gctx, x, y);  // Residual: x + SwiGLUFFN(x)
+    }
 };
 
 }  // namespace
@@ -528,14 +554,6 @@ Session* create_session(const std::string& gguf_path, const SessionOptions& opts
     s->input_w = opts.input_w > 0 ? opts.input_w : s->model.meta.imgsz;
     s->input_h = opts.input_h > 0 ? opts.input_h : s->model.meta.imgsz;
     s->profile_gaps = opts.profile_gaps;
-    s->backend = init_backend_ctx(opts.threads);
-    if (!s->backend.cpu) {
-        free_session(s);
-        return nullptr;
-    }
-    if (opts.profile_ops) {
-        backend_enable_op_profile(s->backend);
-    }
 
     ModelMeta& meta = s->model.meta;
     // YOLO-World: the class count is a runtime knob (set_classes). It fixes
@@ -544,15 +562,45 @@ Session* create_session(const std::string& gguf_path, const SessionOptions& opts
     const int64_t world_nc = opts.world_nc > 0 ? opts.world_nc : meta.nc;
     s->world_nc = (int)world_nc;
     if (s->model.has_text_input) meta.nc = (int)world_nc;
+    // A text-conditioned head cannot run without a vocabulary. With no class list
+    // the caller means "use whatever the checkpoint shipped", mirroring the Python
+    // default of predicting before any set_classes call.
+    if (s->model.has_text_input && opts.world_nc <= 0) {
+        if (s->model.vocab_txt.size() != (size_t)world_nc * 512) {
+            YOLO_LOG_ERROR("no stored vocabulary for %zu classes: convert a checkpoint carrying "
+                           "txt_feats, or pass --classes / --text-embed", (size_t)world_nc);
+            free_session(s);
+            return nullptr;
+        }
+        s->text_pending = s->model.vocab_txt;
+    }
     // Per-anchor output channels: detect=4*rm+nc, segment=+nm, pose=+nk, obb=+ne.
     const int no = 4 * meta.reg_max + meta.nc + meta.nm + meta.nk + meta.ne;
+
+    // ggml node budget: every op expands to a few nodes, and a text-conditioned
+    // head adds one row view plus a 3-node max2 merge per class and reduction
+    // site. Measured 72..140 nodes per class across yolov8s/m/l/x-world at every
+    // dtype, so 256 bounds the shipped models. The scheduler hashes one entry per
+    // node and the graph context holds one tensor struct per slot, so both are
+    // sized from this number.
+    const size_t node_budget =
+        s->model.ops.size() * 12 + 512 + (s->model.has_text_input ? (size_t)world_nc * 256 : 0);
+
+    s->backend = init_backend_ctx(opts.threads, node_budget);
+    if (!s->backend.cpu) {
+        free_session(s);
+        return nullptr;
+    }
+    if (opts.profile_ops) {
+        backend_enable_op_profile(s->backend);
+    }
 
     // Weight context: tensor structs only; data goes to the backend buffer.
     s->wctx = ggml_init({(size_t)(s->model.tensors.size() * ggml_tensor_overhead() + 1024 * 1024),
                          nullptr, /*no_alloc*/ true});
 
     // Graph context: intermediate tensor structs (data lives in galloc/sched).
-    size_t g_size = (size_t)(s->model.ops.size() * 12 + 512) * ggml_tensor_overhead() + (32u << 20);
+    size_t g_size = node_budget * ggml_tensor_overhead() + (32u << 20);
     s->gctx = ggml_init({g_size, nullptr, /*no_alloc*/ true});
     if (!s->wctx || !s->gctx) {
         YOLO_LOG_ERROR("ggml context allocation failed");
@@ -595,6 +643,22 @@ Session* create_session(const std::string& gguf_path, const SessionOptions& opts
         }
 #endif
     }
+#if defined(YOLO_USE_CUDA)
+    // Match the converter's F16 policy exactly: narrow matrix/kernel tensors
+    // once on the host so CUDA uses the faster F16 tensor-core path. Keep all
+    // one-dimensional parameters F32; graph code consumes them as F32 and
+    // narrowing them would add a device cast on every inference.
+    if (meta.dtype == "f32") for (auto& [name, ht] : s->model.tensors) {
+        if (ht.type != GGML_TYPE_F32 || (ht.ne[1] == 1 && ht.ne[2] == 1 && ht.ne[3] == 1)) continue;
+        const int64_t n = ht.ne[0] * ht.ne[1] * ht.ne[2] * ht.ne[3];
+        std::vector<uint8_t> f16(n * sizeof(ggml_fp16_t));
+        const float * src = reinterpret_cast<const float *>(ht.data.data());
+        ggml_fp16_t * dst = reinterpret_cast<ggml_fp16_t *>(f16.data());
+        for (int64_t i = 0; i < n; ++i) dst[i] = ggml_fp32_to_fp16(src[i]);
+        ht.data = std::move(f16);
+        ht.type = GGML_TYPE_F16;
+    }
+#endif
     std::vector<ggml_tensor*> values(s->model.ops.size(), nullptr);
 
     // Debug aid: YOLO_STOP_OP=N truncates the graph at op N so a unified
@@ -618,23 +682,24 @@ Session* create_session(const std::string& gguf_path, const SessionOptions& opts
         ggml_set_input(s->text_input);
         ggml_set_name(s->text_input, "text");
         graph_text = s->text_input;
+        // v4 YOLOE: the reprta residual rides on the detect op; apply it to the
+        // text input before the dtype cast below.
+        if (s->model.detect_op_index >= 0) {
+            const std::string dp = "op." + std::to_string(s->model.detect_op_index);
+            if (s->model.tensors.count(dp + ".reprta_w12_w")) graph_text = gb.reprta(dp, graph_text);
+        }
     }
 
     ggml_tensor* graph_input = s->input;
 #if defined(YOLO_USE_CUDA)
-    // F32 is the numerical reference format. Do not silently lower it to F16
-    // on CUDA: its output is used for PyTorch parity. F16/Q8 deployment models
-    // retain the tensor-core input flow.
-    if (meta.dtype != "f32") {
-        graph_input = ggml_cast(s->gctx, s->input, GGML_TYPE_F16);
-        if (graph_text) graph_text = ggml_cast(s->gctx, s->text_input, GGML_TYPE_F16);
-    }
+    graph_input = ggml_cast(s->gctx, s->input, GGML_TYPE_F16);
+    if (graph_text) graph_text = ggml_cast(s->gctx, graph_text, GGML_TYPE_F16);
 #else
     // CPU and Vulkan: cast input to F16 when model weights are F16 (native or
     // dequantised from Q8_0) so the im2col+mul_mat pipeline stays all-F16.
     if (meta.dtype == "f16" || gb.q8_direct) {
         graph_input = ggml_cast(s->gctx, s->input, GGML_TYPE_F16);
-        if (graph_text) graph_text = ggml_cast(s->gctx, s->text_input, GGML_TYPE_F16);
+        if (graph_text) graph_text = ggml_cast(s->gctx, graph_text, GGML_TYPE_F16);
     }
 #endif
 
@@ -724,18 +789,40 @@ Session* create_session(const std::string& gguf_path, const SessionOptions& opts
             ggml_tensor* x = in0();
             out = ggml_pool_2d(s->gctx, x, GGML_OP_POOL_AVG, x->ne[0], x->ne[1], 1, 1, 0, 0);
         } else if (op.type == "linear") {
-            // Classify: y = x @ W^T + b. W is stored [in, out]; the pooled
-            // [1,1,C,1] feature is flattened to [C,1] for mul_mat.
+            // y = x @ W^T + b with W stored [in, out]. A pooled [1,1,C,1] vector
+            // (classify) and a [W,H,C,1] feature map (prompt-free YOLOE vocabulary)
+            // are the same matmul; the map only needs channel-first staging, exactly
+            // like the world_detect contrastive branch below. Keeping the head a
+            // matmul rather than a 1x1 conv matters: ggml-cuda's IGEMM conv path
+            // rejects non-8-aligned output channels and reserves per-plan buffers,
+            // neither of which a vocabulary-sized classifier should pay.
             ggml_tensor* x = in0();
-            const int64_t c = x->ne[0] * x->ne[1] * x->ne[2];
-            ggml_tensor* flat = ggml_reshape_2d(s->gctx, x, c, 1);
             ggml_tensor* wT = gb.w(prefix, "w");
             GGML_ASSERT(wT && "linear without weight");
-            out = ggml_mul_mat(s->gctx, wT, flat);  // [out, 1]
+            const int64_t C = x->ne[2], W = x->ne[0], H = x->ne[1], HW = W * H;
+            const bool spatial = HW > 1;
+            ggml_tensor* feats = nullptr;
+            if (spatial) {
+                // A [W, H, C] map keeps channels slowest, so [C, HW] is not a view of it:
+                // stage it channels-first once. In the contiguous [C, W, H] result the
+                // channel step is one element and the anchor step is C, which is exactly
+                // the k/n stride pair mul_mat wants.
+                ggml_tensor* cf = ggml_cont(s->gctx, ggml_permute(s->gctx, x, 1, 2, 0, 3));
+                GGML_ASSERT(ggml_is_contiguous(cf) && cf->ne[0] == C && cf->ne[1] == W && cf->ne[2] == H);
+                feats = ggml_view_2d(s->gctx, cf, C, HW, C * ggml_element_size(cf), 0);  // [C, HW]
+            } else {
+                feats = ggml_reshape_2d(s->gctx, x, C, 1);  // pooled [1,1,C] -> [C, 1]
+            }
+            out = ggml_mul_mat(s->gctx, wT, feats);  // [out, HW], always F32
             if (ggml_tensor* b = gb.w(prefix, "b")) {
                 out = ggml_add(s->gctx, out, ggml_reshape_2d(s->gctx, b, b->ne[0], 1));
             }
-            out = ggml_reshape_1d(s->gctx, out, out->ne[0]);
+            if (spatial && out->type != x->type) {
+                out = ggml_cast(s->gctx, out, x->type);  // head concat needs the branch dtype
+            }
+            out = spatial ? ggml_reshape_3d(s->gctx, ggml_cont(s->gctx, ggml_permute(s->gctx, out, 1, 0, 2, 3)),
+                                           W, H, out->ne[0])
+                          : ggml_reshape_1d(s->gctx, out, out->ne[0]);
         } else if (op.type == "classify") {
             // Identity marker on the [nc] logits; softmax/topk run in postprocess.
             out = in0();
@@ -770,11 +857,7 @@ Session* create_session(const std::string& gguf_path, const SessionOptions& opts
         s->output_proto_f16.resize(ggml_nelements(s->output_proto));
     }
 
-    // Text-conditioned max trees add O(world_nc) graph nodes. The old fixed
-    // detect-head estimate overflowed for the default 80-class World session.
-    const size_t graph_size = s->model.ops.size() * 12 + 512 +
-                              (s->model.has_text_input ? (size_t)world_nc * 64 : 0);
-    s->graph = ggml_new_graph_custom(s->gctx, graph_size, /*grads*/ false);
+    s->graph = ggml_new_graph_custom(s->gctx, node_budget, /*grads*/ false);
     if (opts.keep_all_ops) {
         // OUTPUT tensors are never freed by gallocr (ggml-alloc.c free_node),
         // so every op's data survives the full compute for --dump-ops.
