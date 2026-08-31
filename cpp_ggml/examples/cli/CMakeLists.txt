@@ -2,6 +2,10 @@
 # yolo-cli: single-image inference commands for every task.
 add_executable(yolo-cli ${CMAKE_CURRENT_SOURCE_DIR}/../../src/cli.cpp)
 target_link_libraries(yolo-cli PRIVATE yologgml)
+
+# YOLOE visual prompts (SAVPE): one example box per target, no text encoder.
+add_executable(yolo-vp yolo_vp.cpp examples_common.cpp)
+target_link_libraries(yolo-vp PRIVATE yologgml)
 target_compile_definitions(yolo-cli PRIVATE YOLO_GGML_CLIP=$<BOOL:${YOLO_GGML_CLIP}>)
 
 # End-to-end solution scenarios (each pairs one task family with an official

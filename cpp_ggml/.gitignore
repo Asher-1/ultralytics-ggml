@@ -12,6 +12,11 @@ models/onnx/*.onnx
 # Benchmark artifacts
 benchmarks/*.json.tmp
 
+# Regression-gate runtime artifacts (baselines re-record via REGRESS_REFRESH=1,
+# speed entries append per run; both are local caches, not source)
+benchmarks/parity_baseline/
+benchmarks/regress/
+
 # Patch-apply flock sentinel (runtime artifact, not source)
 third_party/.ggml-patch.lock
 

@@ -99,18 +99,14 @@ def main():
         with torch.no_grad():
             if len(sys.argv) > 5:
                 tpe = read_ytxt(sys.argv[5])
-                head = model.model.model[-1]
-                if hasattr(head, "reprta"):
-                    # YTXT stores YOLOE's post-reprta, already normalized embedding.
-                    # predict() normally applies reprta to a raw MobileCLIP tensor, so
-                    # replacing it only for this reference call prevents a second pass.
-                    reprta, head.reprta = head.reprta, torch.nn.Identity()
-                    try:
-                        out = model.model.predict(x, tpe=tpe)
-                    finally:
-                        head.reprta = reprta
-                else:
-                    out = model.model.predict(x, tpe=tpe)
+                # YTXT stores the raw MobileCLIP text-tower output (pre-reprta).
+                # The official get_tpe applies reprta + L2 norm (cos(reprta(ytxt),
+                # get_text_pe) == 1.0), and the engine's --text-embed path applies
+                # the same reprta weights, so pass the blob through untouched —
+                # swapping reprta for Identity here (the old behaviour) produced
+                # wrong class logits. World heads have no reprta and consume the
+                # blob directly; the hasattr check keeps both cases correct.
+                out = model.model.predict(x, tpe=tpe)
             else:
                 out = model.model(x)
         # Detect returns (y, preds); preds holds the pre-DFL raw head output.

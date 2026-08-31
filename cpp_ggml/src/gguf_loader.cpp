@@ -222,6 +222,65 @@ std::unique_ptr<ModelDef> load_gguf(const std::string& path) {
         return nullptr;
     }
 
+    // ---- YOLOE visual-prompt (savpe) support ----
+    // Resolve the FPN feature ops the savpe encoder consumes by walking the
+    // world head's box/embed branch chains back to their shared producer:
+    // branch-internal conv outputs have exactly one consumer, while the FPN
+    // feature feeds both the box and the embed branch (>= 2 consumers).
+    model->has_savpe = key_or(g, "yolo.savpe", 0) != 0;
+    if (model->has_savpe) {
+        if (!model->has_text_input || model->detect_op_index < 0) {
+            YOLO_LOG_ERROR("yolo.savpe set but the graph has no world head; "
+                           "ignore the flag or reconvert the checkpoint");
+            gguf_free(g);
+            ggml_free(weight_ctx);
+            return nullptr;
+        }
+        std::vector<int> consumers(model->ops.size(), 0);
+        for (const OpDef& op : model->ops)
+            for (int in : op.inputs)
+                if (in >= 0) consumers[in]++;
+        auto branch_root = [&](int out_idx) -> int {
+            int cur = out_idx;
+            while (cur >= 0 && cur < (int)model->ops.size()) {
+                const OpDef& o = model->ops[cur];
+                if ((o.type != "conv" && o.type != "dwconv") || o.inputs.empty() || o.inputs[0] < 0) return cur;
+                const int prev = o.inputs[0];
+                if (consumers[prev] >= 2) return prev;  // shared FPN feature
+                cur = prev;
+            }
+            return cur;
+        };
+        const OpDef& head = model->ops[model->detect_op_index];
+        const bool head_masks = head.ip("has_masks", 0) != 0;
+        const size_t lv_stride = head_masks ? 3 : 2;
+        const size_t lv_count =
+            head_masks ? (head.inputs.size() - 1) / lv_stride : head.inputs.size() / lv_stride;
+        for (size_t l = 0; l < lv_count && model->savpe_fpn_ops.size() < 3; l++) {
+            // Per level: [box, embed(, mask)] — box and embed are rooted at
+            // the same FPN feature, so the pair cross-checks the walk.
+            const int root = branch_root(head.inputs[lv_stride * l]);
+            if (root < 0 || root >= (int)model->ops.size() ||
+                root != branch_root(head.inputs[lv_stride * l + 1])) {
+                YOLO_LOG_ERROR("savpe: cannot resolve the FPN feature for level %zu", l);
+                gguf_free(g);
+                ggml_free(weight_ctx);
+                return nullptr;
+            }
+            // Level order follows the head inputs: level 0 = P3 (smallest
+            // stride), which is the torch x = [P3, P4, P5] order savpe needs.
+            model->savpe_fpn_ops.push_back(root);
+        }
+        if (model->savpe_fpn_ops.size() != 3) {
+            YOLO_LOG_ERROR("savpe: expected 3 FPN levels, resolved %zu", model->savpe_fpn_ops.size());
+            gguf_free(g);
+            ggml_free(weight_ctx);
+            return nullptr;
+        }
+        YOLO_LOG_INFO("savpe: fpn ops = %d, %d, %d", model->savpe_fpn_ops[0], model->savpe_fpn_ops[1],
+                      model->savpe_fpn_ops[2]);
+    }
+
     // ---- tensors: reference the mapped ggml context data ----
     const int64_t n_tensors = gguf_get_n_tensors(g);
     for (int64_t t = 0; t < n_tensors; t++) {

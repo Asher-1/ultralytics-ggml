@@ -17,7 +17,6 @@ option(YOLO_GGML_SHARED      "Build libyologgml as a shared library" OFF)
 
 # Backend forwarding to ggml (mirrors rf-detr.cpp pattern)
 option(YOLO_GGML_CUDA    "Enable CUDA backend in ggml"    OFF)
-option(YOLO_GGML_CUDNN   "Use cuDNN for direct CUDA convolutions (optional; native WMMA implicit-GEMM is the default)" OFF)
 option(YOLO_GGML_METAL   "Enable Metal backend in ggml"   OFF)
 option(YOLO_GGML_VULKAN  "Enable Vulkan backend in ggml"  OFF)
 option(YOLO_GGML_HIPBLAS "Enable HIPBLAS backend in ggml" OFF)
@@ -53,34 +52,8 @@ if(YOLO_GGML_CUDA AND NOT DEFINED CMAKE_CUDA_ARCHITECTURES AND CMAKE_VERSION VER
 endif()
 
 if(YOLO_GGML_CUDA)
-    if(YOLO_GGML_CUDNN)
-        find_path(YOLO_CUDNN_INCLUDE_DIR cudnn_version.h
-            HINTS $ENV{CUDNN_ROOT} /usr/local/cudnn
-            PATH_SUFFIXES include)
-        if(NOT YOLO_CUDNN_INCLUDE_DIR)
-            message(FATAL_ERROR "YOLO_GGML_CUDNN requires cuDNN headers; set CUDNN_ROOT or disable it")
-        endif()
-        file(READ "${YOLO_CUDNN_INCLUDE_DIR}/cudnn_version.h" _yolo_cudnn_version_header)
-        foreach(_part MAJOR MINOR PATCHLEVEL)
-            string(REGEX MATCH "#define CUDNN_${_part} +([0-9]+)" _ "${_yolo_cudnn_version_header}")
-            set(_yolo_cudnn_${_part} "${CMAKE_MATCH_1}")
-        endforeach()
-        if(_yolo_cudnn_MAJOR STREQUAL "" OR _yolo_cudnn_MINOR STREQUAL "" OR _yolo_cudnn_PATCHLEVEL STREQUAL "")
-            message(FATAL_ERROR "Could not parse ${YOLO_CUDNN_INCLUDE_DIR}/cudnn_version.h")
-        endif()
-        math(EXPR _yolo_cudnn_version
-            "${_yolo_cudnn_MAJOR} * 1000 + ${_yolo_cudnn_MINOR} * 100 + ${_yolo_cudnn_PATCHLEVEL}")
-        if(_yolo_cudnn_version LESS 8500)
-            set(_yolo_cudnn_version_text
-                "${_yolo_cudnn_MAJOR}.${_yolo_cudnn_MINOR}.${_yolo_cudnn_PATCHLEVEL}")
-            message(FATAL_ERROR
-                "YOLO_GGML_CUDNN requires cuDNN 8.5 or newer, found ${_yolo_cudnn_version_text}")
-        endif()
-        message(STATUS "cuDNN headers: ${_yolo_cudnn_MAJOR}.${_yolo_cudnn_MINOR}.${_yolo_cudnn_PATCHLEVEL}")
-    endif()
     set(GGML_CUDA        ON CACHE BOOL "" FORCE)
     set(GGML_CUDA_GRAPHS ON CACHE BOOL "Replay CUDA graphs" FORCE)
-    set(GGML_CUDA_CUDNN  ${YOLO_GGML_CUDNN} CACHE BOOL "Use cuDNN direct convolutions" FORCE)
 endif()
 if(YOLO_GGML_METAL)
     set(GGML_METAL   ON CACHE BOOL "" FORCE)

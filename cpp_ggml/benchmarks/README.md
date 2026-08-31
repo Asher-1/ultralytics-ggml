@@ -174,6 +174,40 @@ agreement on the 12 anchors above conf 0.25 is **100% for every F32 and F16 key*
 for Q8_0, where the miss is a near-tie (`recreational vehicle` 0.88 vs `bus` 0.87). Boxes and
 masks match the PyTorch run on all three backends.
 
+### cuDNN evaluation (integration removed)
+
+The integration previously carried an optional cuDNN convolution path (`YOLO_GGML_CUDNN`), dispatching cuDNN first
+with the native WMMA implicit-GEMM kernels as fallback. It was removed after a measured cost/benefit run: the
+two paths share the same TF32 / F32-accumulate precision class (raw-head `yolo26n-f32` errors against the
+PyTorch reference were of equal magnitude, relative p99 0.42% vs 0.57%, five bus detections matched with
+confidence deltas <= 0.01 and box deltas <= 0.2 px), while the cuDNN process spent ~52 s of per-process plan
+searching before its first inference — versus ~1-2 s cold start for the native build — to buy only 5-16%
+graph latency on the RTX 3060 below. Amortizing that startup over the 0.3-0.7 ms per-frame saving needs
+~10^5 consecutive frames before break-even, on top of the extra dependency and the cuDNN 8.x/9.x header
+incompatibility it carried. The checked-in CUDA numbers in this report are native-igemm measurements.
+
+The last recorded comparison, before removal (RTX 3060, CUDA 11.8, cuDNN 8.9.6, 480x640, 20 warmups /
+50 iterations, graph-stage mean):
+
+| Model             | cuDNN | native igemm | scalar naive |
+| ----------------- | ----: | -----------: | -----------: |
+| yolo26n-f16       | 2.760 |        3.083 |       28.576 |
+| yolo26n-f32       | 2.907 |        3.095 |       27.345 |
+| yolov8n-f16       | 2.751 |        3.286 |       32.826 |
+| yolo26n-depth-f16 | 4.613 |        5.464 |      137.075 |
+| yolo26n-seg-f16   | 3.581 |        3.785 |       38.389 |
+
+Volta (cc < 8.0) F32 graphs fall back to the scalar path without cuDNN; F16 keeps the tensor-core igemm path
+down to cc 7.0, which is the recommended deployment dtype.
+
+Post-removal regression across backends and precisions (yolo26n family, `bus.jpg` 480x640): CUDA and Vulkan
+F32/F16/Q8_0 plus CPU F16/Q8_0 all pass the detect/depth/seg smoke matrix against the PyTorch letterbox tensor.
+On CUDA the F16 raw head is bit-identical to the F32 one — the TF32 and F16 mma operands share the same
+10-bit mantissa grid with exact fp32 products — so its raw-head error against the PyTorch reference is the
+0.42% relative p99 reported above. The Q8_0 head tracks its usual igemm-only path on both GPU backends
+(relative p99 6.1%, box-channel dominated as noted above) with the same five detections and confidence
+and box deltas within the F32 tolerance.
+
 ### CLIP ViT-B/32 embedding validation
 
 ![CLIP ViT-B/32 validation](clip_validation.png)

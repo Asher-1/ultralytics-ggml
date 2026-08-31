@@ -56,6 +56,14 @@ struct ModelDef {
     // YOLO-World offline vocabulary carried by the checkpoint: row-major
     // [nc, 512] f32, used as the text input when the caller sets none.
     std::vector<float> vocab_txt;
+    // YOLOE visual-prompt support (KV yolo.savpe = 1): the GGUF carries the
+    // head's SAVPE conv weights so example boxes can drive the head instead
+    // of a text embedding. savpe_fpn_ops lists the op indices producing the
+    // FPN features [P3, P4, P5] the savpe encoder consumes (resolved at load
+    // time by walking the head's box/embed branches back to their shared
+    // producer); empty when the GGUF has no savpe.
+    bool has_savpe = false;
+    std::vector<int> savpe_fpn_ops;
 };
 
 // Read only the metadata header (cheap: no tensor data).

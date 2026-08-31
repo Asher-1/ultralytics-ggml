@@ -40,7 +40,6 @@ report generation additionally need Python 3.8 or newer and the Python dependenc
 | --------------- | ---------------------------------------------------------------------------------------------------------------------------------- |
 | CPU             | No accelerator SDK; OpenMP is used when CMake finds it                                                                             |
 | CUDA            | NVIDIA driver, CUDA toolkit, and a Volta (cc 7.0) or newer GPU for the implicit-GEMM conv path                                     |
-| CUDA + cuDNN    | Additionally cuDNN 8.5 or newer when `YOLO_GGML_CUDNN=ON` is requested                                                             |
 | Vulkan          | Vulkan loader, headers, shader compiler, and a Vulkan 1.2-capable driver                                                           |
 | CLIP (optional) | `YOLO_GGML_CLIP=ON` (default) enables the CLIP ViT-B/32 text+image encoder. Python `clip` package needed for GGUF conversion only. |
 
@@ -116,7 +115,7 @@ instructions by default. Add `-DGGML_NATIVE=OFF` when the resulting binary must 
 ### Optimized CUDA
 
 The performance path uses a native WMMA implicit-GEMM convolution that ships inside `ggml-cuda` (see below);
-cuDNN is optional and off by default in the checked-in performance configuration:
+no convolution library such as cuDNN is used or linked:
 
 ```bash
 cmake -S cpp_ggml -B cpp_ggml/build-cuda \
@@ -136,25 +135,6 @@ cmake --build cpp_ggml/build-cuda --parallel 6
 ```
 
 Use the capability of the deployment GPU rather than copying `86` unconditionally.
-
-### Optional cuDNN build
-
-cuDNN is an optional implementation choice, not a requirement of GGML itself. Enable it only when cuDNN 8.5 or
-newer is available and you want its fused plans to compete with the native implicit-GEMM kernels:
-
-```bash
-cmake -S cpp_ggml -B cpp_ggml/build-cuda-cudnn \
-    -DCMAKE_BUILD_TYPE=Release \
-    -DYOLO_GGML_CUDA=ON \
-    -DYOLO_GGML_CUDNN=ON
-cmake --build cpp_ggml/build-cuda-cudnn --parallel 6
-```
-
-Point CMake at the cuDNN installation with `-DCUDNN_ROOT=/path/to/cudnn` (or the exported `CUDNN_ROOT` environment
-variable) when `cudnn_version.h` is not on a system search path. If the cuDNN libraries live in a nonstandard directory,
-also expose that directory to the platform dynamic loader before running the binary.
-
-Set `GGML_CUDA_DISABLE_IGEMM=1` at runtime to benchmark the cuDNN/naive fallback paths in isolation.
 
 ### Vulkan
 
@@ -309,6 +289,59 @@ cpp_ggml/build-cuda/bin/yolo-cli detect \
 The graph appends the mask-coefficient channels to the detection head and keeps the 32-prototype map at one-quarter
 resolution as a second output; masks are composed on device after a single proto readback. Every YOLOv8-seg and
 YOLO26-seg checkpoint (n/s/m/l/x) is supported in F32, F16, and Q8_0.
+
+### YOLOE visual prompts (SAVPE)
+
+Beyond text prompts, YOLOE supports the official **visual prompt** mode: one example bounding box per target drives the
+checkpoint's Small Adoptable Visual Prompt Encoder (SAVPE), which derives the class embeddings directly from the image —
+no text encoder, no class list. Results are labeled `object0..objectN-1`.
+
+Two prerequisites:
+
+1. A YOLOE GGUF carrying the savpe weights. The standard converter emits the text graph only; post-process a
+   non-prompt-free checkpoint once to append them:
+
+   ```bash
+   python3 cpp_ggml/scripts/convert_yoloe_savpe_gguf.py \
+       --gguf cpp_ggml/models/gguf/yoloe-26s-seg-f16.gguf \
+       --model yoloe-26s-seg.pt          # the original .pt the GGUF was converted from
+   ```
+
+   The script copies every KV and tensor byte-exactly, sets `yolo.savpe = 1`, and appends the 28 folded SAVPE conv
+   tensors. Prompt-free (`-pf`) checkpoints reject visual prompts and must not be converted.
+
+2. The `yolo-cli detect --vp-boxes` option or the dedicated `yolo-vp` example:
+
+```bash
+cpp_ggml/build-cuda/bin/yolo-cli detect \
+    --model cpp_ggml/models/gguf/yoloe-26s-seg-f16.gguf \
+    --source party_hats.jpg \
+    --vp-boxes "60,95,285,390,940,0,1170,185,455,365,660,650" \
+    --conf 0.25
+
+cpp_ggml/build-cuda/bin/yolo-vp \
+    --model cpp_ggml/models/gguf/yoloe-26s-seg-f16.gguf \
+    --source party_hats.jpg \
+    --boxes "60,95,285,390,940,0,1170,185,455,365,660,650" \
+    --dets-json cpp_ggml/results/yolo-vp.json
+```
+
+`--vp-boxes`/`--boxes` take one `x1,y1,x2,y2` quadruple per target in original-image pixels; visual prompts take
+precedence over `--classes`/`--text-embed` when both are given. The C API equivalent is
+`aicore_yolo_options_set_visual_prompts` (see the ACloudViewer AICore integration).
+
+Debug tensor dumps for cross-runtime alignment (all env-gated, no cost when unset):
+
+- `YOLO_SAVPE_DUMP=PREFIX` - after the run, writes the aggregated vpe `PREFIX.bin` (`[512, Q]` F32), the level-0
+  contrastive embedding `PREFIX_emb0.bin` and the three SAVPE FPN inputs `PREFIX_fpn{0,1,2}.bin` (host F32, dtype
+  converted from F16 graphs).
+- `YOLO_EMB_DUMP=1` - enables the `PREFIX_emb0.bin` capture (the level-0 `one2one_cv3` embedding the contrastive head
+  scores against).
+- `YOLO_VP_DUMP=FILE` / `YOLO_VP_DEBUG=1` - the rasterized P3 prompt masks (byte-exact what the graph consumes) and
+  per-plane rect tracing.
+
+These pair with ultralytics' own SAVPE (`model.model[-1].savpe`) for optrace-level parity bisection: the dumped fpn
+features + masks run through the official torch module must reproduce `PREFIX.bin` element-wise.
 
 ### YOLO26n absolute depth
 
@@ -577,6 +610,47 @@ python3 scripts/render_parity.py
 cd ..
 ```
 
+### Regression gate: one command, precision + speed
+
+`scripts/regress_all.sh` wraps the sweeps above into the go-to check after any engine change: it measures every
+model family on one backend build and gates on both latency and numerical behavior. Any failing case leaves a
+non-zero exit code, so it doubles as a CI job:
+
+```bash
+# full matrix, both layers (first run also records the precision baselines)
+scripts/regress_all.sh build-cuda cuda
+
+# quick loop while iterating on one model
+scripts/regress_all.sh build-cuda cuda --precision-only --dtypes f16 yolo26n yoloe-26s-seg
+```
+
+Precision is layered per model family: detect/segment/YOLOE/PF compare `--dump-raw` against a cached torch
+baseline (`parity_reference.py prep+raw`, recorded once, so torch is not needed afterwards); depth compares
+`--raw` against the official metric-depth reference; pose/obb/semantic/classify compare per-op optrace dumps
+(`--dump-ops`, supported by every task) against a cached first-run baseline; the YOLOE visual-prompt SAVPE chain
+is gated on a fixed-prompt `--dets-json` baseline. Every tensor-family baseline pairs against official torch —
+including open-vocabulary YOLOE text, whose YTXT blobs are the raw MobileCLIP text-tower output the engine
+pushes through reprta. World is speed-only for now: its torch raw reference needs a `set_classes` flow
+(`WorldModel.predict` takes no tpe). Baselines live in `benchmarks/parity_baseline/`; `REGRESS_REFRESH=1`
+re-records them deliberately, and speed entries append to `benchmarks/regress/<backend>-speed.jsonl` for
+cross-run comparison (latency is recorded, not gated — single-run e2e deltas on GPU backends are clock noise,
+compare solo reruns before calling anything a regression).
+
+The pass criterion per element is a NumPy-allclose band, `|cpp - base| <= max_abs + max_rel * |base|`, with
+per-dtype defaults that absorb the CUDA build's by-design F16 activation flow (see the unconditional input cast
+in `yolo_graph.cpp` — f32 weights ride the same flow as f16 there, so they share its headroom):
+
+| dtype | `REGRESS_MAX_ABS_*` | `REGRESS_MAX_REL_*` |
+| ----- | ------------------- | ------------------- |
+| f32   | 0.5                 | 0.05                |
+| f16   | 0.5                 | 0.05                |
+| q8_0  | 1.0                 | 0.10                |
+
+Structural drift fails immediately regardless of thresholds: a changed op-dump file set (graph rebuild), a
+changed raw shape, or a changed detection list all FAIL. Tighten the variables when a change should be
+bit-exact (e.g. `REGRESS_MAX_ABS_F32=0.05 REGRESS_MAX_REL_F32=0.05` on the CPU build, which runs true F32
+activations).
+
 World is outside the closed-set matrix because a timing is incomplete without its vocabulary and text embeddings. Its
 records include the exact class list, text source, and class count. The timed loop begins after this one-time setup;
 it measures repeated-frame preprocessing, inference, readback, and postprocessing:
@@ -650,7 +724,7 @@ x2.07 (pose), x2.40 (obb), x2.19 (semantic), and x1.07 (classify); pose and clas
 their decode/preprocessing paths (RLE head, 224-input antialiased resize) are the newest additions. GPU graph time
 stays under 30 ms for 268 of 270 keys; the two exceptions are yolov8x-seg F32/F16. These are measurements for the
 documented hardware, software, input, and protocol, not portable guarantees. Re-run the complete matrix after
-changing the GPU, driver, toolkit, cuDNN, compiler, GGML revision, model, input shape, or timing protocol.
+changing the GPU, driver, toolkit, compiler, GGML revision, model, input shape, or timing protocol.
 
 Focused single-image parity covers every integrated family. F32/Q8_0 and production accuracy claims still require
 tolerance-based COCO, NYU Depth V2, Cityscapes, DOTA, and ImageNet validation. Performance and accuracy gates should
@@ -708,8 +782,6 @@ copies of GGML; update the source patch and replay it from the pinned clean subm
 | -------------------------------------------------- | -------------------------------------------------------------------------------------------------- |
 | `ggml submodule not found`                         | Run `git submodule sync --recursive` and `git submodule update --init --recursive`                 |
 | Patch cannot apply forward or in reverse           | Inspect `git -C cpp_ggml/third_party/ggml status`; use a clean worktree if it contains local edits |
-| CMake reports cuDNN older than 8.5                 | Install a supported cuDNN or use the generic CUDA build                                            |
-| CMake cannot find `cudnn_version.h`                | Set `CUDNN_ROOT` to the cuDNN installation prefix                                                  |
 | CUDA compile is killed or the host runs out of RAM | Delete no files; rerun the build with `cmake --build <dir> --parallel 6` or fewer jobs             |
 | CUDA compilation targets the wrong GPU             | Set `CMAKE_CUDA_ARCHITECTURES` to the deployment compute capability                                |
 | Vulkan configure cannot find its SDK               | Load the SDK environment or set `CMAKE_PREFIX_PATH`; verify with `vulkaninfo --summary`            |
@@ -727,8 +799,7 @@ the safest way to obtain an independent clean submodule checkout.
   retaining version 1/2 model support.
 - `yolo_graph.cpp` owns task-independent graph construction and task-specific output reads.
 - `backend.cpp` owns CPU plus one optional GPU scheduler and CPU fallback.
-- The single GGML integration patch owns the native WMMA implicit-GEMM convolution, optional cuDNN dispatch, and
-  Vulkan direct convolution.
+- The single GGML integration patch owns the native WMMA implicit-GEMM convolution and Vulkan direct convolution.
 - `image_io.cpp` and `postprocess.cpp` own preprocessing and task output restoration.
 - `cli.cpp` is a thin command adapter for `detect`, `depth`, `info`, and `bench`.
 - `clip_graph.hpp` / `clip_graph.cpp` own the optional CLIP ViT-B/32 text+image encoder using a GGUF model.

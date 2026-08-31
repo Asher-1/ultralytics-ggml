@@ -20,6 +20,16 @@ struct Session {
     ggml_tensor* text_input = nullptr;         // YOLO-World: external [512, nc] F32 text embedding
     std::vector<float> text_pending;            // host cache for set_text before backend alloc
     int world_nc = 0;                          // YOLO-World: class count driving the text input shape
+    // YOLOE visual prompts (SAVPE): active when SessionOptions::visual_count
+    // > 0. The external [W3, H3, Q] F32 mask leaf replaces the text input;
+    // vp_pending is the host-side letterbox-aware rasterization, uploaded
+    // before every run just like text_pending.
+    ggml_tensor* vp_input = nullptr;
+    std::vector<float> vp_pending;
+    std::vector<float> visual_boxes;  // prompted boxes, original-image pixels
+    ggml_tensor* savpe_out = nullptr;  // debug: the [512, Q] vpe node (visual mode)
+    ggml_tensor* savpe_fpn_dbg[3] = {nullptr, nullptr, nullptr};  // debug: savpe inputs
+    bool visual_mode() const { return vp_input != nullptr; }
     ggml_tensor* output = nullptr;             // raw detect [A,no] or metric depth [W,H,1,1]
     ggml_tensor* output_proto = nullptr;       // segment protos [W,H,nm,1] on the H/4 grid
     ggml_cgraph* graph = nullptr;
@@ -55,6 +65,11 @@ struct SessionOptions {
     bool profile_ops = false;    // per-op wall-time table via sched eval callback (adds per-node sync)
     bool profile_gaps = false;   // per-stage (upload/compute/readback) running averages on stderr
     int world_nc = 0;            // YOLO-World class count (0: use the GGUF yolo.nc default)
+    // YOLOE visual prompts: Q example boxes as a flat [x1,y1,x2,y2, ...] array
+    // in original-image pixels; visual_count > 0 switches the session to the
+    // savpe mask input (requires a GGUF with yolo.savpe = 1).
+    int visual_count = 0;
+    std::vector<float> visual_boxes;
 };
 
 // Create a session for a GGUF model. See SessionOptions for the knobs.
@@ -67,6 +82,14 @@ bool session_run(Session* s, const float* chw_image);
 // YOLO-World: copy an [nc, 512] row-major text embedding into the text input
 // (column-major [512, nc] in ggml) before session_run.
 bool session_set_text(Session* s, const float* text_embed);
+
+// YOLOE visual prompts: rasterize the session's prompted boxes (original-
+// image pixels, stored in SessionOptions::visual_boxes) onto the letterboxed
+// P3 mask grid and queue the upload. Call after create_session and before
+// every session_run; the session must be in visual mode.
+ggml_tensor* yolo_debug_emb();  // debug: level-0 embed matrix (YOLO_EMB_DUMP)
+
+bool session_prepare_visual_masks(Session* s, const LetterboxInfo& info);
 
 // Read back the raw output [no, A] (row-major: no rows x A anchors). For
 // segment models `no` additionally carries nm mask-coefficient rows.

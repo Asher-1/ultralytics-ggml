@@ -37,14 +37,18 @@ void usage() {
             "                 YOLOE takes the same --classes with --text-model mobileclip2_b-f16.gguf;\n"
             "                 without --classes the vocabulary stored in the GGUF is used;\n"
             "                 an empty trailing field is the background class row\n"
+            "                 [--vp-boxes \"x1,y1,x2,y2,...\"] (YOLOE visual prompts: one example\n"
+            "                 box per target in original-image pixels; needs a YOLOE GGUF with\n"
+            "                 yolo.savpe=1 — see scripts/convert_yoloe_savpe_gguf.py;\n"
+            "                 detections are labeled object0..objectN-1)\n"
             "                 [--dets-json OUT.json] writes the detections verbatim for tools\n"
             "                 (segment models run here too: boxes + instance masks, --out blends them)\n"
-            "  yolo-cli pose   --model M.gguf --source IMG [--out OUT.png] [--conf 0.25] [--iou 0.7]\n"
+            "  yolo-cli pose   --model M.gguf --source IMG [--out OUT.png] [--conf 0.25] [--iou 0.7] [--dump-ops DIR]\n"
             "                 [--max-det 300] [--threads N] [--dump-input OUT.bin] [--profile ops|gaps]\n"
-            "  yolo-cli obb    --model M.gguf --source IMG [--out OUT.png] [--conf 0.25] [--iou 0.7]\n"
+            "  yolo-cli obb    --model M.gguf --source IMG [--out OUT.png] [--conf 0.25] [--iou 0.7] [--dump-ops DIR]\n"
             "                 [--max-det 300] [--threads N] [--dump-input OUT.bin] [--profile ops|gaps]\n"
-            "  yolo-cli semantic --model M.gguf --source IMG [--out OUT.png] [--threads N] [--profile ops|gaps]\n"
-            "  yolo-cli classify --model M.gguf --source IMG [--topk 5] [--threads N] [--profile ops|gaps]\n"
+            "  yolo-cli semantic --model M.gguf --source IMG [--out OUT.png] [--threads N] [--dump-ops DIR] [--profile ops|gaps]\n"
+            "  yolo-cli classify --model M.gguf --source IMG [--topk 5] [--threads N] [--dump-ops DIR] [--profile ops|gaps]\n"
             "  yolo-cli depth  --model M.gguf --source IMG [--out OUT.png] [--raw OUT.bin] [--max-depth M]\n"
             "                 [--threads N] [--dump-input OUT.bin] [--profile ops|gaps]\n"
             "  yolo-cli bench  --model M.gguf --source IMG [--warmup 20] [--iters 100] [--threads N]\n"
@@ -55,6 +59,8 @@ void usage() {
             "\n"
             "raw binary formats (little endian, for pytorch parity tests):\n"
             "  --input-f32 / --dump-input: 8b magic \"YINP0001\", 3x i32 (C,H,W), then f32 CHW pixels\n"
+            "  --dump-ops:                  per-op dumps DIR/opNNN_<op>.bin (\"YLYR0001\" + 4x i32 dims +\n"
+            "                               f32 data, F32 tensors only) for optrace regression diffs\n"
             "  --dump-raw:                  8b magic \"YRAW0001\", 2x i32 (no,na), then f32 [no,na]\n"
             "  depth --raw:                 8b magic \"YDEP0001\", 2x i32 (H,W), then f32 meters\n");
 }
@@ -288,6 +294,31 @@ int cmd_detect(const Args& args) {
     const std::string dump_ops = arg_s(args, "dump-ops");
     // YOLO-World: --classes "person,car" sets the open-vocabulary class list.
     const std::vector<std::string> world_classes = parse_class_list(arg_s(args, "classes"));
+    // YOLOE visual prompts: --vp-boxes "x1,y1,x2,y2,..." (flat floats, one box
+    // per target, original-image pixels). Non-empty switches the session to
+    // the savpe mask input; --classes/--text-embed are then ignored (official
+    // semantics: visual prompts take precedence over the class list).
+    std::vector<float> vp_boxes;
+    const std::string vp_spec = arg_s(args, "vp-boxes");
+    if (!vp_spec.empty()) {
+        size_t pos = 0;
+        while (pos <= vp_spec.size()) {
+            const size_t comma = vp_spec.find(',', pos);
+            const std::string tok =
+                vp_spec.substr(pos, comma == std::string::npos ? std::string::npos : comma - pos);
+            if (!tok.empty()) vp_boxes.push_back(strtof(tok.c_str(), nullptr));
+            if (comma == std::string::npos) break;
+            pos = comma + 1;
+        }
+        if (vp_boxes.empty() || vp_boxes.size() % 4 != 0) {
+            fprintf(stderr, "--vp-boxes must be one or more x1,y1,x2,y2 quadruples\n");
+            return 1;
+        }
+        if (!world_classes.empty() || !arg_s(args, "text-embed").empty()) {
+            fprintf(stderr, "note: --vp-boxes takes precedence over --classes/--text-embed\n");
+        }
+    }
+    const bool visual = !vp_boxes.empty();
     yolo::SessionOptions sopts;
     sopts.threads = arg_i(args, "threads", 0);
     sopts.input_w = canvas_w;
@@ -295,6 +326,8 @@ int cmd_detect(const Args& args) {
     sopts.keep_all_ops = !dump_ops.empty();
     sopts.profile_ops = arg_s(args, "profile") == "ops";
     sopts.profile_gaps = arg_s(args, "profile") == "gaps";
+    sopts.visual_count = visual ? (int)(vp_boxes.size() / 4) : 0;
+    sopts.visual_boxes = vp_boxes;
     // YOLO-World class count: --classes wins; otherwise peek the --text-embed
     // blob header (dump_f32 layout: YTXT0002 magic + dims, no ndim field) so
     // the graph is built with the right nc instead of the COCO (80) default.
@@ -313,11 +346,17 @@ int cmd_detect(const Args& args) {
     }
     // Neither knob means "use the vocabulary the checkpoint shipped with", which
     // the session loads itself; only an explicit list has to be encoded here.
-    const bool supply_text = !world_classes.empty() || te_nc > 0;
+    const bool supply_text = !visual && (!world_classes.empty() || te_nc > 0);
     sopts.world_nc = supply_text ? ((int)world_classes.size() ? (int)world_classes.size() : te_nc) : 0;
     SessionPtr session(yolo::create_session(model_path, sopts), yolo::free_session);
     yolo::Session* s = session.get();
     if (!s) return 1;
+    // Visual prompts: rasterize the example boxes onto the letterboxed P3
+    // grid; must be re-done for every new canvas before session_run.
+    if (visual && !yolo::session_prepare_visual_masks(s, info)) {
+        fprintf(stderr, "failed to rasterize the visual prompt boxes\n");
+        return 1;
+    }
 
     const std::string dump_in = arg_s(args, "dump-input");
     if (!dump_in.empty() &&
@@ -388,6 +427,46 @@ int cmd_detect(const Args& args) {
 
     if (!yolo::session_run(s, input.data())) return 1;
 
+    // Debug: dump the savpe vpe node ([512, Q] F32) plus its fpn/emb inputs
+    // for offline comparison. On F16 models the fpn/emb graph nodes hold F16
+    // activations — a naive nelements*sizeof(float) readback overruns the
+    // tensor buffer, so convert on the host from the node's real dtype.
+    if (const char* vdump = getenv("YOLO_SAVPE_DUMP"); vdump && s->savpe_out) {
+        auto dump_node = [](const char* path, ggml_tensor* t) {
+            const size_t n = (size_t)ggml_nelements(t);
+            std::vector<float> f(n);
+            if (t->type == GGML_TYPE_F32) {
+                ggml_backend_tensor_get(t, f.data(), 0, n * sizeof(float));
+            } else if (t->type == GGML_TYPE_F16) {
+                std::vector<ggml_fp16_t> raw(n);
+                ggml_backend_tensor_get(t, raw.data(), 0, n * sizeof(ggml_fp16_t));
+                for (size_t i = 0; i < n; i++) f[i] = ggml_fp16_to_fp32(raw[i]);
+            } else {
+                fprintf(stderr, "[savpe-dump] %s: unsupported dtype %d, skipped\n", path, (int)t->type);
+                return false;
+            }
+            FILE* fp = fopen(path, "wb");
+            if (!fp) return false;
+            fwrite(f.data(), sizeof(float), n, fp);
+            fclose(fp);
+            fprintf(stderr, "[savpe-dump] wrote %s (%zu floats, dims [%lld,%lld,%lld,%lld])\n", path, n,
+                    (long long)t->ne[0], (long long)t->ne[1], (long long)t->ne[2], (long long)t->ne[3]);
+            return true;
+        };
+        dump_node(vdump, s->savpe_out);
+        if (ggml_tensor* emb = yolo::yolo_debug_emb()) {
+            char path[512];
+            snprintf(path, sizeof(path), "%s_emb0.bin", vdump);
+            dump_node(path, emb);
+        }
+        for (int l = 0; l < 3; l++) {
+            if (!s->savpe_fpn_dbg[l]) continue;
+            char path[512];
+            snprintf(path, sizeof(path), "%s_fpn%d.bin", vdump, l);
+            dump_node(path, s->savpe_fpn_dbg[l]);
+        }
+    }
+
     std::vector<float> raw;
     int no = 0, na = 0;
     if (!yolo::session_read_output(s, raw, no, na)) return 1;
@@ -423,7 +502,14 @@ int cmd_detect(const Args& args) {
     }
     yolo::unscale_boxes(dets, info);
 
-    const auto& names = world_classes.empty() ? s->model.meta.class_names : world_classes;
+    // Visual-prompt results group examples: official semantics label them
+    // object0..objectN-1 regardless of any class list.
+    std::vector<std::string> vp_names;
+    if (visual) {
+        for (int i = 0; i < sopts.visual_count; i++) vp_names.push_back("object" + std::to_string(i));
+    }
+    const auto& names = visual ? vp_names
+                               : (world_classes.empty() ? s->model.meta.class_names : world_classes);
     printf("%d detection%s (%s, %s, %dx%d, backend=%s)\n", (int)dets.size(), dets.size() == 1 ? "" : "s",
            s->model.meta.name.c_str(), s->model.meta.dtype.c_str(), canvas_w, canvas_h,
            yolo::backend_name(s->backend));
@@ -503,10 +589,16 @@ int cmd_pose(const Args& args) {
     sopts.input_h = info.imgsz_h;
     sopts.profile_ops = arg_s(args, "profile") == "ops";
     sopts.profile_gaps = arg_s(args, "profile") == "gaps";
+    const std::string dump_ops = arg_s(args, "dump-ops");
+    sopts.keep_all_ops = !dump_ops.empty();
     SessionPtr session(yolo::create_session(model_path, sopts), yolo::free_session);
     yolo::Session* s = session.get();
     if (!s) return 1;
     if (!yolo::session_run(s, input.data())) return 1;
+    if (!dump_ops.empty() && !yolo::session_dump_ops(s, dump_ops)) {
+        fprintf(stderr, "failed to write --dump-ops %s\n", dump_ops.c_str());
+        return 1;
+    }
     std::vector<float> raw;
     int no = 0, na = 0;
     if (!yolo::session_read_output(s, raw, no, na)) return 1;
@@ -565,10 +657,16 @@ int cmd_obb(const Args& args) {
     sopts.input_h = info.imgsz_h;
     sopts.profile_ops = arg_s(args, "profile") == "ops";
     sopts.profile_gaps = arg_s(args, "profile") == "gaps";
+    const std::string dump_ops = arg_s(args, "dump-ops");
+    sopts.keep_all_ops = !dump_ops.empty();
     SessionPtr session(yolo::create_session(model_path, sopts), yolo::free_session);
     yolo::Session* s = session.get();
     if (!s) return 1;
     if (!yolo::session_run(s, input.data())) return 1;
+    if (!dump_ops.empty() && !yolo::session_dump_ops(s, dump_ops)) {
+        fprintf(stderr, "failed to write --dump-ops %s\n", dump_ops.c_str());
+        return 1;
+    }
     std::vector<float> raw;
     int no = 0, na = 0;
     if (!yolo::session_read_output(s, raw, no, na)) return 1;
@@ -622,10 +720,16 @@ int cmd_semantic(const Args& args) {
     sopts.input_h = info.imgsz_h;
     sopts.profile_ops = arg_s(args, "profile") == "ops";
     sopts.profile_gaps = arg_s(args, "profile") == "gaps";
+    const std::string dump_ops = arg_s(args, "dump-ops");
+    sopts.keep_all_ops = !dump_ops.empty();
     SessionPtr session(yolo::create_session(model_path, sopts), yolo::free_session);
     yolo::Session* s = session.get();
     if (!s) return 1;
     if (!yolo::session_run(s, input.data())) return 1;
+    if (!dump_ops.empty() && !yolo::session_dump_ops(s, dump_ops)) {
+        fprintf(stderr, "failed to write --dump-ops %s\n", dump_ops.c_str());
+        return 1;
+    }
     std::vector<float> logits;
     int nc = 0, gw = 0, gh = 0;
     if (!yolo::session_read_semantic(s, logits, nc, gw, gh)) return 1;
@@ -677,6 +781,8 @@ int cmd_classify(const Args& args) {
     sopts.input_h = meta.imgsz;
     sopts.profile_ops = arg_s(args, "profile") == "ops";
     sopts.profile_gaps = arg_s(args, "profile") == "gaps";
+    const std::string dump_ops = arg_s(args, "dump-ops");
+    sopts.keep_all_ops = !dump_ops.empty();
     SessionPtr session(yolo::create_session(model_path, sopts), yolo::free_session);
     yolo::Session* s = session.get();
     if (!s) return 1;
@@ -687,6 +793,10 @@ int cmd_classify(const Args& args) {
         return 1;
     }
     if (!yolo::session_run(s, input.data())) return 1;
+    if (!dump_ops.empty() && !yolo::session_dump_ops(s, dump_ops)) {
+        fprintf(stderr, "failed to write --dump-ops %s\n", dump_ops.c_str());
+        return 1;
+    }
     std::vector<float> logits;
     if (!yolo::session_read_logits(s, logits)) return 1;
     std::vector<float> probs = yolo::classify_softmax(logits);

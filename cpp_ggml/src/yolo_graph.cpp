@@ -14,6 +14,8 @@
 
 namespace yolo {
 
+static ggml_tensor* g_emb_dbg = nullptr;  // debug bridge: world_detect has no Session*
+
 namespace {
 
 // Q8_0 block layout (binary-compatible with ggml's block_q8_0): a per-32-
@@ -482,7 +484,16 @@ struct GraphBuilder {
             // instead applies its folded BatchNorm affine transform.
             ggml_tensor* eT = ggml_cont(gctx, ggml_permute(gctx, emb, 1, 2, 0, 3));  // [embed, W, H]
             ggml_tensor* eT32 = eT->type == GGML_TYPE_F32 ? eT : ggml_cast(gctx, eT, GGML_TYPE_F32);
-            ggml_tensor* e2 = ggml_view_2d(gctx, eT32, emb->ne[2], HW, eT32->nb[1], 0);  // [embed, HW]
+            // e2[k, p] = channel k at flat grid position p (torch's
+            // [C,H,W].flatten(2) order). Both a reshape of the contiguous
+            // [embed, W, H] staging and a view_2d with row stride nb[1]
+            // produce exactly this mapping — keep whichever, but never a
+            // view whose row stride steps ne0 instead of the channel axis.
+            ggml_tensor* e2 = ggml_reshape_2d(gctx, eT32, emb->ne[2], HW);  // [embed, HW]
+            if (l == 0 && getenv("YOLO_EMB_DUMP")) {
+                ggml_set_output(emb);  // graph node: keep alive for the dump
+                g_emb_dbg = emb;
+            }
             if (bn_contrastive) {
                 ggml_tensor* scale = w(prefix, ("cv4_" + std::to_string(l) + "_bn_scale").c_str());
                 ggml_tensor* shift = w(prefix, ("cv4_" + std::to_string(l) + "_bn_shift").c_str());
@@ -501,6 +512,9 @@ struct GraphBuilder {
             const float ls = ls_it != model.tensors.end() ? ((const float*)ls_it->second.data.data())[0] : 1.0f;
             const float bs = bs_it != model.tensors.end() ? ((const float*)bs_it->second.data.data())[0] : 0.0f;
             scores = ggml_scale_bias(gctx, scores, ls, bs);
+            if (getenv("YOLO_DEBUG_WD"))
+                fprintf(stderr, "[wd-dbg] level %zu ls=%.4f bs=%.4f (found=%d)\n",
+                        l, ls, bs, (int)(ls_it != model.tensors.end()));
             ggml_tensor* s4 = ggml_reshape_3d(gctx, ggml_cont(gctx, ggml_permute(gctx, scores, 1, 0, 2, 3)), W, H, nc);
             if (s4->type != box->type) s4 = ggml_cast(gctx, s4, box->type);  // concat needs matching types
             ggml_tensor* level = ggml_concat(gctx, box, s4, 2);  // [w, h, 4*rm + nc]
@@ -541,6 +555,139 @@ struct GraphBuilder {
         y = ggml_add(gctx, y, ggml_reshape_2d(gctx, b3, b3->ne[0], 1));
         return ggml_add(gctx, x, y);  // Residual: x + SwiGLUFFN(x)
     }
+
+    // ------------------------------------------------------------------
+    // YOLOE visual prompts: Small Adoptable Visual Prompt Encoder (SAVPE).
+    // Turns one binary [W3, H3, Q] mask leaf (example boxes rasterized on
+    // the P3 grid) into a [512, Q] class-embedding matrix that REPLACES the
+    // text embedding as the head's cls_pe (no reprta residual; in-tree port
+    // of ultralytics nn/modules/block.py SAVPE + YOLOEDetect.get_vpe). All
+    // convs ride the shared conv2d path (dtype rules + direct-conv fast
+    // paths) through synthetic OpDefs; weights follow the GraphBuilder
+    // naming convention written by
+    // scripts/convert_yoloe_savpe_gguf.py
+    // ("savpe.cv1_0_0.w" = GraphBuilder w("savpe.cv1_0_0", "w")).
+    // ------------------------------------------------------------------
+    ggml_tensor* savpe_conv(const char* tag, ggml_tensor* x, int k, int s, int p, bool silu) {
+        OpDef op;
+        op.type = "conv";
+        op.aparams["s"] = {(int64_t)s, (int64_t)s};
+        op.aparams["p"] = {(int64_t)p, (int64_t)p};
+        op.aparams["d"] = {1, 1};
+        op.aparams["k"] = {(int64_t)k, (int64_t)k};
+        if (silu) op.sparams["act"] = "silu";
+        return conv2d(op, std::string("savpe.") + tag, x);
+    }
+
+    ggml_tensor* savpe(const std::vector<ggml_tensor*>& fpn, ggml_tensor* vp) {
+        // vp: external [W3, H3, Q, 1] F32 binary masks on the P3 grid.
+        const int64_t W3 = fpn[0]->ne[0], H3 = fpn[0]->ne[1];
+        const int64_t HW3 = W3 * H3;
+        const int64_t Q = vp->ne[2];
+
+        // Shared branches: activation (cv2: Conv1x1 -> Upsample) and
+        // semantic (cv1: Conv3x3 -> Conv3x3 -> Upsample) per level — the
+        // convs run at the level's OWN resolution and the upsample comes
+        // LAST (Sequential order), landing every level on the P3 grid.
+        ggml_tensor* act = nullptr;  // [W3, H3, c3]
+        ggml_tensor* sem = nullptr;  // [W3, H3, c3]
+        for (int l = 0; l < 3; l++) {
+            const std::string lv = std::to_string(l);
+            ggml_tensor* a = savpe_conv(("cv2_" + lv).c_str(), fpn[l], 1, 1, 0, true);
+            ggml_tensor* s0 = savpe_conv(("cv1_" + lv + "_0").c_str(), fpn[l], 3, 1, 1, true);
+            ggml_tensor* s1 = savpe_conv(("cv1_" + lv + "_1").c_str(), s0, 3, 1, 1, true);
+            if (l > 0) {
+                a = ggml_upscale(gctx, a, 1 << l, GGML_SCALE_MODE_NEAREST);
+                s1 = ggml_upscale(gctx, s1, 1 << l, GGML_SCALE_MODE_NEAREST);
+            }
+            act = act ? ggml_concat(gctx, act, a, 2) : a;
+            sem = sem ? ggml_concat(gctx, sem, s1, 2) : s1;
+        }
+        // cv4 (3x3, plain) -> [W3, H3, 16]; cv3 (1x1, plain) -> [W3, H3, 512]
+        ggml_tensor* y = savpe_conv("cv4", act, 3, 1, 1, false);
+        ggml_tensor* x = savpe_conv("cv3", sem, 1, 1, 0, false);
+        if (!y || !x) return nullptr;
+
+        // Channels-first staging of the semantic map: [HW3, C] F32 rows,
+        // p = h*W + w — the SAME grid order the mask leaf and s_all use
+        // (torch's [C,H,W].flatten(2) layout). x's own memory already IS
+        // that layout ([W, H, C] with p innermost), so a plain reshape —
+        // no permute — reinterprets it; the per-group views below index it
+        // row-major ((p, ch) at p + ch*nb[1]). A permute-based staging here
+        // scrambles channels against grid positions and silently zeroes
+        // visual-prompt detections.
+        ggml_tensor* xT = x;
+        if (xT->type != GGML_TYPE_F32) xT = ggml_cast(gctx, xT, GGML_TYPE_F32);
+        xT = ggml_reshape_2d(gctx, xT, HW3, x->ne[2]);
+
+        // Per prompt q: cv5(mask) -> cat(y, .) -> cv6 -> masked softmax over
+        // the P3 grid -> one [HW3, 16] score column block.
+        ggml_tensor* s_all = nullptr;  // [HW3, 16*Q], prompt blocks in order
+        for (int64_t q = 0; q < Q; q++) {
+            ggml_tensor* vp_q = ggml_cont(gctx, ggml_view_4d(gctx, vp, W3, H3, 1, 1, vp->nb[1], vp->nb[2],
+                                                             vp->nb[3], q * vp->nb[2]));
+            ggml_tensor* m = savpe_conv("cv5", vp_q, 3, 1, 1, false);
+            // Concat type match (same pattern as world_detect's s4): the mask
+            // branch consumes the F32 external leaf, so on the GPU f16
+            // activation flows cv5 lands on F32 while cv4's `y` is F16 — cast
+            // the mask column to the activation flow's dtype before the
+            // concat (the following cv6 convs then see one dtype).
+            if (m->type != y->type) m = ggml_cast(gctx, m, y->type);
+            ggml_tensor* yq = ggml_concat(gctx, y, m, 2);  // [W3,H3,32]
+            yq = savpe_conv("cv6_0", yq, 3, 1, 1, true);
+            yq = savpe_conv("cv6_1", yq, 3, 1, 1, false);
+
+            // Stage per-group scores: [16, HW3] F32, rows = groups, p = h*W+w
+            // grid order (torch's [16,H,W].flatten(2)). yq's memory is that
+            // order transposed ([HW3, 16] rows, p innermost), so reshape to
+            // [HW3, 16], transpose-view, then cont materializes the
+            // group-major layout the masked-mul broadcast (src1 [1, HW3]
+            // must tile src0) and the s_all column offset below require.
+            ggml_tensor* yT = yq;
+            if (yT->type != GGML_TYPE_F32) yT = ggml_cast(gctx, yT, GGML_TYPE_F32);
+            yT = ggml_cont(gctx, ggml_permute(gctx, ggml_reshape_2d(gctx, yT, HW3, yq->ne[2]), 1, 0, 2, 3));  // [16, HW3]
+
+            // score = y * vp + (1 - vp) * finfo.min, softmax over the grid.
+            // For the binary mask leaf, (1 - vp) == relu(1 - vp) via one
+            // scale_bias (F32 leaf, no cast needed). The previous relu(-vp)
+            // identity is identically ZERO for non-negative vp, so the -1e30
+            // outside gate never fired and the softmax leaked uniform mass
+            // over the whole P3 grid — the aggregated vpe collapsed into the
+            // global image average and the contrastive head scored nothing.
+            ggml_tensor* vp_col = ggml_reshape_2d(gctx, ggml_reshape_1d(gctx, vp_q, HW3), 1, HW3);
+            ggml_tensor* outside = ggml_scale(gctx, ggml_relu(gctx, ggml_scale_bias(gctx, vp_col, -1.0f, 1.0f)), -1e30f);
+            ggml_tensor* masked = ggml_add(gctx, ggml_mul(gctx, yT, vp_col), outside);
+            // Softmax must run over the grid (ne0): transpose to [HW3, 16]
+            // (ne[axis_i] = a->ne[i], so (1,0,2,3) swaps the first two dims).
+            ggml_tensor* s_q = ggml_cont(gctx, ggml_permute(gctx, masked, 1, 0, 2, 3));
+            s_q = ggml_soft_max(gctx, s_q);
+            s_all = s_all ? ggml_concat(gctx, s_all, s_q, 1) : s_q;
+        }
+
+        // Grouped aggregation: for each of the 16 channel groups,
+        // agg_g = X_g @ S_g with X_g = channels [g*32, g*32+32) of the
+        // semantic map and S_g = the prompt-q score columns of that group;
+        // concat over groups -> [512, Q] (the head's cls_pe layout).
+        const int64_t c16 = y->ne[2];
+        const int64_t d = x->ne[2] / c16;  // 32 for the shipped 512-d models
+        ggml_tensor* out = nullptr;
+        for (int64_t g = 0; g < c16; g++) {
+            ggml_tensor* x_g =
+                ggml_cont(gctx, ggml_view_2d(gctx, xT, HW3, d, xT->nb[1], (size_t)(g * d) * xT->nb[1]));
+            // Column-offset into s_all: S_g[p, q] = s_all[p, q*16 + g] — the
+            // softmax weight of GROUP g at grid row p for prompt q (official
+            // SAVPE aggregation). The previous row-offset (g * nb[0]) read
+            // group 0 at grid g+p: mathematically wrong AND out of bounds
+            // for g+p >= HW3 (caused zero visual-prompt detections).
+            ggml_tensor* s_g = ggml_cont(gctx, ggml_view_2d(gctx, s_all, HW3, Q, s_all->nb[1] * c16,
+                                                            (size_t)g * s_all->nb[1]));
+            ggml_tensor* agg = ggml_mul_mat(gctx, x_g, s_g);  // [d, Q]
+            out = out ? ggml_concat(gctx, out, agg, 0) : agg;
+        }
+        // The official encoder L2-normalizes here; world_detect re-normalizes
+        // its cls_pe input regardless, so the extra chain is skipped.
+        return out;  // [512, Q]
+    }
 };
 
 }  // namespace
@@ -554,18 +701,37 @@ Session* create_session(const std::string& gguf_path, const SessionOptions& opts
     s->input_w = opts.input_w > 0 ? opts.input_w : s->model.meta.imgsz;
     s->input_h = opts.input_h > 0 ? opts.input_h : s->model.meta.imgsz;
     s->profile_gaps = opts.profile_gaps;
+    s->visual_boxes = opts.visual_boxes;
 
     ModelMeta& meta = s->model.meta;
     // YOLO-World: the class count is a runtime knob (set_classes). It fixes
     // the text-input shape and every nc-dependent tensor in the graph, so the
     // session must be recreated when the class list changes.
-    const int64_t world_nc = opts.world_nc > 0 ? opts.world_nc : meta.nc;
+    // YOLOE visual prompts: the example-box count drives the same shape
+    // (meta.nc = Q) and requires the checkpoint's SAVPE encoder weights.
+    const bool visual = opts.visual_count > 0;
+    if (visual) {
+        if (!s->model.has_savpe) {
+            YOLO_LOG_ERROR("visual prompts need a YOLOE GGUF converted with savpe weights "
+                           "(yolo.savpe=1); this checkpoint ships none — post-process it with "
+                           "scripts/convert_yoloe_savpe_gguf.py");
+            free_session(s);
+            return nullptr;
+        }
+        if ((int)opts.visual_boxes.size() != opts.visual_count * 4) {
+            YOLO_LOG_ERROR("visual_boxes must carry %d x 4 floats", opts.visual_count);
+            free_session(s);
+            return nullptr;
+        }
+    }
+    const int64_t world_nc = visual ? opts.visual_count : (opts.world_nc > 0 ? opts.world_nc : meta.nc);
     s->world_nc = (int)world_nc;
     if (s->model.has_text_input) meta.nc = (int)world_nc;
     // A text-conditioned head cannot run without a vocabulary. With no class list
     // the caller means "use whatever the checkpoint shipped", mirroring the Python
-    // default of predicting before any set_classes call.
-    if (s->model.has_text_input && opts.world_nc <= 0) {
+    // default of predicting before any set_classes call. Visual prompts replace
+    // the text input entirely, so the vocabulary requirement does not apply.
+    if (s->model.has_text_input && !visual && opts.world_nc <= 0) {
         if (s->model.vocab_txt.size() != (size_t)world_nc * 512) {
             YOLO_LOG_ERROR("no stored vocabulary for %zu classes: convert a checkpoint carrying "
                            "txt_feats, or pass --classes / --text-embed", (size_t)world_nc);
@@ -584,7 +750,8 @@ Session* create_session(const std::string& gguf_path, const SessionOptions& opts
     // node and the graph context holds one tensor struct per slot, so both are
     // sized from this number.
     const size_t node_budget =
-        s->model.ops.size() * 12 + 512 + (s->model.has_text_input ? (size_t)world_nc * 256 : 0);
+        s->model.ops.size() * 12 + 512 + (s->model.has_text_input ? (size_t)world_nc * 256 : 0) +
+        (visual ? (size_t)4096 + (size_t)opts.visual_count * 256 : 0);
 
     s->backend = init_backend_ctx(opts.threads, node_budget);
     if (!s->backend.cpu) {
@@ -676,7 +843,7 @@ Session* create_session(const std::string& gguf_path, const SessionOptions& opts
     ggml_set_name(s->input, "image");
 
     ggml_tensor* graph_text = nullptr;
-    if (s->model.has_text_input) {
+    if (s->model.has_text_input && !visual) {
         // External [512, nc] F32 text embedding (CLIP text encoder output).
         s->text_input = ggml_new_tensor_2d(s->gctx, GGML_TYPE_F32, 512, world_nc);
         ggml_set_input(s->text_input);
@@ -688,6 +855,17 @@ Session* create_session(const std::string& gguf_path, const SessionOptions& opts
             const std::string dp = "op." + std::to_string(s->model.detect_op_index);
             if (s->model.tensors.count(dp + ".reprta_w12_w")) graph_text = gb.reprta(dp, graph_text);
         }
+    }
+    if (visual) {
+        // External [W3, H3, Q] F32 binary mask leaf on the P3 grid; the savpe
+        // chain is built lazily on the first in_text() call (it consumes FPN
+        // features that only exist once the op loop reaches them), so no
+        // reprta residual applies on this path.
+        const int stride0 = meta.strides.empty() ? 8 : (int)meta.strides[0];
+        s->vp_input = ggml_new_tensor_4d(s->gctx, GGML_TYPE_F32, s->input_w / stride0, s->input_h / stride0,
+                                         opts.visual_count, 1);
+        ggml_set_input(s->vp_input);
+        ggml_set_name(s->vp_input, "vp_masks");
     }
 
     ggml_tensor* graph_input = s->input;
@@ -710,7 +888,27 @@ Session* create_session(const std::string& gguf_path, const SessionOptions& opts
             const int idx = op.inputs.empty() ? -1 : op.inputs[0];
             return idx < 0 ? graph_input : values[idx];
         };
-        auto in_text = [&]() {
+        auto in_text = [&]() -> ggml_tensor* {
+            if (visual) {
+                // Build the savpe chain lazily: the FPN features only exist
+                // once the op loop reaches the head that consumes them.
+                if (graph_text == nullptr) {
+                    std::vector<ggml_tensor*> fpn;
+                    for (int op_idx : s->model.savpe_fpn_ops) fpn.push_back(values[op_idx]);
+                    graph_text = gb.savpe(fpn, s->vp_input);
+                    // YOLO_SAVPE_DUMP reads these after the full graph run:
+                    // mark them as graph outputs so gallocr cannot recycle
+                    // their buffers once their last consumer completes
+                    // (without this the dumps read recycled garbage).
+                    ggml_set_output(graph_text);
+                    s->savpe_out = graph_text;  // debug readback hook
+                    for (size_t fi = 0; fi < fpn.size() && fi < 3; fi++) {
+                        s->savpe_fpn_dbg[fi] = fpn[fi];
+                        ggml_set_output(fpn[fi]);
+                    }
+                }
+                return graph_text;
+            }
             const int64_t ti = op.ip("text_in", -1);
             return ti < 0 ? graph_text : values[ti];
         };
@@ -894,6 +1092,7 @@ Session* create_session(const std::string& gguf_path, const SessionOptions& opts
     if (s->backend.sched && s->backend.gpu) {
         ggml_backend_sched_set_tensor_backend(s->backend.sched, s->input, s->backend.gpu);
         if (s->text_input) ggml_backend_sched_set_tensor_backend(s->backend.sched, s->text_input, s->backend.gpu);
+        if (s->vp_input) ggml_backend_sched_set_tensor_backend(s->backend.sched, s->vp_input, s->backend.gpu);
         ggml_backend_sched_set_tensor_backend(s->backend.sched, s->output, s->backend.gpu);
         if (s->output_proto) {
             ggml_backend_sched_set_tensor_backend(s->backend.sched, s->output_proto, s->backend.gpu);
@@ -927,6 +1126,8 @@ Session* create_session(const std::string& gguf_path, const SessionOptions& opts
     return s;
 }
 
+ggml_tensor* yolo_debug_emb() { return g_emb_dbg; }
+
 bool session_run(Session* s, const float* chw_image) {
     // profile_gaps splits session_run on stderr into the input-upload portion
     // and the graph-compute portion (record + submit + any internal
@@ -948,6 +1149,16 @@ bool session_run(Session* s, const float* chw_image) {
             ggml_backend_tensor_set_async(s->backend.gpu, s->text_input, s->text_pending.data(), 0, nbytes);
         } else {
             ggml_backend_tensor_set(s->text_input, s->text_pending.data(), 0, nbytes);
+        }
+    }
+    // Visual-prompt masks: same lifecycle as the text leaf — a host-side
+    // rasterization re-uploaded before every graph execution.
+    if (!s->vp_pending.empty() && s->vp_input) {
+        const size_t nbytes = s->vp_pending.size() * sizeof(float);
+        if (s->backend.gpu) {
+            ggml_backend_tensor_set_async(s->backend.gpu, s->vp_input, s->vp_pending.data(), 0, nbytes);
+        } else {
+            ggml_backend_tensor_set(s->vp_input, s->vp_pending.data(), 0, nbytes);
         }
     }
     const auto t1 = std::chrono::steady_clock::now();
@@ -978,6 +1189,55 @@ bool session_set_text(Session* s, const float* text_embed) {
     // keeps CPU and GPU backends on the same input-buffer lifecycle and avoids
     // writing through a tensor before its allocator has attached a buffer.
     s->text_pending.assign(text_embed, text_embed + ggml_nelements(s->text_input));
+    return true;
+}
+
+bool session_prepare_visual_masks(Session* s, const LetterboxInfo& info) {
+    if (!s || !s->visual_mode() || !s->model.has_savpe) return false;
+    const int q = (int)s->vp_input->ne[2];
+    const int stride0 = s->model.meta.strides.empty() ? 8 : (int)s->model.meta.strides[0];
+    const int w3 = s->input_w / stride0;
+    const int h3 = s->input_h / stride0;
+    if (w3 <= 0 || h3 <= 0) return false;
+
+    // Binary P3 masks [W3, H3, Q]: 1 inside the prompted box, 0 outside.
+    // Boxes arrive in original-image pixels; map them through the letterbox
+    // (scale + pad) and down to the P3 grid, matching the official
+    // LoadVisualPrompt(scale_factor=1/8) rasterization.
+    s->vp_pending.assign((size_t)w3 * h3 * q, 0.0f);
+    float* masks = s->vp_pending.data();
+    for (int i = 0; i < q; i++) {
+        float box[4];
+        for (int k = 0; k < 4; k++) box[k] = 0.0f;
+        if ((int)s->visual_boxes.size() >= (i + 1) * 4) {
+            for (int k = 0; k < 4; k++) box[k] = s->visual_boxes[(size_t)i * 4 + k];
+        }
+        const float sx1 = (box[0] * info.scale + info.pad_w) / stride0;
+        const float sy1 = (box[1] * info.scale + info.pad_h) / stride0;
+        const float sx2 = (box[2] * info.scale + info.pad_w) / stride0;
+        const float sy2 = (box[3] * info.scale + info.pad_h) / stride0;
+        int x0 = std::max(0, std::min((int)std::lround(sx1), w3));
+        int y0 = std::max(0, std::min((int)std::lround(sy1), h3));
+        int x1 = std::max(x0, std::min((int)std::lround(sx2), w3));
+        int y1 = std::max(y0, std::min((int)std::lround(sy2), h3));
+        float* plane = masks + (size_t)i * w3 * h3;
+        for (int yy = y0; yy < y1; ++yy) {
+            float* row = plane + (size_t)yy * w3;
+            for (int xx = x0; xx < x1; ++xx) row[xx] = 1.0f;
+        }
+        static const bool vp_dbg = std::getenv("YOLO_VP_DEBUG") != nullptr;
+        if (vp_dbg)
+            std::fprintf(stderr,
+                         "[vp-dbg] plane %d rect=[%d,%d)-[%d,%d) grid=%dx%d\n",
+                         i, x0, y0, x1, y1, w3, h3);
+    }
+    if (const char* mdump = std::getenv("YOLO_VP_DUMP")) {
+        FILE* f = std::fopen(mdump, "wb");
+        if (f) {
+            std::fwrite(masks, sizeof(float), s->vp_pending.size(), f);
+            std::fclose(f);
+        }
+    }
     return true;
 }
 
