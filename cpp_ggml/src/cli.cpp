@@ -3,6 +3,7 @@
 #include "common.hpp"
 #include "image_io.hpp"
 #include "postprocess.hpp"
+#include "tracker.hpp"
 #include "yolo_graph.hpp"
 
 #if defined(YOLO_GGML_CLIP) && YOLO_GGML_CLIP
@@ -11,14 +12,17 @@
 #endif
 
 #include <algorithm>
+#include <cctype>
 #include <cmath>
 #include <cstdio>
 #include <cstring>
+#include <dirent.h>
 #include <limits>
 #include <map>
 #include <memory>
 #include <numeric>
 #include <string>
+#include <sys/stat.h>
 #include <unordered_map>
 #include <vector>
 
@@ -47,8 +51,22 @@ void usage() {
             "                 [--max-det 300] [--threads N] [--dump-input OUT.bin] [--profile ops|gaps]\n"
             "  yolo-cli obb    --model M.gguf --source IMG [--out OUT.png] [--conf 0.25] [--iou 0.7] [--dump-ops DIR]\n"
             "                 [--max-det 300] [--threads N] [--dump-input OUT.bin] [--profile ops|gaps]\n"
+            "  yolo-cli track  --model M.gguf --source DIR|IMG[,IMG,...] [--tracker tracktrack]\n"
+            "                 [--tracks-json OUT.jsonl] [--out PREFIX] [--conf 0.1] [--iou 0.7]\n"
+            "                 [--max-det 300] [--threads N] [--tracker-config C.yaml] [--no-gmc]\n"
+            "                 [--frames DIR|LIST.txt] (frames for GMC in --dets-jsonl replay mode)\n"
+            "                 [--dets-jsonl IN.jsonl] (replay recorded detections instead of\n"
+            "                 running a model; --model/--source then optional)\n"
+            "                 (multi-object tracking over a frame sequence; tracker is one of\n"
+            "                 bytetrack|botsort|ocsort|deepocsort|fasttrack|tracktrack, default\n"
+            "                 tracktrack, or an official ultralytics/cfg/trackers/*.yaml file;\n"
+            "                 --tracker-config overrides individual keys from a YAML file;\n"
+            "                 detect/segment/pose/obb models are supported; --out writes\n"
+            "                 PREFIX_%%05d.png with #id labels)\n"
             "  yolo-cli semantic --model M.gguf --source IMG [--out OUT.png] [--threads N] [--dump-ops DIR] [--profile ops|gaps]\n"
+            "                 [--raw OUT.bin] (YSEM0001: orig-size class map for A/B comparisons)\n"
             "  yolo-cli classify --model M.gguf --source IMG [--topk 5] [--threads N] [--dump-ops DIR] [--profile ops|gaps]\n"
+            "                 [--raw OUT.bin] (YCLS0001: full softmax probs for A/B comparisons)\n"
             "  yolo-cli depth  --model M.gguf --source IMG [--out OUT.png] [--raw OUT.bin] [--max-depth M]\n"
             "                 [--threads N] [--dump-input OUT.bin] [--profile ops|gaps]\n"
             "  yolo-cli bench  --model M.gguf --source IMG [--warmup 20] [--iters 100] [--threads N]\n"
@@ -56,6 +74,7 @@ void usage() {
             "                 [--text-embed vocabulary.ytxt] (YOLO-World/YOLOE)\n"
             "  --profile ops:   per-op wall-time table on exit (adds per-node sync; GPU builds)\n"
             "  --profile gaps:  per-stage (upload/compute/readback) traces on stderr\n"
+            "  pose/obb --dets-json: final detections as JSON for the A/B comparisons\n"
             "\n"
             "raw binary formats (little endian, for pytorch parity tests):\n"
             "  --input-f32 / --dump-input: 8b magic \"YINP0001\", 3x i32 (C,H,W), then f32 CHW pixels\n"
@@ -151,6 +170,41 @@ std::string json_escape(const std::string& text) {
         }
     }
     return escaped;
+}
+
+// Full-canvas row-major run-length encoding of a segment mask (defined below);
+// used by the A/B JSON outputs.
+std::string mask_rle(int canvas_w, int canvas_h, const yolo::SegMask& m);
+
+// Resolve the original-image size used for unscale/clip. Image mode uses the
+// loaded image; --input-f32 runs may pass --img-size W,H to report boxes in
+// original-image coordinates (with the Python-pipeline boundary clip) instead
+// of canvas coordinates. Returns false on malformed input.
+bool resolve_orig_size(const Args& args, const yolo::Image& img, bool has_input_f32, int meta_imgsz,
+                       yolo::LetterboxInfo& info, int& ow, int& oh) {
+    ow = img.w;
+    oh = img.h;
+    const std::string img_size = arg_s(args, "img-size");
+    if (img_size.empty()) return true;
+    const size_t comma = img_size.find(',');
+    if (comma == std::string::npos) {
+        fprintf(stderr, "--img-size expects W,H\n");
+        return false;
+    }
+    const int w = atoi(img_size.substr(0, comma).c_str());
+    const int h = atoi(img_size.c_str() + comma + 1);
+    if (w <= 0 || h <= 0) {
+        fprintf(stderr, "--img-size expects positive W,H\n");
+        return false;
+    }
+    if (!has_input_f32) {
+        fprintf(stderr, "note: --img-size only applies with --input-f32; using the loaded image size\n");
+        return true;
+    }
+    info = yolo::letterbox_geometry(w, h, meta_imgsz);
+    ow = w;
+    oh = h;
+    return true;
 }
 
 // ---- raw f32 dump helpers (tensor-level parity with pytorch) ----------------
@@ -500,7 +554,9 @@ int cmd_detect(const Args& args) {
         if (!yolo::session_read_proto(s, proto, nm, pw, ph)) return 1;
         masks = yolo::compose_masks(dets, raw, na, s->model.meta, proto, pw, ph, canvas_w, canvas_h);
     }
-    yolo::unscale_boxes(dets, info);
+    int orig_w = 0, orig_h = 0;
+    if (!resolve_orig_size(args, img, !in_f32.empty(), meta.imgsz, info, orig_w, orig_h)) return 1;
+    yolo::unscale_boxes(dets, info, orig_w, orig_h);
 
     // Visual-prompt results group examples: official semantics label them
     // object0..objectN-1 regardless of any class list.
@@ -537,15 +593,20 @@ int cmd_detect(const Args& args) {
         }
         // The vocabulary is part of the result: an open-vocabulary run maps class ids
         // to dataset categories by name, so re-deriving the list here would be a second
-        // source of truth for --classes semantics.
-        fputs("{\"vocabulary\":[", f);
+        // source of truth for --classes semantics. "canvas" is the letterbox size the
+        // masks live in; segment detections carry a full-canvas row-major RLE so the
+        // A/B comparisons can diff final masks pixel-for-pixel.
+        fprintf(f, "{\"canvas\":[%d,%d],\"vocabulary\":[", canvas_w, canvas_h);
         for (size_t i = 0; i < names.size(); i++)
             fprintf(f, "%s\"%s\"", i ? "," : "", json_escape(names[i]).c_str());
         fputs("],\"detections\":[", f);
         for (size_t i = 0; i < dets.size(); i++) {
             const auto& d = dets[i];
-            fprintf(f, "%s{\"cls\":%d,\"conf\":%.6f,\"xyxy\":[%.3f,%.3f,%.3f,%.3f]}", i ? "," : "",
-                    d.class_id, d.score, d.x1, d.y1, d.x2, d.y2);
+            fprintf(f, "%s{\"cls\":%d,\"conf\":%.6f,\"xyxy\":[%.3f,%.3f,%.3f,%.3f]", i ? "," : "", d.class_id,
+                    d.score, d.x1, d.y1, d.x2, d.y2);
+            if (meta.task == "segment" && i < masks.size() && masks[i].w > 0)
+                fprintf(f, ",\"mask\":\"%s\"", mask_rle(canvas_w, canvas_h, masks[i]).c_str());
+            fputs("}", f);
         }
         fputs("]}\n", f);
         fclose(f);
@@ -568,8 +629,9 @@ int cmd_detect(const Args& args) {
 int cmd_pose(const Args& args) {
     const std::string model_path = arg_s(args, "model");
     const std::string source = arg_s(args, "source");
-    if (model_path.empty() || source.empty()) {
-        fprintf(stderr, "--model and --source are required\n");
+    const std::string in_f32 = arg_s(args, "input-f32");
+    if (model_path.empty() || (source.empty() && in_f32.empty())) {
+        fprintf(stderr, "--model and (--source | --input-f32) are required\n");
         return 1;
     }
     const yolo::ModelMeta meta = yolo::read_gguf_meta(model_path);
@@ -580,9 +642,29 @@ int cmd_pose(const Args& args) {
     }
     yolo::Image img;
     yolo::LetterboxInfo info{};
-    if (!yolo::load_image(source, img)) return 1;
     std::vector<float> input;
-    yolo::letterbox_image(img, meta.imgsz, info, input);
+    int canvas_w = meta.imgsz, canvas_h = meta.imgsz;
+    if (!in_f32.empty()) {
+        // Same engine-level A/B path as detect --input-f32: consume a dumped
+        // letterbox tensor verbatim; detections stay in canvas coordinates.
+        std::vector<int32_t> in_dims = {3, canvas_h, canvas_w};
+        if (!read_f32(in_f32.c_str(), "YINP0001", in_dims, input)) {
+            fprintf(stderr, "failed to read --input-f32 %s\n", in_f32.c_str());
+            return 1;
+        }
+        canvas_h = in_dims[1];
+        canvas_w = in_dims[2];
+        if (in_dims[0] != 3) {
+            fprintf(stderr, "--input-f32 must contain three channels\n");
+            return 1;
+        }
+        info = yolo::LetterboxInfo{1.0f, 0, 0, canvas_w, canvas_h, canvas_w, canvas_h};
+    } else {
+        if (!yolo::load_image(source, img)) return 1;
+        yolo::letterbox_image(img, meta.imgsz, info, input);
+        canvas_w = info.imgsz_w;
+        canvas_h = info.imgsz_h;
+    }
     yolo::SessionOptions sopts;
     sopts.threads = arg_i(args, "threads", 0);
     sopts.input_w = info.imgsz_w;
@@ -608,7 +690,9 @@ int cmd_pose(const Args& args) {
     cfg.max_det = arg_i(args, "max-det", s->model.meta.max_det);
     std::vector<yolo::PoseDetection> poses =
         yolo::postprocess_pose(raw, no, na, s->model.meta, s->anchors.data(), s->anchor_strides.data(), cfg);
-    yolo::unscale_pose(poses, info);
+    int orig_w = 0, orig_h = 0;
+    if (!resolve_orig_size(args, img, !in_f32.empty(), meta.imgsz, info, orig_w, orig_h)) return 1;
+    yolo::unscale_pose(poses, info, orig_w, orig_h);
     const auto& names = s->model.meta.class_names;
     printf("%zu pose result%s (%s, %s, %dx%d, backend=%s)\n", poses.size(), poses.size() == 1 ? "" : "s",
            s->model.meta.name.c_str(), s->model.meta.dtype.c_str(), info.imgsz_w, info.imgsz_h,
@@ -623,8 +707,31 @@ int cmd_pose(const Args& args) {
         if (nkpt > 5) printf(" ...");
         printf("\n");
     }
+    // Machine-readable pose detections for the A/B comparisons: final boxes and
+    // keypoints in original-image pixels, the same quantities Python predict
+    // exposes on Results.
+    const std::string pose_json = arg_s(args, "dets-json");
+    if (!pose_json.empty()) {
+        FILE* f = fopen(pose_json.c_str(), "wb");
+        if (!f) {
+            fprintf(stderr, "failed to write --dets-json %s\n", pose_json.c_str());
+            return 1;
+        }
+        fprintf(f, "{\"canvas\":[%d,%d],\"detections\":[", info.imgsz_w, info.imgsz_h);
+        for (size_t i = 0; i < poses.size(); i++) {
+            const auto& p = poses[i];
+            fprintf(f, "%s{\"cls\":%d,\"conf\":%.6f,\"xyxy\":[%.3f,%.3f,%.3f,%.3f],\"kpts\":[", i ? "," : "",
+                    p.det.class_id, p.det.score, p.det.x1, p.det.y1, p.det.x2, p.det.y2);
+            for (size_t j = 0; j < p.kpts.size(); j++) fprintf(f, "%s%.3f", j ? "," : "", p.kpts[j]);
+            fputs("]}", f);
+        }
+        fputs("]}\n", f);
+        fclose(f);
+    }
     const std::string out = arg_s(args, "out");
-    if (!out.empty() && !yolo::draw_pose(out, img, poses, names)) {
+    if (!out.empty() && !in_f32.empty()) {
+        fprintf(stderr, "note: --out skipped with --input-f32 (no source image)\n");
+    } else if (!out.empty() && !yolo::draw_pose(out, img, poses, names)) {
         fprintf(stderr, "failed to write --out %s\n", out.c_str());
         return 1;
     }
@@ -636,8 +743,9 @@ int cmd_pose(const Args& args) {
 int cmd_obb(const Args& args) {
     const std::string model_path = arg_s(args, "model");
     const std::string source = arg_s(args, "source");
-    if (model_path.empty() || source.empty()) {
-        fprintf(stderr, "--model and --source are required\n");
+    const std::string obb_in_f32 = arg_s(args, "input-f32");
+    if (model_path.empty() || (source.empty() && obb_in_f32.empty())) {
+        fprintf(stderr, "--model and (--source | --input-f32) are required\n");
         return 1;
     }
     const yolo::ModelMeta meta = yolo::read_gguf_meta(model_path);
@@ -648,9 +756,29 @@ int cmd_obb(const Args& args) {
     }
     yolo::Image img;
     yolo::LetterboxInfo info{};
-    if (!yolo::load_image(source, img)) return 1;
     std::vector<float> input;
-    yolo::letterbox_image(img, meta.imgsz, info, input);
+    int obb_canvas_w = meta.imgsz, obb_canvas_h = meta.imgsz;
+    if (!obb_in_f32.empty()) {
+        // Engine-level A/B path: consume a dumped letterbox tensor verbatim;
+        // detections stay in canvas coordinates (see detect --input-f32).
+        std::vector<int32_t> in_dims = {3, obb_canvas_h, obb_canvas_w};
+        if (!read_f32(obb_in_f32.c_str(), "YINP0001", in_dims, input)) {
+            fprintf(stderr, "failed to read --input-f32 %s\n", obb_in_f32.c_str());
+            return 1;
+        }
+        obb_canvas_h = in_dims[1];
+        obb_canvas_w = in_dims[2];
+        if (in_dims[0] != 3) {
+            fprintf(stderr, "--input-f32 must contain three channels\n");
+            return 1;
+        }
+        info = yolo::LetterboxInfo{1.0f, 0, 0, obb_canvas_w, obb_canvas_h, obb_canvas_w, obb_canvas_h};
+    } else {
+        if (!yolo::load_image(source, img)) return 1;
+        yolo::letterbox_image(img, meta.imgsz, info, input);
+        obb_canvas_w = info.imgsz_w;
+        obb_canvas_h = info.imgsz_h;
+    }
     yolo::SessionOptions sopts;
     sopts.threads = arg_i(args, "threads", 0);
     sopts.input_w = info.imgsz_w;
@@ -676,6 +804,8 @@ int cmd_obb(const Args& args) {
     cfg.max_det = arg_i(args, "max-det", s->model.meta.max_det);
     std::vector<yolo::OBBDetection> obbs =
         yolo::postprocess_obb(raw, no, na, s->model.meta, s->anchors.data(), s->anchor_strides.data(), cfg);
+    int obb_ow = 0, obb_oh = 0;
+    if (!resolve_orig_size(args, img, !obb_in_f32.empty(), meta.imgsz, info, obb_ow, obb_oh)) return 1;
     yolo::unscale_obb(obbs, info);
     const auto& names = s->model.meta.class_names;
     printf("%zu obb result%s (%s, %s, %dx%d, backend=%s)\n", obbs.size(), obbs.size() == 1 ? "" : "s",
@@ -686,8 +816,28 @@ int cmd_obb(const Args& args) {
         printf("  %-12s %.2f  rbox cx=%.1f cy=%.1f w=%.1f h=%.1f angle=%.1fdeg\n", cname, o.score, o.cx, o.cy, o.w,
                o.h, o.angle * 180.0f / 3.14159265f);
     }
+    // Machine-readable OBB detections for the A/B comparisons: rotated boxes in
+    // original-image pixels (cx, cy, w, h, angle radians).
+    const std::string obb_json = arg_s(args, "dets-json");
+    if (!obb_json.empty()) {
+        FILE* f = fopen(obb_json.c_str(), "wb");
+        if (!f) {
+            fprintf(stderr, "failed to write --dets-json %s\n", obb_json.c_str());
+            return 1;
+        }
+        fprintf(f, "{\"canvas\":[%d,%d],\"detections\":[", info.imgsz_w, info.imgsz_h);
+        for (size_t i = 0; i < obbs.size(); i++) {
+            const auto& o = obbs[i];
+            fprintf(f, "%s{\"cls\":%d,\"conf\":%.6f,\"cx\":%.3f,\"cy\":%.3f,\"w\":%.3f,\"h\":%.3f,\"angle\":%.6f}",
+                    i ? "," : "", o.class_id, o.score, o.cx, o.cy, o.w, o.h, o.angle);
+        }
+        fputs("]}\n", f);
+        fclose(f);
+    }
     const std::string out = arg_s(args, "out");
-    if (!out.empty() && !yolo::draw_obb(out, img, obbs, names)) {
+    if (!out.empty() && !obb_in_f32.empty()) {
+        fprintf(stderr, "note: --out skipped with --input-f32 (no source image)\n");
+    } else if (!out.empty() && !yolo::draw_obb(out, img, obbs, names)) {
         fprintf(stderr, "failed to write --out %s\n", out.c_str());
         return 1;
     }
@@ -734,6 +884,57 @@ int cmd_semantic(const Args& args) {
     int nc = 0, gw = 0, gh = 0;
     if (!yolo::session_read_semantic(s, logits, nc, gw, gh)) return 1;
     std::vector<uint8_t> classes = yolo::semantic_argmax(logits, nc, gw, gh);
+    // Final-mode class map for the A/B comparisons, replicating the Python
+    // semantic postprocess (predict.py postprocess + ops.scale_masks): bilinear
+    // logits up to the letterbox canvas, crop the padding, bilinear down to the
+    // original image, then per-pixel argmax (nearest-upsampled argmax disagree
+    // with Python wherever interpolated logits cross, which measurably changes
+    // both pixels and the present class set). One uint8 class id per pixel as
+    // f32 (YSEM0001).
+    const std::string sem_raw = arg_s(args, "raw");
+    if (!sem_raw.empty()) {
+        const int ow = img.w, oh = img.h, cwv = info.imgsz_w, chv = info.imgsz_h;
+        const float sgx = (float)gw / cwv, sgy = (float)gh / chv;
+        const float gain = std::min((float)chv / oh, (float)cwv / ow);
+        const float pad_w = (cwv - std::round(ow * gain)) / 2.0f;
+        const float pad_h = (chv - std::round(oh * gain)) / 2.0f;
+        const int left = (int)std::nearbyint(pad_w - 0.1f), top = (int)std::nearbyint(pad_h - 0.1f);
+        const int crop_w = cwv - left - (int)std::nearbyint(pad_w + 0.1f);
+        const int crop_h = chv - top - (int)std::nearbyint(pad_h + 0.1f);
+        const float sx2 = (float)crop_w / ow, sy2 = (float)crop_h / oh;
+        auto grid_at = [&](int c, float cx, float cy) {
+            const float sx = std::max(0.0f, (cx + 0.5f) * sgx - 0.5f);
+            const float sy = std::max(0.0f, (cy + 0.5f) * sgy - 0.5f);
+            const int ix = (int)sx, iy = (int)sy;
+            const int ix1 = std::min(ix + 1, gw - 1), iy1 = std::min(iy + 1, gh - 1);
+            const float fx = sx - ix, fy = sy - iy;
+            const float* base = logits.data() + (size_t)c * gw * gh;
+            return base[(size_t)iy * gw + ix] * (1 - fx) * (1 - fy) + base[(size_t)iy * gw + ix1] * fx * (1 - fy) +
+                   base[(size_t)iy1 * gw + ix] * (1 - fx) * fy + base[(size_t)iy1 * gw + ix1] * fx * fy;
+        };
+        std::vector<uint8_t> full((size_t)ow * oh);
+        for (int y = 0; y < oh; y++) {
+            const float cy = std::max(0.0f, (y + 0.5f) * sy2 - 0.5f) + top;
+            for (int x = 0; x < ow; x++) {
+                const float cx = std::max(0.0f, (x + 0.5f) * sx2 - 0.5f) + left;
+                int best = 0;
+                float best_v = grid_at(0, cx, cy);
+                for (int c = 1; c < nc; c++) {
+                    const float v = grid_at(c, cx, cy);
+                    if (v > best_v) {
+                        best_v = v;
+                        best = c;
+                    }
+                }
+                full[(size_t)y * ow + x] = (uint8_t)best;
+            }
+        }
+        std::vector<float> full_f(full.begin(), full.end());
+        if (!dump_f32(sem_raw.c_str(), "YSEM0001", {img.h, img.w}, full_f.data(), full_f.size())) {
+            fprintf(stderr, "failed to write --raw %s\n", sem_raw.c_str());
+            return 1;
+        }
+    }
     const auto& names = s->model.meta.class_names;
     printf("semantic %dx%d grid, %d classes, top classes:", gw, gh, nc);
     std::map<uint8_t, size_t> hist;
@@ -800,6 +1001,13 @@ int cmd_classify(const Args& args) {
     std::vector<float> logits;
     if (!yolo::session_read_logits(s, logits)) return 1;
     std::vector<float> probs = yolo::classify_softmax(logits);
+    // Final-mode softmax probabilities for the A/B comparisons (YCLS0001).
+    const std::string cls_raw = arg_s(args, "raw");
+    if (!cls_raw.empty() &&
+        !dump_f32(cls_raw.c_str(), "YCLS0001", {(int)probs.size()}, probs.data(), probs.size())) {
+        fprintf(stderr, "failed to write --raw %s\n", cls_raw.c_str());
+        return 1;
+    }
     const int topk = std::clamp(arg_i(args, "topk", 5), 1, (int)probs.size());
     std::vector<size_t> idx(probs.size());
     std::iota(idx.begin(), idx.end(), 0);
@@ -888,6 +1096,508 @@ int cmd_depth(const Args& args) {
     printf("depth %dx%d meters (min=%.3f mean=%.3f max=%.3f, model=%s, dtype=%s)\n", img.w, img.h, *lo, mean,
            *hi, meta.name.c_str(), meta.dtype.c_str());
     return 0;
+}
+
+// ---- track -------------------------------------------------------------------
+
+// Frame sources: a directory of images (sorted by name), a comma-separated file
+// list, or a single image (a single-frame track). Tracking needs consecutive
+// frames of one stream; video decoding is out of scope for the C++ runtime.
+std::vector<std::string> list_frame_files(const std::string& source) {
+    auto has_image_ext = [](const std::string& s) {
+        const size_t dot = s.rfind('.');
+        if (dot == std::string::npos) return false;
+        std::string ext = s.substr(dot);
+        for (char& c : ext) c = (char)std::tolower((unsigned char)c);
+        return ext == ".jpg" || ext == ".jpeg" || ext == ".png" || ext == ".bmp" || ext == ".tga";
+    };
+    std::vector<std::string> files;
+    if (source.find(',') != std::string::npos) {
+        size_t pos = 0;
+        while (true) {
+            const size_t comma = source.find(',', pos);
+            std::string tok = source.substr(pos, comma == std::string::npos ? std::string::npos : comma - pos);
+            const size_t b = tok.find_first_not_of(' '), e = tok.find_last_not_of(' ');
+            if (b != std::string::npos) files.push_back(tok.substr(b, e - b + 1));
+            if (comma == std::string::npos) break;
+            pos = comma + 1;
+        }
+        return files;
+    }
+    struct stat st;
+    if (stat(source.c_str(), &st) == 0 && S_ISDIR(st.st_mode)) {
+        DIR* d = opendir(source.c_str());
+        if (!d) return files;
+        while (const dirent* ent = readdir(d)) {
+            const std::string name = ent->d_name;
+            if (name.front() == '.') continue;
+            if (has_image_ext(name)) files.push_back(source + "/" + name);
+        }
+        closedir(d);
+        std::sort(files.begin(), files.end());
+        return files;
+    }
+    files.push_back(source);
+    return files;
+}
+
+yolo::track::TrackDet det_to_track(const yolo::Detection& d, int idx) {
+    yolo::track::TrackDet t;
+    t.cx = (d.x1 + d.x2) / 2;
+    t.cy = (d.y1 + d.y2) / 2;
+    t.w = d.x2 - d.x1;
+    t.h = d.y2 - d.y1;
+    t.angle = -10.0f;
+    t.score = d.score;
+    t.class_id = d.class_id;
+    t.idx = idx;
+    return t;
+}
+
+yolo::track::TrackDet obb_to_track(const yolo::OBBDetection& o, int idx) {
+    yolo::track::TrackDet t;
+    t.cx = o.cx;
+    t.cy = o.cy;
+    t.w = o.w;
+    t.h = o.h;
+    t.angle = o.angle;
+    t.score = o.score;
+    t.class_id = o.class_id;
+    t.idx = idx;
+    return t;
+}
+
+// Full-canvas row-major run-length encoding of a binary mask (runs alternate
+// 0/1 starting with the leading zero-run count) — the compact form used by the
+// A/B comparisons to diff final masks pixel-for-pixel.
+std::string mask_rle(int canvas_w, int canvas_h, const yolo::SegMask& m) {
+    std::vector<uint8_t> full((size_t)canvas_w * canvas_h, 0);
+    for (int y = 0; y < m.h; y++)
+        for (int x = 0; x < m.w; x++)
+            if (m.bits[(size_t)y * m.w + x]) {
+                const int cy = m.y + y, cx = m.x + x;
+                if (cy >= 0 && cy < canvas_h && cx >= 0 && cx < canvas_w) full[(size_t)cy * canvas_w + cx] = 1;
+            }
+    std::vector<uint64_t> runs;
+    uint64_t run = 0;
+    uint8_t val = 0;
+    for (size_t i = 0; i < full.size(); i++) {
+        if (full[i] == val) {
+            run++;
+        } else {
+            runs.push_back(run);
+            run = 1;
+            val ^= 1;
+        }
+    }
+    runs.push_back(run);
+    std::string out;
+    char buf[24];
+    for (size_t i = 0; i < runs.size(); i++) {
+        snprintf(buf, sizeof(buf), "%s%llu", i ? "," : "", (unsigned long long)runs[i]);
+        out += buf;
+    }
+    return out;
+}
+
+void write_track_json_entry(FILE* f, const yolo::track::TrackDet& t, int track_id,
+                            const std::vector<float>* kpts = nullptr) {
+    fprintf(f, "{\"cx\":%.6f,\"cy\":%.6f,\"w\":%.6f,\"h\":%.6f", t.cx, t.cy, t.w, t.h);
+    if (t.angled()) fprintf(f, ",\"angle\":%.6f", t.angle);
+    if (track_id >= 0) fprintf(f, ",\"id\":%d", track_id);
+    fprintf(f, ",\"score\":%.6f,\"cls\":%d,\"idx\":%d", t.score, t.class_id, t.idx);
+    if (kpts && !kpts->empty()) {
+        fputs(",\"kpts\":[", f);
+        for (size_t j = 0; j < kpts->size(); j++) fprintf(f, "%s%.3f", j ? "," : "", (*kpts)[j]);
+        fputs("]", f);
+    }
+    fputs("}", f);
+}
+
+// --dets-jsonl replay input: per-frame detections in the same schema
+// --tracks-json writes (flat objects; angle/id optional). Driving the tracker
+// with recorded or hand-written detections skips the model entirely — the
+// tracking analog of --input-f32, and how the parity script replays frames.
+struct ReplayFrame {
+    std::vector<yolo::track::TrackDet> dets, dets_del;
+};
+
+float json_num(const std::string& obj, const char* key, float def) {
+    const std::string pat = std::string("\"") + key + "\":";
+    const size_t p = obj.find(pat);
+    if (p == std::string::npos) return def;
+    return strtof(obj.c_str() + p + pat.size(), nullptr);
+}
+
+int json_int(const std::string& obj, const char* key, int def) {
+    const std::string pat = std::string("\"") + key + "\":";
+    const size_t p = obj.find(pat);
+    if (p == std::string::npos) return def;
+    return atoi(obj.c_str() + p + pat.size());
+}
+
+std::vector<yolo::track::TrackDet> json_det_array(const std::string& line, const char* array_key) {
+    std::vector<yolo::track::TrackDet> out;
+    // Colon suffix disambiguates "detections": from "detections_del":.
+    const size_t arr = line.find(std::string("\"") + array_key + "\":");
+    if (arr == std::string::npos) return out;
+    size_t pos = line.find('[', arr);
+    if (pos == std::string::npos) return out;
+    while (true) {
+        const size_t obj_begin = line.find('{', pos);
+        const size_t arr_end = line.find(']', pos);
+        if (obj_begin == std::string::npos || (arr_end != std::string::npos && arr_end < obj_begin)) break;
+        const size_t obj_end = line.find('}', obj_begin);
+        if (obj_end == std::string::npos) break;
+        const std::string obj = line.substr(obj_begin, obj_end - obj_begin + 1);
+        yolo::track::TrackDet d;
+        d.cx = json_num(obj, "cx", 0);
+        d.cy = json_num(obj, "cy", 0);
+        d.w = json_num(obj, "w", 0);
+        d.h = json_num(obj, "h", 0);
+        d.score = json_num(obj, "score", 0);
+        d.class_id = json_int(obj, "cls", 0);
+        d.idx = json_int(obj, "idx", 0);
+        const size_t angle_key = obj.find("\"angle\":");
+        d.angle = angle_key == std::string::npos ? -10.0f : json_num(obj, "angle", -10.0f);
+        out.push_back(d);
+        pos = obj_end + 1;
+    }
+    return out;
+}
+
+std::vector<ReplayFrame> read_replay_frames(const std::string& path) {
+    std::vector<ReplayFrame> frames;
+    FILE* f = fopen(path.c_str(), "rb");
+    if (!f) return frames;
+    char buf[65536];
+    size_t n;
+    std::string content;
+    while ((n = fread(buf, 1, sizeof(buf), f)) > 0) content.append(buf, n);
+    fclose(f);
+    size_t pos = 0;
+    while (pos < content.size()) {
+        size_t eol = content.find('\n', pos);
+        if (eol == std::string::npos) eol = content.size();
+        const std::string line = content.substr(pos, eol - pos);
+        pos = eol + 1;
+        if (line.find("detections") == std::string::npos) continue;
+        ReplayFrame fr;
+        fr.dets = json_det_array(line, "detections");
+        fr.dets_del = json_det_array(line, "detections_del");
+        frames.push_back(std::move(fr));
+    }
+    return frames;
+}
+
+int cmd_track(const Args& args) {
+    const std::string model_path = arg_s(args, "model");
+    const std::string source = arg_s(args, "source");
+    const std::string dets_in_path = arg_s(args, "dets-jsonl");
+    if (model_path.empty() && dets_in_path.empty()) {
+        fprintf(stderr, "--model (or --dets-jsonl) is required\n");
+        return 1;
+    }
+    if (source.empty() && dets_in_path.empty()) {
+        fprintf(stderr, "--source is required\n");
+        return 1;
+    }
+    yolo::ModelMeta meta;
+    std::vector<ReplayFrame> replay;
+    if (!dets_in_path.empty()) {
+        // Replay mode: drive the tracker with recorded detections, no model.
+        replay = read_replay_frames(dets_in_path);
+        if (replay.empty()) {
+            fprintf(stderr, "no frames parsed from --dets-jsonl %s\n", dets_in_path.c_str());
+            return 1;
+        }
+        meta.task = "detect";
+        meta.imgsz = 640;
+        meta.max_det = 300;
+    } else {
+        meta = yolo::read_gguf_meta(model_path);
+        if (meta.imgsz <= 0) return 1;
+        // Trackable tasks in canonical order, mirroring trackers/track.py's on_predict_start.
+        if (meta.task != "detect" && meta.task != "segment" && meta.task != "pose" && meta.task != "obb") {
+            fprintf(stderr, "task '%s' doesn't support mode=track, valid tasks are detect, segment, pose, obb\n",
+                    meta.task.c_str());
+            return 1;
+        }
+    }
+
+    // Tracker config: bare type (official YAML defaults) or a YAML file, plus
+    // optional per-key overrides via --tracker-config.
+    yolo::track::TrackConfig tcfg;
+    if (!yolo::track::resolve_tracker_config(arg_s(args, "tracker", "tracktrack"), tcfg)) return 1;
+    const std::string cfg_override = arg_s(args, "tracker-config");
+    if (!cfg_override.empty() && !yolo::track::load_tracker_config_yaml(cfg_override, tcfg)) return 1;
+    auto tracker = yolo::track::create_tracker(tcfg);
+    if (!tracker) return 1;
+
+    const std::vector<std::string> frames = list_frame_files(source);
+    // Optional frames for GMC while replaying detections (--dets-jsonl + --frames).
+    std::vector<std::string> gmc_frames;
+    const std::string gmc_source = arg_s(args, "frames");
+    if (!gmc_source.empty()) {
+        gmc_frames = list_frame_files(gmc_source);
+        if (gmc_frames.empty()) {
+            fprintf(stderr, "no frames found for --frames %s\n", gmc_source.c_str());
+            return 1;
+        }
+        if (gmc_frames.size() != replay.size()) {
+            fprintf(stderr, "--frames has %zu files but --dets-jsonl has %zu frames; counts must match\n",
+                    gmc_frames.size(), replay.size());
+            return 1;
+        }
+    }
+    if (replay.empty() && frames.empty()) {
+        fprintf(stderr, "no frames found for --source %s\n", source.c_str());
+        return 1;
+    }
+
+    yolo::PostprocConfig cfg;
+    // ByteTrack-family association needs low-confidence detections; 0.1 mirrors
+    // Model.track()'s conf default.
+    cfg.conf_thres = (float)arg_f(args, "conf", 0.1);
+    cfg.iou_thres = (float)arg_f(args, "iou", 0.7);
+    cfg.max_det = arg_i(args, "max-det", meta.max_det);
+    if (!(cfg.conf_thres > 0.0f && cfg.conf_thres < 1.0f) || !(cfg.iou_thres >= 0.0f && cfg.iou_thres <= 1.0f) ||
+        cfg.max_det <= 0) {
+        fprintf(stderr, "--conf must be in (0,1), --iou in [0,1], and --max-det positive\n");
+        return 1;
+    }
+    // Loose-NMS recovery for TrackTrack (detect/obb only), mirroring
+    // track_tracker.attach_raw_preds_hook + compute_dets_del.
+    yolo::PostprocConfig loose = cfg;
+    loose.iou_thres = 0.95f;
+    const bool want_recovered = tcfg.tracker_type == "tracktrack" && (meta.task == "detect" || meta.task == "obb");
+
+    const std::string tracks_json = arg_s(args, "tracks-json");
+    const std::string out_prefix = arg_s(args, "out");
+    FILE* jf = nullptr;
+    if (!tracks_json.empty()) {
+        jf = fopen(tracks_json.c_str(), "wb");
+        if (!jf) {
+            fprintf(stderr, "failed to write --tracks-json %s\n", tracks_json.c_str());
+            return 1;
+        }
+    }
+
+    SessionPtr session(nullptr, yolo::free_session);
+    yolo::Session* s = nullptr;
+    yolo::LetterboxInfo info{};
+    int canvas_w = 0, canvas_h = 0;
+    int rc = 0;
+
+    const size_t n_frames = replay.empty() ? frames.size() : replay.size();
+    for (size_t k = 0; k < n_frames; k++) {
+        yolo::Image img;
+        yolo::track::FrameInput fin;
+        fin.frame = nullptr;
+        // --no-gmc feeds a null frame: GMC is skipped exactly like Python's
+        // update(results, img=None) path (used for deterministic parity replays).
+        if (replay.empty()) {
+            fin.frame = arg_s(args, "no-gmc").empty() ? &img : nullptr;
+        } else if (!gmc_frames.empty()) {
+            // Replay mode with optional GMC frames: detections come from the
+            // JSONL, frames feed the GMC estimator.
+            if (!yolo::load_image(gmc_frames[k], img)) {
+                rc = 1;
+                break;
+            }
+            fin.frame = &img;
+        }
+        auto fin_dets = [&](yolo::track::TrackDet d) { fin.dets.push_back(d); };
+        auto fin_del = [&](yolo::track::TrackDet d) { fin.dets_del.push_back(d); };
+        std::vector<yolo::Detection> dets;
+        std::vector<yolo::SegMask> masks;
+        std::vector<yolo::PoseDetection> poses;
+        std::vector<yolo::OBBDetection> obbs;
+        if (replay.empty()) {
+            if (!yolo::load_image(frames[k], img)) {
+                rc = 1;
+                break;
+            }
+            std::vector<float> input;
+            yolo::letterbox_image(img, meta.imgsz, info, input);
+            if (!s) {
+                canvas_w = info.imgsz_w;
+                canvas_h = info.imgsz_h;
+                yolo::SessionOptions sopts;
+                sopts.threads = arg_i(args, "threads", 0);
+                sopts.input_w = canvas_w;
+                sopts.input_h = canvas_h;
+                session.reset(yolo::create_session(model_path, sopts));
+                s = session.get();
+                if (!s) {
+                    rc = 1;
+                    break;
+                }
+            } else if (info.imgsz_w != canvas_w || info.imgsz_h != canvas_h) {
+                fprintf(stderr, "frame %s letterboxes to %dx%d; tracking requires every frame to share the\n"
+                                "first frame's canvas (%dx%d)\n",
+                        frames[k].c_str(), info.imgsz_w, info.imgsz_h, canvas_w, canvas_h);
+                rc = 1;
+                break;
+            }
+            if (!yolo::session_run(s, input.data())) {
+                rc = 1;
+                break;
+            }
+            std::vector<float> raw;
+            int no = 0, na = 0;
+            if (!yolo::session_read_output(s, raw, no, na)) {
+                rc = 1;
+                break;
+            }
+
+            if (meta.task == "detect" || meta.task == "segment") {
+                dets = yolo::postprocess(raw, no, na, s->model.meta, s->anchors.data(), s->anchor_strides.data(), cfg);
+                if (meta.task == "segment") {
+                    std::vector<float> proto;
+                    int nm = 0, pw = 0, ph = 0;
+                    if (!yolo::session_read_proto(s, proto, nm, pw, ph)) {
+                        rc = 1;
+                        break;
+                    }
+                    masks = yolo::compose_masks(dets, raw, na, s->model.meta, proto, pw, ph, canvas_w, canvas_h);
+                }
+                yolo::unscale_boxes(dets, info, img.w, img.h);
+            } else if (meta.task == "pose") {
+                poses =
+                    yolo::postprocess_pose(raw, no, na, s->model.meta, s->anchors.data(), s->anchor_strides.data(), cfg);
+                yolo::unscale_pose(poses, info, img.w, img.h);
+            } else if (meta.task == "obb") {
+                obbs = yolo::postprocess_obb(raw, no, na, s->model.meta, s->anchors.data(), s->anchor_strides.data(), cfg);
+                yolo::unscale_obb(obbs, info);
+            }
+
+            if (meta.task == "obb") {
+                for (size_t i = 0; i < obbs.size(); i++) fin_dets(obb_to_track(obbs[i], (int)i));
+            } else if (meta.task == "pose") {
+                for (size_t i = 0; i < poses.size(); i++) fin_dets(det_to_track(poses[i].det, (int)i));
+            } else {
+                for (size_t i = 0; i < dets.size(); i++) fin_dets(det_to_track(dets[i], (int)i));
+            }
+            if (want_recovered) {
+                std::vector<yolo::Detection> loose_dets =
+                    yolo::postprocess(raw, no, na, s->model.meta, s->anchors.data(), s->anchor_strides.data(), loose);
+                yolo::unscale_boxes(loose_dets, info);
+                for (const auto& ld : loose_dets) {
+                    float best = 0.0f;
+                    for (const auto& td : dets) {
+                        const float xx1 = std::max(ld.x1, td.x1), yy1 = std::max(ld.y1, td.y1);
+                        const float xx2 = std::min(ld.x2, td.x2), yy2 = std::min(ld.y2, td.y2);
+                        const float inter = std::max(0.0f, xx2 - xx1) * std::max(0.0f, yy2 - yy1);
+                        const float uni =
+                            (ld.x2 - ld.x1) * (ld.y2 - ld.y1) + (td.x2 - td.x1) * (td.y2 - td.y1) - inter;
+                        if (uni > 0) best = std::max(best, inter / uni);
+                    }
+                    if (best < 0.97f) fin_del(det_to_track(ld, -1));
+                }
+            }
+        } else {
+            for (const auto& d : replay[k].dets) fin_dets(d);
+            for (const auto& d : replay[k].dets_del) fin_del(d);
+        }
+
+        const std::vector<yolo::track::TrackedBox> tracks = tracker->update(fin);
+        static const std::vector<std::string> kNoNames;
+        const auto& names = s ? s->model.meta.class_names : kNoNames;
+        const char* image_label = replay.empty() ? frames[k].c_str() : "replay";
+        printf("frame %zu %s: %zu track%s", k, image_label, tracks.size(), tracks.size() == 1 ? "" : "s");
+        if (s)
+            printf(" (%s, %s, %dx%d, backend=%s)", s->model.meta.name.c_str(), s->model.meta.dtype.c_str(), img.w,
+                   img.h, yolo::backend_name(s->backend));
+        printf("\n");
+        for (const auto& t : tracks) {
+            const char* cname = t.det.class_id < (int)names.size() ? names[t.det.class_id].c_str() : "?";
+            if (t.det.angled())
+                printf("  #%d %-12s %.2f  rbox cx=%.1f cy=%.1f w=%.1f h=%.1f angle=%.1fdeg\n", t.track_id, cname,
+                       t.det.score, t.det.cx, t.det.cy, t.det.w, t.det.h, t.det.angle * 180.0f / 3.14159265f);
+            else
+                printf("  #%d %-12s %.2f  [%.1f, %.1f, %.1f, %.1f]\n", t.track_id, cname, t.det.score, t.det.cx - t.det.w / 2,
+                       t.det.cy - t.det.h / 2, t.det.cx + t.det.w / 2, t.det.cy + t.det.h / 2);
+        }
+
+        if (jf) {
+            fprintf(jf, "{\"frame\":%zu,\"image\":\"%s\",\"detections\":[", k, json_escape(image_label).c_str());
+            for (size_t i = 0; i < fin.dets.size(); i++) {
+                if (i) fputs(",", jf);
+                write_track_json_entry(jf, fin.dets[i], -1);
+            }
+            fputs("]", jf);
+            if (want_recovered) {
+                fputs(",\"detections_del\":[", jf);
+                for (size_t i = 0; i < fin.dets_del.size(); i++) {
+                    if (i) fputs(",", jf);
+                    write_track_json_entry(jf, fin.dets_del[i], -1);
+                }
+                fputs("]", jf);
+            }
+            fputs(",\"tracks\":[", jf);
+            // ModelMeta.nk is the total keypoint float count (nkpts * ndim).
+            const size_t kpt_len = meta.nk > 0 ? (size_t)meta.nk : 51;
+            for (size_t i = 0; i < tracks.size(); i++) {
+                if (i) fputs(",", jf);
+                const std::vector<float>* kpts = nullptr;
+                if (meta.task == "pose" && tracks[i].det.idx >= 0 && tracks[i].det.idx < (int)poses.size() &&
+                    poses[tracks[i].det.idx].kpts.size() >= kpt_len)
+                    kpts = &poses[tracks[i].det.idx].kpts;
+                write_track_json_entry(jf, tracks[i].det, tracks[i].track_id, kpts);
+            }
+            fputs("]}\n", jf);
+        }
+
+        if (!out_prefix.empty()) {
+            char path[1024];
+            snprintf(path, sizeof(path), "%s_%05zu.png", out_prefix.c_str(), k);
+            std::vector<std::string> labels;
+            if (meta.task == "obb") {
+                labels.resize(obbs.size());
+                for (const auto& t : tracks) {
+                    if (t.det.idx < 0 || t.det.idx >= (int)obbs.size()) continue;
+                    const char* cname = t.det.class_id < (int)names.size() ? names[t.det.class_id].c_str() : "?";
+                    char buf[128];
+                    snprintf(buf, sizeof(buf), "%s #%d %.2f", cname, t.track_id, t.det.score);
+                    labels[t.det.idx] = buf;
+                }
+                if (!yolo::draw_obb(path, img, obbs, names, &labels)) {
+                    rc = 1;
+                    break;
+                }
+            } else if (meta.task == "pose") {
+                labels.resize(poses.size());
+                for (const auto& t : tracks) {
+                    if (t.det.idx < 0 || t.det.idx >= (int)poses.size()) continue;
+                    const char* cname = t.det.class_id < (int)names.size() ? names[t.det.class_id].c_str() : "?";
+                    char buf[128];
+                    snprintf(buf, sizeof(buf), "%s #%d %.2f", cname, t.track_id, t.det.score);
+                    labels[t.det.idx] = buf;
+                }
+                if (!yolo::draw_pose(path, img, poses, names, &labels)) {
+                    rc = 1;
+                    break;
+                }
+            } else {
+                labels.resize(dets.size());
+                for (const auto& t : tracks) {
+                    if (t.det.idx < 0 || t.det.idx >= (int)dets.size()) continue;
+                    const char* cname = t.det.class_id < (int)names.size() ? names[t.det.class_id].c_str() : "?";
+                    char buf[128];
+                    snprintf(buf, sizeof(buf), "%s #%d %.2f", cname, t.track_id, t.det.score);
+                    labels[t.det.idx] = buf;
+                }
+                if (!yolo::draw_detections(path, img, dets, names, meta.task == "segment" ? &masks : nullptr,
+                                           &info, &labels)) {
+                    rc = 1;
+                    break;
+                }
+            }
+        }
+    }
+    if (jf) fclose(jf);
+    return rc;
 }
 
 // ---- bench -------------------------------------------------------------------
@@ -1172,6 +1882,7 @@ int main(int argc, char** argv) {
     if (cmd == "detect") return cmd_detect(args);
     if (cmd == "pose") return cmd_pose(args);
     if (cmd == "obb") return cmd_obb(args);
+    if (cmd == "track") return cmd_track(args);
     if (cmd == "semantic") return cmd_semantic(args);
     if (cmd == "classify") return cmd_classify(args);
     if (cmd == "depth") return cmd_depth(args);

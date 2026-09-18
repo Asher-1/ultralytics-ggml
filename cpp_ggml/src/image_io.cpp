@@ -11,6 +11,14 @@
 #include <omp.h>
 #endif
 
+#if defined(YOLO_WITH_OPENCV)
+// Decode through the same OpenCV loader as the Python pipeline (cv2.imread),
+// so JPEG/PNG IDCT rounding matches upstream and the residual +-2/255
+// per-pixel stb_image drift disappears from the end-to-end A/B envelope.
+#include <opencv2/imgcodecs.hpp>
+#include <opencv2/imgproc.hpp>
+#endif
+
 #define STB_IMAGE_IMPLEMENTATION
 #define STBI_ONLY_JPEG
 #define STBI_ONLY_PNG
@@ -23,6 +31,20 @@
 namespace yolo {
 
 bool load_image(const std::string& path, Image& img) {
+#if defined(YOLO_WITH_OPENCV)
+    cv::Mat bgr = cv::imread(path, cv::IMREAD_COLOR);
+    if (bgr.empty()) {
+        YOLO_LOG_ERROR("failed to load image %s", path.c_str());
+        return false;
+    }
+    cv::Mat rgb;
+    cv::cvtColor(bgr, rgb, cv::COLOR_BGR2RGB);
+    img.w = rgb.cols;
+    img.h = rgb.rows;
+    img.c = 3;
+    img.rgb.assign(rgb.data, rgb.data + (size_t)rgb.total() * 3);
+    return true;
+#else
     int n = 0;
     uint8_t* data = stbi_load(path.c_str(), &img.w, &img.h, &n, 3);
     if (!data) {
@@ -33,6 +55,7 @@ bool load_image(const std::string& path, Image& img) {
     img.rgb.assign(data, data + (size_t)img.w * img.h * 3);
     stbi_image_free(data);
     return true;
+#endif
 }
 
 static std::vector<float> resize_bilinear_float(const float* src, int sw, int sh, int dw, int dh) {
@@ -152,21 +175,26 @@ void classify_preprocess(const Image& img, int size, std::vector<float>& out) {
     }
 }
 
-void letterbox_image(const Image& img, int imgsz, LetterboxInfo& info, std::vector<float>& out) {
-    const float r = std::min((float)imgsz / img.w, (float)imgsz / img.h);
+LetterboxInfo letterbox_geometry(int orig_w, int orig_h, int imgsz) {
+    const float r = std::min((float)imgsz / orig_w, (float)imgsz / orig_h);
     // nearbyint = round-half-to-even, matching Python round().
-    const int new_w = (int)std::nearbyint(img.w * r);
-    const int new_h = (int)std::nearbyint(img.h * r);
+    const int new_w = (int)std::nearbyint(orig_w * r);
+    const int new_h = (int)std::nearbyint(orig_h * r);
 
     // Ultralytics LetterBox(auto=True, center=True): mod stride first, then split padding.
     int dw = (imgsz - new_w) % 32, dh = (imgsz - new_h) % 32;
     const float hw = dw / 2.0f, hh = dh / 2.0f;
     const int left = (int)std::nearbyint(hw - 0.1f), right = (int)std::nearbyint(hw + 0.1f);
     const int top = (int)std::nearbyint(hh - 0.1f), bottom = (int)std::nearbyint(hh + 0.1f);
-    const int canvas_w = new_w + left + right;
-    const int canvas_h = new_h + top + bottom;
+    return LetterboxInfo{r, left, top, new_w, new_h, new_w + left + right, new_h + top + bottom};
+}
 
-    info = LetterboxInfo{r, left, top, new_w, new_h, canvas_w, canvas_h};
+void letterbox_image(const Image& img, int imgsz, LetterboxInfo& info, std::vector<float>& out) {
+    info = letterbox_geometry(img.w, img.h, imgsz);
+    const int left = info.pad_w, top = info.pad_h;
+    const int right = info.imgsz_w - info.new_w - left, bottom = info.imgsz_h - info.new_h - top;
+    const int new_w = info.new_w, new_h = info.new_h;
+    const int canvas_w = info.imgsz_w, canvas_h = info.imgsz_h;
 
     const size_t plane = (size_t)canvas_w * canvas_h;
     out.resize(3 * plane);
@@ -186,16 +214,25 @@ void letterbox_image(const Image& img, int imgsz, LetterboxInfo& info, std::vect
 
     const float fx = (float)img.w / new_w;
     const float fy = (float)img.h / new_h;
-    std::vector<int> x0(new_w), x1(new_w);
-    std::vector<float> wx(new_w);
+    // cv2.resize(INTER_LINEAR) on uint8 is fixed-point: fractional positions get
+    // 11-bit weights (INTER_RESIZE_COEF_BITS, scale 2048) per axis and the two
+    // passes round once at the end ((v + 2^21) >> 22). Replicating that keeps the
+    // network input bit-identical to Python's cv2 preprocessing; plain float
+    // interpolation lands up to 1/255 away, which measurably shifts confidences
+    // in A/B comparisons of near-threshold detections.
+    constexpr int kCoefScale = 1 << 11;
+    std::vector<int> x0(new_w), x1(new_w), xa0(new_w), xa1(new_w);
     for (int x = 0; x < new_w; x++) {
         // OpenCV INTER_LINEAR sampling: sx = (x + 0.5) * scale - 0.5, pixel-
-        // center aligned (verified bit-exact against cv2.resize on bus.jpg).
+        // center aligned; weights are saturate_cast<short>(f * 2048), i.e.
+        // round-half-to-even like cvRound.
         const float sx = (x + 0.5f) * fx - 0.5f;
         const int ix0 = (int)std::floor(sx);
+        const float frac = sx - ix0;
         x0[x] = std::clamp(ix0, 0, img.w - 1);
         x1[x] = std::clamp(ix0 + 1, 0, img.w - 1);
-        wx[x] = sx - ix0;
+        xa0[x] = (int)std::nearbyint((1.0f - frac) * kCoefScale);
+        xa1[x] = (int)std::nearbyint(frac * kCoefScale);
     }
 
 #if defined(YOLO_USE_OPENMP)
@@ -207,7 +244,9 @@ void letterbox_image(const Image& img, int imgsz, LetterboxInfo& info, std::vect
         const int iy0 = (int)std::floor(sy);
         const int yc0 = std::clamp(iy0, 0, img.h - 1);
         const int yc1 = std::clamp(iy0 + 1, 0, img.h - 1);
-        const float wy = sy - iy0;
+        const float frac_y = sy - iy0;
+        const int ya0 = (int)std::nearbyint((1.0f - frac_y) * kCoefScale);
+        const int ya1 = (int)std::nearbyint(frac_y * kCoefScale);
         for (int x = 0; x < new_w; x++) {
             const size_t p00 = ((size_t)yc0 * img.w + x0[x]) * 3;
             const size_t p01 = ((size_t)yc0 * img.w + x1[x]) * 3;
@@ -215,30 +254,46 @@ void letterbox_image(const Image& img, int imgsz, LetterboxInfo& info, std::vect
             const size_t p11 = ((size_t)yc1 * img.w + x1[x]) * 3;
             const size_t dst = (size_t)(y + top) * canvas_w + x + left;
             for (int c = 0; c < 3; c++) {
-                const float v0 = img.rgb[p00 + c] + (img.rgb[p01 + c] - img.rgb[p00 + c]) * wx[x];
-                const float v1 = img.rgb[p10 + c] + (img.rgb[p11 + c] - img.rgb[p10 + c]) * wx[x];
-                const uint8_t value = (uint8_t)(v0 + (v1 - v0) * wy + 0.5f);
+                const int h0 = xa0[x] * img.rgb[p00 + c] + xa1[x] * img.rgb[p01 + c];
+                const int h1 = xa0[x] * img.rgb[p10 + c] + xa1[x] * img.rgb[p11 + c];
+                const uint8_t value = (uint8_t)((ya0 * h0 + ya1 * h1 + (1 << 21)) >> 22);
                 out[(size_t)c * plane + dst] = value / 255.0f;
             }
         }
     }
 }
 
-void unscale_boxes(std::vector<Detection>& dets, const LetterboxInfo& info) {
+void unscale_boxes(std::vector<Detection>& dets, const LetterboxInfo& info, int orig_w, int orig_h) {
     for (auto& d : dets) {
         d.x1 = (d.x1 - info.pad_w) / info.scale;
         d.y1 = (d.y1 - info.pad_h) / info.scale;
         d.x2 = (d.x2 - info.pad_w) / info.scale;
         d.y2 = (d.y2 - info.pad_h) / info.scale;
+        if (orig_w > 0 && orig_h > 0) {
+            // Python predict clips final boxes to the image bounds
+            // (scale_boxes -> clip_boxes at the end of the NMS pipeline).
+            d.x1 = std::clamp(d.x1, 0.0f, (float)orig_w);
+            d.y1 = std::clamp(d.y1, 0.0f, (float)orig_h);
+            d.x2 = std::clamp(d.x2, 0.0f, (float)orig_w);
+            d.y2 = std::clamp(d.y2, 0.0f, (float)orig_h);
+        }
     }
 }
 
-void unscale_pose(std::vector<PoseDetection>& poses, const LetterboxInfo& info) {
+void unscale_pose(std::vector<PoseDetection>& poses, const LetterboxInfo& info, int orig_w, int orig_h) {
     for (auto& p : poses) {
         p.det.x1 = (p.det.x1 - info.pad_w) / info.scale;
         p.det.y1 = (p.det.y1 - info.pad_h) / info.scale;
         p.det.x2 = (p.det.x2 - info.pad_w) / info.scale;
         p.det.y2 = (p.det.y2 - info.pad_h) / info.scale;
+        if (orig_w > 0 && orig_h > 0) {
+            // Python predict clips final boxes to the image bounds
+            // (scale_boxes -> clip_boxes); keypoints are left unclipped.
+            p.det.x1 = std::clamp(p.det.x1, 0.0f, (float)orig_w);
+            p.det.y1 = std::clamp(p.det.y1, 0.0f, (float)orig_h);
+            p.det.x2 = std::clamp(p.det.x2, 0.0f, (float)orig_w);
+            p.det.y2 = std::clamp(p.det.y2, 0.0f, (float)orig_h);
+        }
         for (size_t k = 0; k + 1 < p.kpts.size(); k += 2) {
             p.kpts[k] = (p.kpts[k] - info.pad_w) / info.scale;
             p.kpts[k + 1] = (p.kpts[k + 1] - info.pad_h) / info.scale;
@@ -315,7 +370,8 @@ static const uint8_t* glyph_rows(char ch) {
 
 bool draw_detections(const std::string& out_path, Image& img,
                      const std::vector<Detection>& dets, const std::vector<std::string>& names,
-                     const std::vector<SegMask>* masks, const LetterboxInfo* info) {
+                     const std::vector<SegMask>* masks, const LetterboxInfo* info,
+                     const std::vector<std::string>* labels) {
     const int t = 2;
     for (size_t k = 0; k < dets.size(); k++) {
         const auto& d = dets[k];
@@ -344,8 +400,12 @@ bool draw_detections(const std::string& out_path, Image& img,
                 if (x < x1 + t || x >= x2 - t + 1 || y < y1 + t || y >= y2 - t + 1)
                     for (int c = 0; c < 3; c++) img.rgb[(size_t)(y * img.w + x) * 3 + c] = col[c];
         char label[128];
-        const char* cname = d.class_id >= 0 && d.class_id < (int)names.size() ? names[d.class_id].c_str() : "?";
-        snprintf(label, sizeof(label), "%s %.2f", cname, d.score);
+        if (labels && k < labels->size() && !(*labels)[k].empty()) {
+            snprintf(label, sizeof(label), "%s", (*labels)[k].c_str());
+        } else {
+            const char* cname = d.class_id >= 0 && d.class_id < (int)names.size() ? names[d.class_id].c_str() : "?";
+            snprintf(label, sizeof(label), "%s %.2f", cname, d.score);
+        }
         constexpr int scale = 2, glyph_h = 7 * scale, advance = 6 * scale, pad = 2;
         constexpr int label_h = 2 * pad + glyph_h;
         const int available = img.w - x1 - 2 * pad;
@@ -402,7 +462,8 @@ static void draw_line(Image& img, float x0, float y0, float x1, float y1, const 
 }
 
 bool draw_pose(const std::string& out_path, Image& img, const std::vector<PoseDetection>& poses,
-               const std::vector<std::string>& names) {
+               const std::vector<std::string>& names, const std::vector<std::string>* labels) {
+    int pose_idx = 0;
     const int nkpt = 17;  // COCO-17 is the only shipped pose family
     for (const auto& p : poses) {
         const auto& d = p.det;
@@ -429,7 +490,11 @@ bool draw_pose(const std::string& out_path, Image& img, const std::vector<PoseDe
         }
         const char* cname = d.class_id >= 0 && d.class_id < (int)names.size() ? names[d.class_id].c_str() : "?";
         char label[64];
-        snprintf(label, sizeof(label), "%s %.2f", cname, d.score);
+        if (labels && pose_idx < (int)labels->size() && !(*labels)[pose_idx].empty())
+            snprintf(label, sizeof(label), "%s", (*labels)[pose_idx].c_str());
+        else
+            snprintf(label, sizeof(label), "%s %.2f", cname, d.score);
+        pose_idx++;
         constexpr int scale = 2, glyph_h = 7 * scale, advance = 6 * scale, pad = 2;
         constexpr int label_h = 2 * pad + glyph_h;
         const size_t visible_chars = std::min(std::strlen(label),
@@ -457,7 +522,8 @@ bool draw_pose(const std::string& out_path, Image& img, const std::vector<PoseDe
 }
 
 bool draw_obb(const std::string& out_path, Image& img, const std::vector<OBBDetection>& obbs,
-              const std::vector<std::string>& names) {
+              const std::vector<std::string>& names, const std::vector<std::string>* labels) {
+    int obb_idx = 0;
     for (const auto& o : obbs) {
         const uint8_t col[3] = {clamp8(o.class_id * 53 + 30), clamp8(220 - o.class_id * 37),
                                 clamp8(o.class_id * 91 + 60)};
@@ -471,7 +537,11 @@ bool draw_obb(const std::string& out_path, Image& img, const std::vector<OBBDete
         draw_line(img, o.cx, o.cy, o.cx, o.cy, col, 4);  // center mark
         const char* cname = o.class_id >= 0 && o.class_id < (int)names.size() ? names[o.class_id].c_str() : "?";
         char label[64];
-        snprintf(label, sizeof(label), "%s %.2f %.0fdeg", cname, o.score, o.angle * 180.0f / 3.14159265f);
+        if (labels && obb_idx < (int)labels->size() && !(*labels)[obb_idx].empty())
+            snprintf(label, sizeof(label), "%s", (*labels)[obb_idx].c_str());
+        else
+            snprintf(label, sizeof(label), "%s %.2f %.0fdeg", cname, o.score, o.angle * 180.0f / 3.14159265f);
+        obb_idx++;
         constexpr int scale = 2, glyph_h = 7 * scale, advance = 6 * scale, pad = 2;
         constexpr int label_h = 2 * pad + glyph_h;
         const int x1 = std::clamp((int)o.cx - 30, 0, img.w - 1);

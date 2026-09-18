@@ -16,7 +16,7 @@ remaining validation boundary.
 ```text
 cpp_ggml/
 ├── CMakeLists.txt
-├── src/                       # loader, graph builder, backends, preprocessing, postprocessing, CLI, CLIP
+├── src/                       # loader, graph builder, backends, preprocessing, postprocessing, tracking, CLI, CLIP
 ├── examples/cli/              # yolo-cli target + 7 end-to-end solution scenarios + yolo-similarity
 ├── models/
 │   ├── MODEL_CARD.md
@@ -177,18 +177,29 @@ release checkpoints are downloaded into the canonical PyTorch directory by Ultra
 
 Every runtime GGUF in this integration is published prebuilt at
 [huggingface.co/Asher-1/yolo-gguf](https://huggingface.co/Asher-1/yolo-gguf) — the 135 closed-set checkpoints, the 13
-YOLO-World files, all 30 YOLOE-26 (incl. `-pf`) variants, and the CLIP/MobileCLIP text towers with their `.ref.npz`
-parity references (187 files total). Download them straight into the canonical GGUF directory:
+YOLO-World files, all 30 YOLOE-26 (incl. `-pf`) variants, both resolution variants for the yolo26 obb/sem scales, and
+the CLIP/MobileCLIP text towers with their `.ref.npz` parity references (217 files total). The same files are mirrored
+as GitHub release assets at
+[cloudViewer_downloads/yolo_gguf_models](https://github.com/Asher-1/cloudViewer_downloads/releases/tag/yolo_gguf_models).
+Download them straight into the canonical GGUF directory:
 
 ```bash
 pip install -U "huggingface_hub[cli]"
 huggingface-cli download Asher-1/yolo-gguf --local-dir cpp_ggml/models/gguf
+
+# or the GitHub release mirror
+gh release download yolo_gguf_models --repo Asher-1/cloudViewer_downloads --pattern '*.gguf' \
+    --dir cpp_ggml/models/gguf --clobber
 ```
+
+The yolo26 obb/sem scales ship two resolution variants: the canonical name is the 640 speed build and the `-1024-`
+name is the checkpoint-native build that reproduces Ultralytics Python output exactly. Verify the downloaded obb/sem
+files against the tracked checksum list with `cd cpp_ggml/models/gguf && sha256sum -c SHA256SUMS`.
 
 Local conversion below remains the reproducible path from the PyTorch checkpoints.
 
 Convert all 45 supported checkpoints (YOLOv8/YOLO26 detect, segment, depth, pose, obb, semantic, classify) to F32,
-F16, and Q8_0, producing 135 GGUF files:
+F16, and Q8_0, producing 135 GGUF files plus the 30 yolo26 obb/sem 1024-resolution variants (165 total):
 
 ```bash
 cd cpp_ggml
@@ -381,7 +392,9 @@ cpp_ggml/build-cuda/bin/yolo-cli obb \
 ```
 
 Prints rotated boxes (cx, cy, w, h, angle degrees) in the DOTA-15 class set; `--out` renders rotated rectangles. All
-five YOLO26 obb scales are supported.
+five YOLO26 obb scales are supported. Each scale also ships a checkpoint-native
+`yolo26n-obb-1024-<dtype>.gguf` variant that matches Python output exactly (no 640 end-to-end grid ghost classes) at
+higher compute cost.
 
 ### Semantic segmentation
 
@@ -393,7 +406,9 @@ cpp_ggml/build-cuda/bin/yolo-cli semantic \
 ```
 
 Prints the per-class pixel histogram on the canvas/8 grid; `--out` blends the Cityscapes-19 class map over the source
-image. All five YOLO26 semantic scales are supported.
+image. All five YOLO26 semantic scales are supported. Each scale also ships a checkpoint-native
+`yolo26n-sem-1024-<dtype>.gguf` variant that matches Python output exactly (full Cityscapes-19 class set) at higher
+compute cost.
 
 This is not the `-seg` models above. Those run through `detect` and return one mask, box, and confidence per detected
 object, leaving the rest of the frame unlabeled; a semantic model has no object concept at all and labels every pixel,
@@ -412,6 +427,85 @@ cpp_ggml/build-cuda/bin/yolo-cli classify \
 Prints the top-k ImageNet-1000 classes with softmax probabilities. The CLI reproduces the checkpoint-baked
 preprocessing (antialiased resize + center crop + plain /255 normalization). All five YOLO26 classify scales are
 supported.
+
+### Multi-object tracking (mode=track)
+
+`track` mirrors the official `mode=track` pipeline: it feeds every frame's detections to a multi-object tracker and
+labels each active object with a persistent id. Detect, segment, pose, and obb models are supported (the same task
+set as Python). The `--source` is a directory of frames, a comma-separated frame list, or a single image — the C++
+runtime has no video decoder, so decode mp4/webm to frames first:
+
+```bash
+# 1) decode a video into frames (ffmpeg, not shipped)
+mkdir -p /tmp/frames && ffmpeg -i video.mp4 -q:v 2 /tmp/frames/frame_%05d.jpg
+# 2) track
+mkdir -p cpp_ggml/results
+cpp_ggml/build-cpu/bin/yolo-cli track \
+    --model cpp_ggml/models/gguf/yolo26n-f16.gguf \
+    --source /tmp/frames \
+    --tracker tracktrack \
+    --tracks-json cpp_ggml/results/tracks.jsonl \
+    --out cpp_ggml/results/track
+```
+
+`--tracker` accepts a bare name (`bytetrack`, `botsort`, `ocsort`, `deepocsort`, `fasttrack`, `tracktrack` — the
+default follows `ultralytics/cfg/default.yaml`) or a path to the official
+`ultralytics/cfg/trackers/<name>.yaml`, which is parsed directly. `--tracker-config` applies per-key overrides from
+a second YAML. `--conf` defaults to 0.1 like `Model.track()` because the ByteTrack family needs low-confidence
+detections. Every frame prints `#id class score box` rows; `--out PREFIX` renders `PREFIX_00000.png` with `#id`
+labels; `--tracks-json` writes one JSON object per frame with the tracker input (`detections`), the TrackTrack
+loose-NMS recoveries (`detections_del`, detect/obb only), and the tracked output (`tracks`).
+
+The tracker implementations in `src/tracker.cpp` mirror `ultralytics/trackers/` algorithm-for-algorithm (Kalman
+XYAH/XYWH, IoU/probiou matching, two-stage or multi-cue association, lifecycle pools, TrackTrack's iterative
+assignment + TAI, and FastTracker's occlusion rollback). Boundaries:
+
+- `with_reid: true` is rejected — no ReID encoder ships with the C++ runtime. This is the default of every official
+  tracker YAML.
+- When the build finds OpenCV (`YOLO_WITH_OPENCV`), every GMC method calls the same cv2 routines as
+  `ultralytics/trackers/utils/gmc.py`: `sparseOptFlow`, `orb`, `ecc`, and — on OpenCV >= 4.4 — `sift`. Verified with
+  the same-frames parity below (`sparseOptFlow` matches exactly; `orb`/`ecc` warps differ only by sub-pixel
+  OpenCV-version noise). Without OpenCV the self-contained `sparseOptFlow`/`none` fallback is used and the extra
+  methods are rejected at tracker creation.
+- Assignments come from an equivalent rectangular shortest-augmenting-path solver instead of `lap.lapjv`; on
+  tied-cost optima the chosen pairing may differ while both remain optimal.
+
+`--dets-jsonl IN.jsonl` replays recorded detections (the same schema `--tracks-json` writes) through the tracker
+without running a model — the tracking analog of `--input-f32` and how the parity script drives both sides. See
+[Track parity](#track-parity).
+
+### Final-output A/B comparison (all tasks)
+
+`scripts/ab_compare.py` runs the official Python ultralytics predict pipeline and the C++ runtime end to end on the
+same image and diffs the FINAL quantities each mode emits — per task: boxes/conf/cls (detect), masks as RLE
+(segment), COCO-17 keypoints (pose), rotated boxes (obb), the full softmax vector (classify), the orig-size class
+map (semantic), and the orig-size metric depth map (depth). The `.pt` and the GGUF must come from the same
+checkpoint (`models/pytorch/*.pt` are the canonical conversion inputs):
+
+```bash
+# end-to-end (both sides read the image themselves)
+python cpp_ggml/scripts/ab_compare.py --task all
+# engine-level (bit-identical input tensor fed to both engines via --input-f32)
+python cpp_ggml/scripts/ab_compare.py --same-input --task all
+# single task with explicit model pair
+python cpp_ggml/scripts/ab_compare.py --task detect \
+    --pt cpp_ggml/models/pytorch/yolo26n.pt --gguf cpp_ggml/models/gguf/yolo26n-f32.gguf
+```
+
+Two comparison levels are reported per task:
+
+- **Engine level (`--same-input`)**: both engines consume a bit-identical letterbox tensor, so only ggml-vs-torch
+  numerics remain — measured on the n-scale F32 pairs: box coords within 7e-4 px, conf within 2e-5, mask IoU ≥
+  0.79, keypoints within 0.7 px, semantic 99.8% pixel agreement, depth rel-p99 0.5%.
+- **End-to-end**: when both sides decode through the same OpenCV build the inputs are bit-identical; against the
+  Python wheel (which bundles its own OpenCV + libjpeg) the decode/IDCT still drifts by up to one 1/255 quantization
+  step on ~10% of the pixels, which the end2end heads amplify near thresholds — the same torch model on two such
+  inputs moves conf by up to 0.09 and reorders boxes. The end-to-end gates measure that integration envelope, not
+  engine parity.
+
+Track alignment is verified separately per tracker with `scripts/verify_track_parity.py` (see
+[Track parity](#track-parity)); the engine-level A/B above covers the four box tasks' detection inputs that feed
+the trackers.
 
 ### One-model latency
 
@@ -535,6 +629,49 @@ cpp_ggml/build-cuda/bin/yolo-cli bench \
 
 Run the command at least twice to cover allocator and cached-plan reuse across process lifetimes. Also exercise the
 largest model, depth, alternate image sizes, and the narrowest performance-margin model on deployment hardware.
+
+### Track parity
+
+The C++ trackers are checked against the official Python trackers on identical detection inputs:
+
+```bash
+# 1) record the tracker input/output of a C++ run (GMC off for determinism)
+cpp_ggml/build-cpu/bin/yolo-cli track \
+    --model cpp_ggml/models/gguf/yolo26n-f32.gguf \
+    --source /tmp/frames --tracker tracktrack --no-gmc \
+    --tracks-json /tmp/tracks.jsonl
+# 2) replay the same detections into the Python tracker and compare ids + boxes
+python cpp_ggml/scripts/verify_track_parity.py --jsonl /tmp/tracks.jsonl --tracker tracktrack
+```
+
+`OK: N frames, track ids and boxes match the Python ...` is the pass line. The check runs per tracker type; run it
+for `bytetrack`, `botsort`, `ocsort`, `deepocsort`, `fasttrack`, and `tracktrack` (keep `--no-gmc`, since this
+build's system OpenCV and the Python wheel may differ in version; with an OpenCV build you can instead pass
+`--frames DIR` on both sides — `--dets-jsonl d.jsonl --frames frames/` on the C++ side and `--frames frames/` here —
+to verify the GMC path itself, where `sparseOptFlow` matches exactly). For a fast detector-independent loop,
+feed synthetic detections with `--dets-jsonl`:
+
+```bash
+cpp_ggml/build-cpu/bin/yolo-cli track --dets-jsonl /tmp/synth_dets.jsonl \
+    --tracker bytetrack --tracks-json /tmp/replayed.jsonl
+python cpp_ggml/scripts/verify_track_parity.py --jsonl /tmp/replayed.jsonl --tracker bytetrack
+```
+
+### True end-to-end track A/B
+
+The replay above proves the tracker algorithms; `e2e_track_ab.py` closes the last gap by running the entire chain
+independently on both sides (decode -> letterbox -> inference -> detection -> tracker) and comparing every frame's
+tracks. Track ids are arbitrary labels, so it compares up to a label permutation (near-equal confidences can swap
+the first-frame detection order inside the decode envelope, permuting every downstream id) while requiring an exact
+bijection of track box sequences:
+
+```bash
+python cpp_ggml/scripts/e2e_track_ab.py --pt cpp_ggml/models/pytorch/yolo26n.pt \
+    --gguf cpp_ggml/models/gguf/yolo26n-f32.gguf --frames /tmp/pan_frames
+# all six trackers pass: tracktrack/bytetrack/botsort/ocsort/deepocsort/fasttrack,
+# max box drift 4.1 px (1% of the box extent, the end-to-end envelope);
+# obb n-f16 @1024 matches bit-for-bit (max drift 0.000 px)
+```
 
 ## 7. Reproduce the complete benchmark comparison
 

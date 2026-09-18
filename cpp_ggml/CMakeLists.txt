@@ -133,6 +133,7 @@ set(YOLOGGML_SOURCES
     src/backend.cpp
     src/yolo_graph.cpp
     src/postprocess.cpp
+    src/tracker.cpp
 )
 
 if(YOLO_GGML_CLIP)
@@ -174,6 +175,21 @@ find_package(OpenMP QUIET)
 if(OpenMP_CXX_FOUND)
     target_link_libraries(yologgml PRIVATE OpenMP::OpenMP_CXX)
     target_compile_definitions(yologgml PRIVATE YOLO_USE_OPENMP)
+endif()
+
+# Optional OpenCV: when found, the GMC methods orb/sift/ecc/sparseOptFlow call
+# the same cv2 functions as ultralytics/trackers/utils/gmc.py, and load_image
+# decodes through cv::imread (YOLO_WITH_OPENCV). Without it the self-contained
+# sparseOptFlow fallback and stb_image decoding are used and the extra GMC
+# methods are rejected at tracker creation.
+find_package(OpenCV QUIET COMPONENTS core imgproc imgcodecs video calib3d features2d)
+if(OpenCV_FOUND)
+    target_link_libraries(yologgml PRIVATE ${OpenCV_LIBS})
+    target_include_directories(yologgml PRIVATE ${OpenCV_INCLUDE_DIRS})
+    target_compile_definitions(yologgml PRIVATE YOLO_WITH_OPENCV)
+    message(STATUS "OpenCV ${OpenCV_VERSION}: GMC + image decode aligned with cv2")
+else()
+    message(STATUS "OpenCV not found: GMC falls back to built-in sparseOptFlow|none")
 endif()
 
 if(CMAKE_CXX_COMPILER_ID MATCHES "GNU|Clang")

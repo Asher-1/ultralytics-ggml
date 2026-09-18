@@ -41,9 +41,21 @@ for m in "${MODELS[@]}"; do
         out="models/gguf/$m-$dt.gguf"
         if [[ -f "$out" ]]; then
             echo "[skip] $out exists"
-            continue
+        else
+            python3 scripts/convert_yolo_to_gguf.py --model "$m" --dtype "$dt" --output "$out"
         fi
-        python3 scripts/convert_yolo_to_gguf.py --model "$m" --dtype "$dt" --output "$out"
+        # The obb/sem checkpoints train at 1024, so also emit that native-resolution
+        # variant (yolo26n-obb-1024-f16.gguf) alongside the 640 canonical speed file.
+        case "$m" in
+            *-obb | *-sem)
+                out="models/gguf/$m-1024-$dt.gguf"
+                if [[ -f "$out" ]]; then
+                    echo "[skip] $out exists"
+                else
+                    python3 scripts/convert_yolo_to_gguf.py --model "$m" --dtype "$dt" --imgsz 1024 --output "$out"
+                fi
+                ;;
+        esac
     done
 done
 echo "done: $(ls models/gguf/*.gguf | wc -l) gguf files in models/gguf/"

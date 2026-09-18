@@ -2,13 +2,23 @@
 
 This directory is the single model store for the C++ integration. PyTorch checkpoints are conversion inputs; GGUF
 files are runtime artifacts. Both are ignored by Git and can be regenerated — or downloaded prebuilt: every runtime
-GGUF (187 files: the 135 closed-set checkpoints, 13 YOLO-World, 30 YOLOE-26 incl. `-pf`, and the CLIP/MobileCLIP text
-towers with `.ref.npz` parity references) is published at
-[huggingface.co/Asher-1/yolo-gguf](https://huggingface.co/Asher-1/yolo-gguf):
+GGUF (217 files: the 135 closed-set checkpoints, 13 YOLO-World, 30 YOLOE-26 incl. `-pf`, 30 yolo26 obb/sem
+1024-resolution variants, and the CLIP/MobileCLIP text towers with `.ref.npz` parity references) is published at
+[huggingface.co/Asher-1/yolo-gguf](https://huggingface.co/Asher-1/yolo-gguf) and mirrored as GitHub release assets at
+[cloudViewer_downloads/yolo_gguf_models](https://github.com/Asher-1/cloudViewer_downloads/releases/tag/yolo_gguf_models):
 
 ```bash
 pip install -U "huggingface_hub[cli]"
 huggingface-cli download Asher-1/yolo-gguf --local-dir models/gguf
+
+# or the GitHub release mirror
+gh release download yolo_gguf_models --repo Asher-1/cloudViewer_downloads --pattern '*.gguf' --dir models/gguf --clobber
+```
+
+Verify the 60 obb/sem resolution variants against the tracked checksum list:
+
+```bash
+cd models/gguf && sha256sum -c SHA256SUMS
 ```
 
 ```text
@@ -36,7 +46,9 @@ models/
     ├── yolo26{n,s,m,l,x}-depth-{f32,f16,q8_0}.gguf
     ├── yolo26{n,s,m,l,x}-pose-{f32,f16,q8_0}.gguf
     ├── yolo26{n,s,m,l,x}-obb-{f32,f16,q8_0}.gguf
+    ├── yolo26{n,s,m,l,x}-obb-1024-{f32,f16,q8_0}.gguf
     ├── yolo26{n,s,m,l,x}-sem-{f32,f16,q8_0}.gguf
+    ├── yolo26{n,s,m,l,x}-sem-1024-{f32,f16,q8_0}.gguf
     ├── yolo26{n,s,m,l,x}-cls-{f32,f16,q8_0}.gguf
     ├── clip-ViT-B-32-{f32,f16,q8_0}.gguf
     └── mobileclip2_b-{f32,f16,q8_0}.gguf
@@ -62,28 +74,28 @@ All conversion, benchmark, parity, and rendering scripts resolve this canonical 
 
 ## Supported models
 
-| Model                                      | Task                             |       Default input | Recommended use                                                               |
-| ------------------------------------------ | -------------------------------- | ------------------: | ----------------------------------------------------------------------------- |
-| YOLOv8n                                    | detect                           |                 640 | Lowest detection latency and memory use                                       |
-| YOLOv8s                                    | detect                           |                 640 | Small edge deployments needing more capacity than n                           |
-| YOLOv8m                                    | detect                           |                 640 | Balanced accuracy and compute                                                 |
-| YOLOv8l                                    | detect                           |                 640 | Accuracy-oriented GPU deployment                                              |
-| YOLOv8x                                    | detect                           |                 640 | Highest-capacity YOLOv8 integration target                                    |
-| YOLO26n                                    | detect                           |                 640 | Lowest-latency end-to-end YOLO26 detector                                     |
-| YOLO26s                                    | detect                           |                 640 | Compact end-to-end detector                                                   |
-| YOLO26m                                    | detect                           |                 640 | Balanced end-to-end detector                                                  |
-| YOLO26l                                    | detect                           |                 640 | Accuracy-oriented end-to-end detector                                         |
-| YOLO26x                                    | detect                           |                 640 | Highest-capacity YOLO26 detection target                                      |
-| YOLOv8s-world .. YOLOv8x-world             | detect (open-vocabulary)         |                 640 | Open-vocabulary detection with CLIP text embeddings (--classes, --text-embed) |
-| YOLOE-v8/11 s..l and YOLOE-26 n..x, `-seg` | open-vocabulary instance segment |                 640 | Plaintext --classes via native MobileCLIP GGUF, or a YTXT0002 blob            |
-| YOLOv8n-seg .. YOLOv8x-seg                 | instance segment                 |                 640 | YOLOv8 boxes + on-device instance masks                                       |
-| YOLO26n-seg .. YOLO26x-seg                 | instance segment                 |                 640 | YOLO26 boxes + on-device instance masks                                       |
-| YOLO26n-depth .. YOLO26x-depth             | absolute depth                   |                 768 | Monocular metric-depth preview and spatial reasoning                          |
-| YOLO26n-pose .. YOLO26x-pose               | keypoints                        |                 640 | COCO-17 person pose (RLE head), boxes + 17 keypoints                          |
-| YOLO26n-obb .. YOLO26x-obb                 | oriented boxes                   |                 640 | DOTA-15 rotated boxes (raw angle, no sigmoid)                                 |
-| YOLO26n-sem .. YOLO26x-sem                 | semantic seg                     |                 640 | Cityscapes-19 dense per-pixel class map                                       |
-| YOLO26n-cls .. YOLO26x-cls                 | classification                   |                 224 | ImageNet-1000 logits (checkpoint-baked transforms)                            |
-| CLIP ViT-B/32                              | text + image encoder             | 224x224 / 77 tokens | 512-d L2-normalised embeddings for semantic similarity search                 |
+| Model                                      | Task                             |       Default input | Recommended use                                                                 |
+| ------------------------------------------ | -------------------------------- | ------------------: | ------------------------------------------------------------------------------- |
+| YOLOv8n                                    | detect                           |                 640 | Lowest detection latency and memory use                                         |
+| YOLOv8s                                    | detect                           |                 640 | Small edge deployments needing more capacity than n                             |
+| YOLOv8m                                    | detect                           |                 640 | Balanced accuracy and compute                                                   |
+| YOLOv8l                                    | detect                           |                 640 | Accuracy-oriented GPU deployment                                                |
+| YOLOv8x                                    | detect                           |                 640 | Highest-capacity YOLOv8 integration target                                      |
+| YOLO26n                                    | detect                           |                 640 | Lowest-latency end-to-end YOLO26 detector                                       |
+| YOLO26s                                    | detect                           |                 640 | Compact end-to-end detector                                                     |
+| YOLO26m                                    | detect                           |                 640 | Balanced end-to-end detector                                                    |
+| YOLO26l                                    | detect                           |                 640 | Accuracy-oriented end-to-end detector                                           |
+| YOLO26x                                    | detect                           |                 640 | Highest-capacity YOLO26 detection target                                        |
+| YOLOv8s-world .. YOLOv8x-world             | detect (open-vocabulary)         |                 640 | Open-vocabulary detection with CLIP text embeddings (--classes, --text-embed)   |
+| YOLOE-v8/11 s..l and YOLOE-26 n..x, `-seg` | open-vocabulary instance segment |                 640 | Plaintext --classes via native MobileCLIP GGUF, or a YTXT0002 blob              |
+| YOLOv8n-seg .. YOLOv8x-seg                 | instance segment                 |                 640 | YOLOv8 boxes + on-device instance masks                                         |
+| YOLO26n-seg .. YOLO26x-seg                 | instance segment                 |                 640 | YOLO26 boxes + on-device instance masks                                         |
+| YOLO26n-depth .. YOLO26x-depth             | absolute depth                   |                 768 | Monocular metric-depth preview and spatial reasoning                            |
+| YOLO26n-pose .. YOLO26x-pose               | keypoints                        |                 640 | COCO-17 person pose (RLE head), boxes + 17 keypoints                            |
+| YOLO26n-obb .. YOLO26x-obb                 | oriented boxes                   |          640 / 1024 | DOTA-15 rotated boxes (raw angle, no sigmoid); 640 speed + 1024 native variants |
+| YOLO26n-sem .. YOLO26x-sem                 | semantic seg                     |          640 / 1024 | Cityscapes-19 dense per-pixel class map; 640 speed + 1024 native variants       |
+| YOLO26n-cls .. YOLO26x-cls                 | classification                   |                 224 | ImageNet-1000 logits (checkpoint-baked transforms)                              |
+| CLIP ViT-B/32                              | text + image encoder             | 224x224 / 77 tokens | 512-d L2-normalised embeddings for semantic similarity search                   |
 
 Detection models use COCO's 80 classes. YOLO26 detection checkpoints use the end-to-end head exported by the local
 Ultralytics checkout. YOLO-World detection models are open-vocabulary: they accept a class list at runtime
@@ -96,6 +108,13 @@ emit one box plus 17 COCO keypoints (x, y, visibility) per person; OBB models em
 set; semantic models emit an argmax class map on the Cityscapes-19 class set; classify models emit ImageNet-1000
 softmax probabilities. The five YOLO26 scales (n/s/m/l/x) share one graph per task; scale changes tensor shapes, not
 the public CLI or GGUF contract.
+
+The obb and semantic checkpoints train at 1024, so each scale ships two resolution variants: the canonical file
+(`yolo26n-obb-f16.gguf`) is the 640 speed build and the `-1024-` file (`yolo26n-obb-1024-f16.gguf`) is the
+checkpoint-native build. The 1024 files are the parity-correct choice — they reproduce Ultralytics Python output
+(no end-to-end grid ghost classes, full Cityscapes-19 class set) for about +6% CPU latency and up to ~2.6x compute
+on GPU backends. Choose 1024 whenever C++ output must match Python; choose 640 when latency dominates and the
+documented 640 grid deviation is acceptable.
 
 YOLOE models consume the raw L2-normalised MobileCLIP feature: the checkpoint's
 `reprta` block is embedded in the GGUF graph (op-graph v4). Pass `--classes` and
@@ -146,7 +165,7 @@ rather than inferring dataset accuracy from the qualitative grid.
 
 ### YOLOv8-World benchmark parity
 
-![World Parity Bus & Zidane](../benchmarks/world_parity_bus_zidane.png)
+![World Parity Bus & Zidane](https://github.com/Asher-1/ultralytics-ggml/raw/main/cpp_ggml/benchmarks/world_parity_bus_zidane.png)
 
 ### CLIP text+image encoder
 
@@ -166,7 +185,7 @@ Use with the similarity subcommand:
 yolo-cli similarity --model models/gguf/clip-ViT-B-32-f16.gguf --source image.jpg --text "a bus on the street"
 ```
 
-![CLIP Validation](../benchmarks/clip_validation.png)
+![CLIP Validation](https://github.com/Asher-1/ultralytics-ggml/raw/main/cpp_ggml/benchmarks/clip_validation.png)
 
 ### YOLOv8-World runtime notes
 
@@ -210,13 +229,15 @@ CLI command. Output text lists each box with its first five keypoints; `--out` r
 
 **YOLO26{n,s,m,l,x}-obb** predict oriented boxes in the DOTA-15 class set. The OBB26 head emits the angle in raw
 radians (no sigmoid), decoded with dist2rbox into (cx, cy, w, h, angle). Use the `obb` CLI command; `--out` renders
-rotated rectangles.
+rotated rectangles. Each scale ships the 640 speed variant under the canonical name plus the checkpoint-native
+`yolo26n-obb-1024-<dtype>.gguf`; see the resolution-variant note above.
 
 ### YOLO26 semantic segmentation family
 
 **YOLO26{n,s,m,l,x}-sem** predict a dense per-pixel class map over the 19 Cityscapes classes at one-eighth
 resolution, argmax-reduced on device. Use the `semantic` CLI command; `--out` blends the class map over the source
-image.
+image. Each scale ships the 640 speed variant under the canonical name plus the checkpoint-native
+`yolo26n-sem-1024-<dtype>.gguf`; see the resolution-variant note above.
 
 ### YOLO26 classification family
 
@@ -285,6 +306,7 @@ python3 scripts/convert_yolo_to_gguf.py --model yolo26n --dtype f16
 python3 scripts/convert_yolo_to_gguf.py --model yolo26n-depth --dtype f16
 python3 scripts/convert_yolo_to_gguf.py --model yolo26s-pose --dtype f16
 python3 scripts/convert_yolo_to_gguf.py --model yolo26l-obb --dtype f16
+python3 scripts/convert_yolo_to_gguf.py --model yolo26l-obb --dtype f16 --imgsz 1024   # writes yolo26l-obb-1024-f16.gguf
 python3 scripts/convert_yolo_to_gguf.py --model yolo26m-sem --dtype f16
 python3 scripts/convert_yolo_to_gguf.py --model yolo26n-cls --dtype f16
 ```

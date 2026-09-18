@@ -732,7 +732,13 @@ def write_gguf(path: str, name: str, builder: GraphBuilder, meta: dict, dtype: s
     print(f"[write] {path}: {len(builder.ops)} ops, tensors q8_0={n_quant} f16={n_f16} f32={n_f32}")
 
 
-def convert(model_path: str, dtype: str, output: str, opmap: str | None = None) -> None:
+def convert(
+    model_path: str,
+    dtype: str,
+    output: str | None = None,
+    opmap: str | None = None,
+    imgsz: int | None = None,
+) -> None:
     yolo = YOLO(model_path)
     model = yolo.model
     task = yolo.task or "detect"
@@ -743,7 +749,15 @@ def convert(model_path: str, dtype: str, output: str, opmap: str | None = None) 
 
     model.eval()
     model.fuse()
-    imgsz = 768 if task == "depth" else (224 if task == "classify" else 640)
+    default_imgsz = 768 if task == "depth" else (224 if task == "classify" else 640)
+    imgsz = imgsz or default_imgsz
+    if output is None:
+        # A non-default graph size is part of the model identity: bake it into the file name
+        # (yolo26n-obb-1024-f16.gguf) so resolution variants never overwrite each other.
+        stem = Path(model_path).stem
+        if imgsz != default_imgsz:
+            stem = f"{stem}-{imgsz}"
+        output = str(GGUF_MODELS / f"{stem}-{dtype}.gguf")
     from ultralytics.nn.tasks import WorldModel, YOLOEModel
 
     is_world = isinstance(model, WorldModel)
@@ -819,8 +833,20 @@ def main():
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument("--model", required=True, help=".pt checkpoint path or alias (yolov8n, yolo26n-depth)")
     ap.add_argument("--dtype", default="f16", choices=["f32", "f16", "q8_0"])
-    ap.add_argument("--output", help="output .gguf path (default: models/gguf/<model>-<dtype>.gguf)")
+    ap.add_argument(
+        "--output",
+        help="output .gguf path (default: models/gguf/<model>-<dtype>.gguf; when --imgsz overrides the\n"
+        "task default the size is inserted: models/gguf/<model>-<imgsz>-<dtype>.gguf)",
+    )
     ap.add_argument("--opmap", help="optional JSON: torch layer -> op index map (parity tests)")
+    ap.add_argument(
+        "--imgsz",
+        type=int,
+        default=None,
+        help="graph input size override (default: 768 depth, 224 classify, 640 others; use the checkpoint's\n"
+        "train-time size, e.g. 1024 for the DOTA obb / Cityscapes sem checkpoints); a non-default\n"
+        "size is appended to the output file name to keep resolution variants apart",
+    )
     args = ap.parse_args()
 
     PYTORCH_MODELS.mkdir(parents=True, exist_ok=True)
@@ -829,8 +855,7 @@ def main():
         src = requested
     else:
         src = PYTORCH_MODELS / (requested.name if requested.suffix == ".pt" else f"{requested.name}.pt")
-    output = args.output or GGUF_MODELS / f"{src.stem}-{args.dtype}.gguf"
-    convert(str(src), args.dtype, str(output), args.opmap)
+    convert(str(src), args.dtype, args.output, args.opmap, args.imgsz)
 
 
 if __name__ == "__main__":

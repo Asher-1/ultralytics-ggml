@@ -62,12 +62,30 @@ std::vector<Detection> postprocess(const std::vector<float>& raw, int no, int na
                 }
             }
         }
-        for (int a = 0; a < na; a++) {
-            if (best[a] > logit_thr) cands.push_back({a, sigmoid(best[a]), bc[a]});
+        if (meta.end2end) {
+            // Detect26/OBB26/Pose26 end2end postprocess (head.py get_topk_index):
+            // stage 1 takes the top max_det anchors by max class, stage 2 takes the
+            // top max_det (anchor, class) pairs among them — one anchor can
+            // legitimately emit one row per class. The confidence filter runs after
+            // the cap in the predictor's end2end branch, not here.
+            const int k = std::min(cfg.max_det, na);
+            std::vector<int> order(na);
+            std::iota(order.begin(), order.end(), 0);
+            std::stable_sort(order.begin(), order.end(),
+                             [&](int a, int b) { return best[a] > best[b]; });
+            cands.reserve((size_t)k * nc);
+            for (int i = 0; i < k; i++) {
+                const int a = order[i];
+                for (int c = 0; c < nc; c++) cands.push_back({a, sigmoid(cls_base[(size_t)c * na + a]), c});
+            }
+        } else {
+            for (int a = 0; a < na; a++) {
+                if (best[a] > logit_thr) cands.push_back({a, sigmoid(best[a]), bc[a]});
+            }
         }
     } else {
         for (int a = 0; a < na; a++) {
-            if (cls_base[a] > logit_thr) cands.push_back({a, sigmoid(cls_base[a]), 0});
+            if (meta.end2end || cls_base[a] > logit_thr) cands.push_back({a, sigmoid(cls_base[a]), 0});
         }
     }
 
@@ -118,12 +136,16 @@ std::vector<Detection> postprocess(const std::vector<float>& raw, int no, int na
     }
 
     if (meta.end2end) {
-        // Detect.postprocess topk (score descending) then the conf filter in the
-        // non_max_suppression end2end branch keeps the order; cap at max_det.
+        // Detect.postprocess topk (score descending) then the confidence filter of
+        // the predictor's end2end branch keeps the order; cap at max_det.
         std::stable_sort(dets.begin(), dets.end(),
                          [](const Detection& x, const Detection& y) { return x.score > y.score; });
         if ((int)dets.size() > cfg.max_det) dets.resize(cfg.max_det);
-        return dets;
+        std::vector<Detection> kept;
+        kept.reserve(dets.size());
+        for (const Detection& d : dets)
+            if (d.score > cfg.conf_thres) kept.push_back(d);
+        return kept;
     }
 
     // Greedy class-aware NMS, matching torchvision.ops.nms with the class offset
