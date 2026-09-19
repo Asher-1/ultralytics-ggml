@@ -42,7 +42,7 @@ struct TrackConfig {
     std::string gmc_method = "sparseOptFlow";  // sparseOptFlow|orb|sift|ecc|none (extras need an OpenCV build)
     float proximity_thresh = 0.5f;
     float appearance_thresh = 0.8f;
-    bool with_reid = false;  // C++ runtime ships no ReID encoder; true is rejected at tracker creation
+    bool with_reid = false;  // model="auto": ReID engages through FrameInput.feats (no encoder ships in-tree)
     std::string model = "auto";
     float alpha_fixed_emb = 0.95f;
     // FastTracker specifics (fasttrack.yaml)
@@ -102,6 +102,11 @@ struct FrameInput {
     std::vector<TrackDet> dets;          // full post-NMS frame detections, original-image coords
     const yolo::Image* frame = nullptr;  // raw RGB frame (GMC input; may be null to disable GMC)
     std::vector<TrackDet> dets_del;      // TRACKTRACK loose-NMS recoveries (detect/obb only; may be empty)
+    // Official model="auto" ReID features (predict.py get_obj_feats),
+    // index-aligned with dets: one (unnormalized) vector per detection;
+    // empty when ReID is off, the head is end2end, or the runtime provides
+    // no features. dets_del rows carry no features (upstream parity).
+    std::vector<std::vector<float>> feats;
 };
 
 struct Tracker {
@@ -112,8 +117,12 @@ struct Tracker {
 };
 
 // Factory: bytetrack|botsort|ocsort|deepocsort|fasttrack|tracktrack.
-// Rejects with_reid=true (no C++ ReID encoder) and, on builds without OpenCV,
-// the orb/sift/ecc GMC methods.
+// with_reid=true is accepted on the BoT-SORT family: the ReID cosine term
+// engages through FrameInput.feats (the official model="auto" detector-
+// feature path); a stream without features degrades to motion-only
+// association, mirroring the upstream "feats missing" behavior. The
+// factory rejects with_reid only for the trackers that never consume
+// features and, on builds without OpenCV, the orb/sift/ecc GMC methods.
 std::unique_ptr<Tracker> create_tracker(const TrackConfig& cfg);
 
 }  // namespace track
